@@ -298,8 +298,8 @@ jq .peers /var/lib/syncfs/status.json
   add a dependency and two programming models for no gain. Later steps can
   queue messages to a peer with `Network::send`.
 - **postcard:** compact, serde-based (the messages are plain Rust types)
-  and has a documented, stable wire format, unlike bincode 2's
-  configuration-dependent one. Frame decoding is fuzzed: random bytes,
+  and has a documented, stable wire format.
+  Frame decoding is fuzzed: random bytes,
   mutated frames, and streams split at random points must never panic.
 
 ## Internals
