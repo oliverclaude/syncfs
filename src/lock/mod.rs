@@ -8,3 +8,6 @@ mod model;
 pub mod voter;
 
 pub use key::Key;
+pub mod manager;
+
+pub use manager::{LockError, LockManager, Settings};
