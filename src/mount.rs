@@ -10,7 +10,8 @@ use fuser::{MountOption, Session, SessionACL};
 use signal_hook::iterator::Signals;
 
 use crate::config::Config;
-use crate::fs::{LocalOnly, SyncFs};
+use crate::fs::{LocalOnly, SyncFs, WriteHooks};
+use crate::lock::{ClusterHooks, LockManager, Settings};
 use crate::net::Network;
 use crate::process;
 use crate::status::{providers, Registry};
@@ -113,8 +114,9 @@ fn option_name(o: &MountOption) -> String {
 /// Registers the `.syncfs` providers, in file order.
 fn register_status(
     status: &Registry,
-    fs: &SyncFs<LocalOnly>,
+    fs: &SyncFs<Hooks>,
     net: &Network,
+    locks: Option<&LockManager>,
     cfg: &Config,
     fc: &fuser::Config,
 ) {
@@ -129,7 +131,13 @@ fn register_status(
         mount_options,
         shadowed_backing_entry: fs.shadows_backing_entry(),
     };
-    providers::register_builtin(status, info, Some(fs.stats_provider()), net.provider());
+    providers::register_builtin(
+        status,
+        info,
+        Some(fs.stats_provider()),
+        net.provider(),
+        locks.map(LockManager::provider),
+    );
 }
 
 fn check_dir(what: &str, p: &Path) -> anyhow::Result<()> {
@@ -179,10 +187,29 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
     // Runs after daemonizing: threads do not survive fork.
     let start = || -> anyhow::Result<Served> {
         let status = Registry::new();
-        let fs = SyncFs::new(backing, LocalOnly, Arc::clone(&status))
-            .with_context(|| format!("opening backing_dir {}", backing.display()))?;
         let net = Network::start(cfg).with_context(|| format!("listening on {}", cfg.listen))?;
-        register_status(&status, &fs, &net, cfg, &fuse_cfg);
+        // A standalone node has nobody to agree with: no locks.
+        let locks = (!cfg.peers.is_empty())
+            .then(|| LockManager::start(Settings::from_config(cfg), net.clone()));
+        let hooks: Hooks = match &locks {
+            Some(l) => Arc::new(ClusterHooks::new(l.clone())),
+            None => Arc::new(LocalOnly),
+        };
+        let stop = |net: &Network, locks: &Option<LockManager>| {
+            if let Some(l) = locks {
+                l.shutdown();
+            }
+            net.shutdown();
+        };
+        let fs = match SyncFs::new(backing, hooks, Arc::clone(&status)) {
+            Ok(fs) => fs,
+            Err(e) => {
+                stop(&net, &locks);
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("opening backing_dir {}", backing.display()));
+            }
+        };
+        register_status(&status, &fs, &net, locks.as_ref(), cfg, &fuse_cfg);
         let mounted = if rustix::process::geteuid().is_root() {
             mount_direct(fs, backing, mountpoint, &fuse_cfg, kernel_flags)
         } else {
@@ -191,6 +218,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
                     session,
                     direct: None,
                     net: None,
+                    locks: None,
                 })
                 .map_err(Into::into)
         };
@@ -198,11 +226,12 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         {
             Ok(s) => s,
             Err(e) => {
-                net.shutdown();
+                stop(&net, &locks);
                 return Err(e);
             }
         };
         served.net = Some(net);
+        served.locks = locks;
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
         Ok(served)
     };
@@ -212,16 +241,19 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
 /// A mounted session. `direct` is set when we called mount(2) ourselves
 /// and must unmount ourselves too.
 struct Served {
-    session: Session<SyncFs<LocalOnly>>,
+    session: Session<SyncFs<Hooks>>,
     direct: Option<PathBuf>,
     net: Option<Network>,
+    locks: Option<LockManager>,
 }
+
+type Hooks = Arc<dyn WriteHooks>;
 
 /// Mounts with mount(2) as root, with filesystem type `fuse.syncfs` so the
 /// mount table, `findmnt -t fuse.syncfs` and `mount -a` see the real type
 /// (fuser's own root path always uses plain `fuse`).
 fn mount_direct(
-    fs: SyncFs<LocalOnly>,
+    fs: SyncFs<Hooks>,
     backing: &Path,
     mountpoint: &Path,
     fuse_cfg: &fuser::Config,
@@ -290,6 +322,7 @@ fn mount_direct(
             session,
             direct: Some(mountpoint.to_path_buf()),
             net: None,
+            locks: None,
         }),
         Err(e) => {
             // SAFETY: valid path string.
@@ -305,6 +338,7 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         mut session,
         direct,
         net,
+        locks,
     } = served;
     let mut unmounter = session.unmount_callable();
     std::thread::spawn(move || {
@@ -329,6 +363,9 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         }
     });
     let res = session.run().context("serving filesystem");
+    if let Some(locks) = locks {
+        locks.shutdown();
+    }
     if let Some(net) = net {
         net.shutdown();
     }

@@ -31,7 +31,7 @@ use fuser::{
 use rustix::fs::{AtFlags, Mode, OFlags, Timespec, Timestamps};
 
 use attr::{key, to_attr};
-pub use hooks::{AttrChange, LocalOnly, Mutation, NodeRef, WriteHooks};
+pub use hooks::{AttrChange, LocalOnly, Mutation, NodeRef, OpGuard, WriteHooks};
 use inode::{Inode, InodeTable, ROOT};
 
 use crate::status::{FnProvider, Op, Provider, Registry, Stats};
@@ -313,7 +313,7 @@ impl<H: WriteHooks> SyncFs<H> {
 
     /// Runs `apply` between the `before` and `after` hooks for `op`.
     fn mutate<T>(&self, op: Mutation<'_>, apply: impl FnOnce() -> Res<T>) -> Res<T> {
-        self.hooks.before(&op)?;
+        let _guard = self.hooks.before(&op)?;
         let v = apply()?;
         self.hooks.after(&op);
         Ok(v)

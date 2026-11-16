@@ -11,3 +11,6 @@ pub use key::Key;
 pub mod manager;
 
 pub use manager::{LockError, LockManager, Settings};
+pub mod hooks;
+
+pub use hooks::ClusterHooks;

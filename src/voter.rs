@@ -1,6 +1,6 @@
 //! Daemon mode: a voter-only node with no backing directory and no mount.
-//! It takes part in membership (and, from step 5, in quorum and lock
-//! votes).
+//! It takes part in membership and in lock votes (it counts towards every
+//! quorum), but never takes a lock itself.
 //!
 //! Having no `.syncfs` directory, it writes the same status as JSON to
 //! `<state_dir>/status.json`, replaced atomically on every membership change
@@ -14,6 +14,7 @@ use anyhow::Context;
 use signal_hook::iterator::Signals;
 
 use crate::config::Config;
+use crate::lock::{LockManager, Settings};
 use crate::net::Network;
 use crate::process;
 use crate::status::{providers, Registry};
@@ -29,23 +30,30 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
     if cfg.peers.is_empty() {
         log::warn!("daemon mode without peers: a standalone voter has nothing to vote on");
     }
-    let start = || -> anyhow::Result<(Network, Arc<Registry>)> {
+    let start = || -> anyhow::Result<(Network, Arc<Registry>, LockManager)> {
         let net = Network::start(cfg).with_context(|| format!("listening on {}", cfg.listen))?;
+        let locks = LockManager::start(Settings::from_config(cfg), net.clone());
         let status = Registry::new();
         let info = providers::NodeInfo {
             config: cfg.clone(),
             mount_options: Vec::new(),
             shadowed_backing_entry: false,
         };
-        providers::register_builtin(&status, info, None, net.provider());
+        providers::register_builtin(&status, info, None, net.provider(), Some(locks.provider()));
         log::info!("voter node {} running", cfg.node_id);
-        Ok((net, status))
+        Ok((net, status, locks))
     };
     let path = status_path(cfg);
     let every = cfg.heartbeat_interval.get() * 5;
-    process::run(cfg.foreground, start, move |(net, status), signals| {
-        serve(&net, &status, &path, every, signals)
-    })
+    process::run(
+        cfg.foreground,
+        start,
+        move |(net, status, locks), signals| {
+            let res = serve(&net, &status, &path, every, signals);
+            locks.shutdown();
+            res
+        },
+    )
 }
 
 fn write_status(status: &Registry, path: &Path) {

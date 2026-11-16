@@ -66,10 +66,12 @@ pub fn config(config: Config) -> Arc<dyn Provider> {
 }
 
 /// `locks`: the whole-file lock table (step 5).
+/// `locks` on a standalone node, which takes no locks.
 pub fn locks(config: Config) -> Arc<dyn Provider> {
     Arc::new(FnProvider::new("locks", move || {
         json!({
-            "implemented": false,
+            "implemented": true,
+            "standalone": true,
             "lease_timeout": config.lock_lease_timeout.to_string(),
             "held": 0,
             "locks": [],
@@ -98,6 +100,7 @@ pub fn register_builtin(
     info: NodeInfo,
     stats: Option<Arc<dyn Provider>>,
     peers: Arc<dyn Provider>,
+    locks_provider: Option<Arc<dyn Provider>>,
 ) {
     let cfg = info.config.clone();
     registry.register(node(info));
@@ -106,6 +109,6 @@ pub fn register_builtin(
         registry.register(stats);
     }
     registry.register(peers);
-    registry.register(locks(cfg.clone()));
+    registry.register(locks_provider.unwrap_or_else(|| locks(cfg.clone())));
     registry.register(replication(cfg));
 }

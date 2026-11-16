@@ -6,10 +6,9 @@
 //! writing and closing it again go through [`WriteHooks::open_write`] and
 //! [`WriteHooks::release_write`].
 //!
-//! Step 2 uses [`LocalOnly`], which allows everything. Later steps plug in
-//! the whole-file lock and quorum check (`before` / `open_write`, failing
-//! with an errno such as `EROFS`), lock release (`release_write`) and dirty
-//! tracking plus the metadata journal (`after`).
+//! A standalone node uses [`LocalOnly`], which allows everything; a cluster
+//! node uses `lock::ClusterHooks` (whole-file write locks and the quorum
+//! check). Step 7 adds dirty tracking and the metadata journal (`after`).
 
 use std::ffi::OsStr;
 use std::io;
@@ -124,12 +123,37 @@ pub enum Mutation<'a> {
     },
 }
 
+/// Returned by [`WriteHooks::before`]; dropped once the operation is
+/// over, whether it succeeded or failed (after [`WriteHooks::after`] on
+/// success). Used to release locks taken for a single operation.
+#[must_use]
+#[derive(Default)]
+pub struct OpGuard(Option<Box<dyn FnOnce() + Send>>);
+
+impl OpGuard {
+    pub fn none() -> OpGuard {
+        OpGuard(None)
+    }
+
+    pub fn new(on_drop: impl FnOnce() + Send + 'static) -> OpGuard {
+        OpGuard(Some(Box::new(on_drop)))
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 /// Hooks around every local change. All methods have permissive defaults.
 pub trait WriteHooks: Send + Sync + 'static {
     /// Called before `op` is applied. An error aborts the operation and is
     /// returned to the caller.
-    fn before(&self, _op: &Mutation<'_>) -> Result<(), Errno> {
-        Ok(())
+    fn before(&self, _op: &Mutation<'_>) -> Result<OpGuard, Errno> {
+        Ok(OpGuard::none())
     }
 
     /// Called after `op` was applied successfully.
@@ -149,3 +173,21 @@ pub trait WriteHooks: Send + Sync + 'static {
 pub struct LocalOnly;
 
 impl WriteHooks for LocalOnly {}
+
+impl<T: WriteHooks + ?Sized> WriteHooks for std::sync::Arc<T> {
+    fn before(&self, op: &Mutation<'_>) -> Result<OpGuard, Errno> {
+        (**self).before(op)
+    }
+
+    fn after(&self, op: &Mutation<'_>) {
+        (**self).after(op)
+    }
+
+    fn open_write(&self, node: NodeRef<'_>) -> Result<(), Errno> {
+        (**self).open_write(node)
+    }
+
+    fn release_write(&self, node: NodeRef<'_>) {
+        (**self).release_write(node)
+    }
+}
