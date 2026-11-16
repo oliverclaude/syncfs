@@ -15,9 +15,10 @@ form a cluster and keep a full copy of the same filesystem on every node.
   backing directory. Reads are always served from that local copy.
 - **Quorum + whole-file locks.** A write is accepted only when the node can
   see a quorum (strict majority of all configured nodes) and holds the
-  whole-file write lock. Locks are taken on open-for-write or first write,
-  released on close, and expire after a lease timeout if the holder dies.
-  Each node keeps the lock table in memory.
+  whole-file write lock. Locks are taken on open-for-write (or for the
+  single operation, for changes without an open handle), released on
+  close, and expire after a lease timeout if the holder dies. Each node
+  keeps its lock table in memory. See [Write locks](#write-locks).
 - **Async replication.** After the local write completes, changes are shipped
   to the other nodes in the background, driven by a persisted per-file
   dirty-block bitmap and an ordered metadata journal (create, rename, delete,
@@ -152,7 +153,7 @@ jq .peers /mnt/data/.syncfs/status.json
 | `config`      | the effective configuration (all layers merged)                                  |
 | `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes |
 | `peers`       | cluster size, quorum, reachable nodes, quorum verdict, every peer's live state  |
-| `locks`       | held whole-file locks and the lease timeout (step 5)                             |
+| `locks`       | locks this node holds, the votes it has given, lease settings, counters          |
 | `replication` | dirty files/blocks and journal queue length (step 7)                             |
 | `status.json` | all of the above as one JSON object, keyed by file name, plus `format_version`   |
 
@@ -202,7 +203,7 @@ threads. That is fine at this size, so there is no gossip or relaying.
 ### Wire format
 
 Every connection starts with an 8-byte preamble in each direction:
-`SYNCFS` and the protocol version as a big-endian u16 (currently 1). The
+`SYNCFS` and the protocol version as a big-endian u16 (currently 2). The
 preamble never changes, so nodes on different protocol versions recognise
 the mismatch, log it and close. After the preamble come frames:
 
@@ -219,14 +220,14 @@ u32 big-endian payload length | payload = one postcard-encoded Message
   variants and fields are only ever appended. Anything else bumps the
   version.
 
-The message set already names what later steps need. Only the handshake,
-heartbeats and `Goodbye` are used so far; the others are logged and ignored.
+The message set already names what later steps need; messages of later
+steps are logged and ignored.
 
 | Messages | Used by |
 |----------|---------|
 | `Hello`, `Welcome`, `Reject` | handshake (step 4) |
 | `Heartbeat {seq, up}`, `Goodbye {reason}` | liveness (step 4) |
-| `LockRequest`, `LockGrant`, `LockDeny`, `LockRenew`, `LockRelease`, `VoteRequest`, `Vote` | locks and quorum (step 5) |
+| `LockRequest`, `LockGrant`, `LockDeny`, `LockConfirm`, `LockConfirmed`, `LockRenew`, `LockRenewed`, `LockRelease` | write locks (step 5) |
 | `JournalEntry`, `JournalAck`, `BlockPull`, `BlockData`, `BlockPush` | replication (step 7) |
 | `CatchUpRequest`, `CatchUpDone` | rejoin (step 8) |
 
@@ -279,8 +280,8 @@ nodes, voters included.
 ### Daemon mode
 
 `syncfs --mode daemon` (or `mode: daemon` in the YAML) runs a voter-only
-node: no backing directory, no mount, just membership (and, from step 5,
-lock and quorum votes). It daemonizes unless `--foreground` is given. With
+node: no backing directory, no mount, just membership and lock votes (it
+counts towards every quorum but never takes a lock). It daemonizes unless `--foreground` is given. With
 no `.syncfs` directory to read, it writes the same status as JSON to
 `<state_dir>/status.json`. The file is replaced atomically on every
 membership change and at least every 5 heartbeat intervals, and removed on
@@ -303,6 +304,137 @@ jq .peers /var/lib/syncfs/status.json
   Frame decoding is fuzzed: random bytes,
   mutated frames, and streams split at random points must never panic.
 
+## Write locks
+
+Every node has an in-memory lock table and votes on lock requests,
+voter-only daemons included. A node may change a file only while it holds
+that file's lock, which needs the votes of a quorum (a strict majority of
+all configured nodes). Reads never lock.
+
+### What is locked
+
+The lock key is the file's **path** relative to the mount root, not an
+inode number (inode numbers differ between nodes). A key covers everything
+below it: a lock on `a/b` conflicts with `a/b`, with `a/b/c` and with `a`,
+but not with `a/bc` or `a/x`. Locks of the same node never conflict with
+each other: the node serializes its own operations locally.
+
+| Operation | Lock |
+|-----------|------|
+| open for writing (including `O_CREAT`, `O_TRUNC`) | the file's path, until the handle is closed |
+| write, truncate, chmod, chown, utimens, xattr, fallocate on an open writable file | checks that the lock is still valid; re-acquires it if the lease lapsed |
+| the same without a writable handle (`truncate(1)`, `chmod`, `setfattr`) | the path, for that one operation |
+| create, mkdir, mknod, symlink, link | the new path, for the operation |
+| unlink, rmdir | the path, for the operation (so a file open for writing elsewhere cannot be removed) |
+| rename | source and destination, for the operation, in a fixed order; locks under the source are then re-taken under the new path |
+
+Consequences of path keys, by design:
+
+- Renaming or removing a directory waits for (or fails on) every lock below
+  it anywhere in the cluster.
+- A file this node renames while it is open keeps its lock, moved to the
+  new path.
+- A file deleted while open needs no lock for further writes (it is no
+  longer shared); its old path stays locked until it is closed, so another
+  node cannot create a new file there in the meantime.
+- Hard links are locked per path: two nodes writing the same inode through
+  different names are not serialized. This is a known limitation.
+
+### Errors
+
+| Situation | Result |
+|-----------|--------|
+| No quorum reachable | `EROFS` at once (reads keep working) |
+| Lock held by another node | wait up to `lock_wait` (default 10 s), then `EBUSY`; `lock_wait: 0` fails at once |
+| Lease lapsed (quorum lost while holding) | writes try to re-acquire; `EROFS` if that fails |
+| Voters still in their start-up grace period (below), or not answering, until `lock_wait` | `EROFS` |
+
+Waits are bounded by `lock_wait`, so two nodes waiting for each other's
+locks (say, each renaming onto a path the other has open) cannot deadlock:
+one of them gets `EBUSY`.
+
+### Algorithm
+
+A lock is a lease granted by a quorum, acquired in two phases.
+
+- **Ballots.** Every acquisition gets a ballot `(counter, node id)`, where
+  `counter` is a Lamport clock (one more than the largest counter this node
+  has seen). Lower ballots are older and win; the node id breaks ties.
+  Retries of the same acquisition keep their ballot.
+- **Phase 1, request.** The requester sends `LockRequest(key, ballot)` to
+  every node, itself included. A voter refuses with `Held` if another node
+  has a confirmed lease on a conflicting key, and with `Older` if another
+  node has a provisional grant with an older ballot. Otherwise it removes
+  any younger conflicting provisional grants (telling their requesters
+  `Preempted`) and records a provisional grant for this ballot, which
+  expires after a few request timeouts.
+- **Phase 2, confirm.** Once a quorum granted, the requester notes the time
+  `t` and sends `LockConfirm` to those voters (and to any that grant
+  later). A voter confirms only if it still has the provisional grant for
+  exactly this ballot; the lease then runs `lock_lease_timeout` from when
+  the confirm arrived. With a quorum of confirmations the requester holds
+  the lock **until `t + lease - margin`**, where `margin` is a tenth of the
+  lease (at least 50 ms).
+- **Failure.** If a quorum becomes impossible (refusals, unreachable
+  nodes) or the attempt times out, the requester sends `LockRelease` for
+  the ballot to everyone, backs off (20 ms doubling to 500 ms, jittered)
+  and retries with the same ballot until `lock_wait` is used up.
+- **Renewal.** The holder sends `LockRenew` every third of a lease. A voter
+  that still has the confirmed lease for that ballot extends it from
+  receipt. With a quorum of answers the holder's validity becomes `t' +
+  lease - margin`, where `t'` is when this round was sent. Without one the
+  validity simply runs out; the holder considers the lock invalid from then
+  on and writes have to re-acquire it.
+- **Release.** Closing the last writable handle sends `LockRelease` to
+  every node.
+- **Restarts.** A voter grants nothing during its first lease after
+  starting, because it has forgotten any lease it gave before a restart.
+  One restarted node does not block anyone (the others still form a
+  quorum), but after a cold start of the whole cluster, or of a majority,
+  writes fail with `EROFS` for the first `lock_lease_timeout`.
+
+**Safety (at most one holder of conflicting keys).** A voter holds at most
+one confirmed lease among conflicting keys of different nodes, and it
+confirms only an existing provisional grant, of which it also holds at most
+one per conflict set. Two holders would need two confirm quorums, which
+share a voter; that voter would have confirmed both while both leases were
+running, which it never does. Time: a holder's validity ends at `t + lease -
+margin`, and every voter's lease ended no earlier than `t + lease` (it
+started on arrival, after `t`), so the holder stops before any voter could
+grant the key to someone else, provided clocks run at about the same rate
+(the margin absorbs drift and a write that began just before the deadline).
+A restarted voter's lost memory is covered by its one-lease quarantine.
+
+**No deadlock or livelock.** An attempt with the oldest ballot among the
+competitors is never refused `Older` and never preempted; it can only be
+refused `Held`, by a lease that ends (released or expired). Counters only
+grow, so a node only ever sees finitely many ballots older than a waiting
+one: every waiter eventually becomes the oldest and wins. Younger attempts
+that lose release their votes at once, so nothing waits on a loser.
+
+**Model check.** `src/lock/model.rs` explores every interleaving of the real
+voter and requester state machines for 3 voters and 2 requesters (equal
+and nested keys, with and without arbitrary attempt timeouts), with FIFO channels per node pair as TCP provides. It checks
+that no two nodes ever hold conflicting locks and no voter confirms two
+conflicting leases (about 8 million states in total), and that without timeouts
+every run ends with nobody stuck mid-attempt and the oldest ballot holding
+the lock. Lease timing is outside the model; it is covered by the argument
+above and by the expiry tests.
+
+### Timings
+
+| Value | Default with `lock_lease_timeout: 30s`, `heartbeat_interval: 1s` |
+|-------|------------------------------------------------|
+| renewal | every lease / 3 (10 s) |
+| safety margin | lease / 10, at least 50 ms (3 s) |
+| one attempt's timeout | 2 × request timeout; request timeout = 2 × heartbeat, 200 ms to 2 s (4 s) |
+| provisional grant lifetime | 4 × request timeout (8 s) |
+| voter start-up grace | one lease (30 s) |
+
+All nodes should use the same `lock_lease_timeout`. A voter refuses to
+confirm a lease longer than its own (`LockDeny Lease`, logged), since its
+start-up grace would not cover it.
+
 ## Internals
 
 - **Inodes.** Each inode the kernel holds is an `O_PATH` descriptor on the
@@ -316,8 +448,9 @@ jq .peers /var/lib/syncfs/status.json
   unlink, chmod/chown/utimens, xattrs, fallocate) is described as a
   `Mutation` and passed through the `WriteHooks` trait before and after it
   is applied, and open-for-write / release go through
-  `open_write`/`release_write`. Step 2 uses `LocalOnly`; locking, quorum and
-  dirty tracking plug in there. See `src/fs/hooks.rs`.
+  `open_write`/`release_write`. A standalone node uses `LocalOnly`; a
+  cluster node uses `lock::ClusterHooks`, and dirty tracking (step 7) plugs
+  in there too. See `src/fs/hooks.rs`.
 - **`.syncfs` inodes.** The directory is inode `2^63` and its files
   `2^63 + 1 + n`, far from the backing counter. See `src/fs/virt.rs`.
 
@@ -333,6 +466,14 @@ jq .peers /var/lib/syncfs/status.json
   restarts nodes, and requires every survivor's view to converge within
   8 s. `cargo test --release --test cluster -- --ignored` adds a 99-process
   cluster.
+- Locks: unit tests of the voter table and the attempt state machine; an
+  exhaustive model check of the protocol (`src/lock/model.rs`, run
+  optimized in CI); `tests/locks.rs` runs lock managers in process (exclusion,
+  waiting, renewal, lease expiry, quorum loss, a randomized 5-node stress
+  run); `tests/cluster.rs` has multi-process lock tests on FUSE mounts
+  (conflicting opens, 3 and 5 nodes taking turns, a killed holder, a
+  partition giving `EROFS` while reads work, voter daemons forming the
+  quorum).
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with
@@ -351,8 +492,8 @@ Each step ends with passing tests and a commit.
    provider registry for later steps.
 4. **Wire protocol and peer membership** (done): framed TCP, handshake,
    heartbeats, peer states, reconnect, voter daemon mode.
-5. **Quorum and lock table**: whole-file locks, leases, voter-only daemon
-   mode.
+5. **Quorum and lock table** (done): whole-file locks with quorum leases,
+   voter-only daemons voting, `EROFS` without quorum, `.syncfs/locks`.
 6. **Write path**: lock, quorum check, local write, mark dirty.
 7. **Async replication**: dirty-block bitmap and metadata journal.
 8. **Rejoin and recovery**.
