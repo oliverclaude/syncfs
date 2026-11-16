@@ -98,9 +98,35 @@ impl Node {
     }
 
     fn peers(&self) -> Option<Value> {
+        self.status("peers")
+    }
+
+    fn status(&self, section: &str) -> Option<Value> {
         let raw = std::fs::read(self.status_file()).ok()?;
         let v: Value = serde_json::from_slice(&raw).ok()?;
-        Some(v["peers"].clone())
+        Some(v[section].clone())
+    }
+
+    /// SIGKILL, even for a mount (which then needs a lazy unmount).
+    fn kill(&mut self) {
+        self.signal(libc::SIGKILL);
+        self.child.take().unwrap().wait().unwrap();
+        if self.kind == Kind::Mount {
+            for (cmd, arg) in [("fusermount3", "-uz"), ("umount", "-l")] {
+                if !is_mounted(&self.mnt()) {
+                    break;
+                }
+                let _ = Command::new(cmd)
+                    .arg(arg)
+                    .arg(self.mnt())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    fn backing(&self) -> PathBuf {
+        self.dir.join("backing")
     }
 
     fn running(&self) -> bool {
@@ -137,6 +163,13 @@ struct Cluster {
 
 impl Cluster {
     fn new(kinds: &[Kind]) -> Cluster {
+        let mut c = Cluster::build(kinds, &[]);
+        c.start_all();
+        c
+    }
+
+    /// Nodes with `extra` arguments each, not started yet.
+    fn build(kinds: &[Kind], extra: &[&str]) -> Cluster {
         let tmp = tempfile::Builder::new()
             .prefix("syncfs-cluster-")
             .tempdir()
@@ -174,6 +207,7 @@ impl Cluster {
                 args.push("--state-dir".into());
                 args.push(dir.join("state").display().to_string());
                 args.extend(peers.iter().cloned());
+                args.extend(extra.iter().map(|s| s.to_string()));
                 Node {
                     id,
                     kind,
@@ -183,11 +217,13 @@ impl Cluster {
                 }
             })
             .collect();
-        let mut c = Cluster { _tmp: tmp, nodes };
-        for n in &mut c.nodes {
+        Cluster { _tmp: tmp, nodes }
+    }
+
+    fn start_all(&mut self) {
+        for n in &mut self.nodes {
             n.start();
         }
-        c
     }
 
     fn node(&mut self, id: u16) -> &mut Node {
@@ -356,4 +392,250 @@ fn daemons_99_nodes() {
         c.node(id).start();
     }
     report("restart 3 of 99", c.converge("restart 3"));
+}
+
+// ---------------------------------------------------------------------------
+// Write locks across processes. Leases are short (1 s) so expiry and the
+// start-up quarantine take about a second. Replication does not exist yet
+// (step 7), so files that several nodes write are created in every backing
+// directory before the cluster starts.
+
+const LEASE: Duration = Duration::from_secs(1);
+
+fn lock_cluster(kinds: &[Kind], lock_wait: &str, files: &[&str]) -> Cluster {
+    let mut c = Cluster::build(
+        kinds,
+        &["--lock-lease-timeout", "1s", "--lock-wait", lock_wait],
+    );
+    for n in &c.nodes {
+        for f in files {
+            std::fs::write(n.backing().join(f), b"initial\n").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    // Voters grant nothing during their first lease.
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    c
+}
+
+fn open_rw(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).write(true).open(p)
+}
+
+fn errno(r: std::io::Result<impl Sized>) -> Option<i32> {
+    r.err().and_then(|e| e.raw_os_error())
+}
+
+/// Retries `f` until it succeeds (releases reach voters asynchronously).
+fn eventually<T>(what: &str, mut f: impl FnMut() -> std::io::Result<T>) -> T {
+    let t = Instant::now();
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(e) => assert!(t.elapsed() < CONVERGE, "{what}: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn locks_conflicting_open_is_busy_and_reads_stay_local() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "0s", &["f"]);
+    let f1 = c.node(1).mnt().join("f");
+    let f2 = c.node(2).mnt().join("f");
+    let mut w = open_rw(&f1).unwrap();
+    use std::io::Write;
+    w.write_all(b"from node 1\n").unwrap();
+    // Node 2 may read its own copy, but neither open it for writing nor
+    // create, remove or rename over it.
+    assert_eq!(std::fs::read(&f2).unwrap(), b"initial\n");
+    assert_eq!(errno(open_rw(&f2)), Some(libc::EBUSY));
+    assert_eq!(errno(std::fs::remove_file(&f2)), Some(libc::EBUSY));
+    assert_eq!(
+        errno(std::fs::rename(&f2, c.node(2).mnt().join("g"))),
+        Some(libc::EBUSY)
+    );
+    std::fs::write(c.node(2).mnt().join("other"), b"ok").unwrap();
+    // .syncfs/locks on the holder and the voter's view of it.
+    let held = c.node(1).status("locks").unwrap();
+    assert_eq!(held["held"], 1, "{held:#}");
+    assert_eq!(held["locks"][0]["path"], "/f");
+    assert_eq!(held["locks"][0]["valid"], true);
+    // The voter writes status.json every 5 heartbeats.
+    eventually("voter shows the lease", || {
+        let v = c.node(3).status("locks").unwrap_or_default();
+        let leased = v["votes"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|g| g["path"] == "/f" && g["holder"] == 1 && g["state"] == "leased")
+        });
+        leased
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("{v:#}")))
+    });
+    // Closing releases.
+    drop(w);
+    let mut w2 = eventually("node 2 opens after release", || open_rw(&f2));
+    w2.write_all(b"node 2\n").unwrap();
+    assert_eq!(errno(open_rw(&f1)), Some(libc::EBUSY));
+    drop(w2);
+    c.converge("end");
+}
+
+/// Writers on every mount contend for one file; their critical sections
+/// (open for writing .. close) never overlap.
+fn contend(kinds: &[Kind]) {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    let c = lock_cluster(kinds, "20s", &["shared"]);
+    let epoch = Instant::now();
+    let spans: Arc<Mutex<Vec<(u16, Duration, Duration)>>> = Arc::default();
+    let threads: Vec<_> = c
+        .nodes
+        .iter()
+        .filter(|n| n.kind == Kind::Mount)
+        .map(|n| {
+            let (id, path, spans) = (n.id, n.mnt().join("shared"), spans.clone());
+            std::thread::spawn(move || {
+                for round in 0..8 {
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap_or_else(|e| panic!("node {id} round {round}: {e}"));
+                    let start = epoch.elapsed();
+                    writeln!(f, "node {id} round {round}").unwrap();
+                    std::thread::sleep(Duration::from_millis(15));
+                    f.sync_all().unwrap();
+                    let end = epoch.elapsed();
+                    drop(f);
+                    spans.lock().unwrap().push((id, start, end));
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let mut spans = spans.lock().unwrap().clone();
+    spans.sort_by_key(|s| s.1);
+    for w in spans.windows(2) {
+        assert!(
+            w[0].0 == w[1].0 || w[0].2 <= w[1].1,
+            "overlapping writers: {:?} and {:?}",
+            w[0],
+            w[1]
+        );
+    }
+    let writers = kinds.iter().filter(|k| **k == Kind::Mount).count();
+    assert_eq!(spans.len(), writers * 8);
+    eprintln!(
+        "{} lock hand-overs in {:?}",
+        spans.len(),
+        spans.last().unwrap().2 - spans[0].1
+    );
+}
+
+#[test]
+fn locks_three_writers_take_turns() {
+    require_fuse!();
+    contend(&[Kind::Mount, Kind::Mount, Kind::Mount]);
+}
+
+#[test]
+fn locks_five_nodes_with_voters_take_turns() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    contend(&[Mount, Daemon, Mount, Daemon, Mount]);
+}
+
+#[test]
+fn locks_killed_holder_expires() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "10s", &["f"]);
+    let f2 = c.node(2).mnt().join("f");
+    let _w = open_rw(&c.node(1).mnt().join("f")).unwrap();
+    // Renewals keep it held well past one lease.
+    std::thread::sleep(LEASE * 2);
+    assert!(c.node(1).status("locks").unwrap()["locks"][0]["valid"] == true);
+    c.node(1).kill();
+    let t = Instant::now();
+    // Blocks (lock_wait 10 s) until node 1's lease runs out at the voters.
+    let w2 = open_rw(&f2).expect("lock not freed by lease expiry");
+    let waited = t.elapsed();
+    eprintln!("lock moved {waited:?} after the holder was killed");
+    assert!(waited >= LEASE / 3, "{waited:?}: lease ignored?");
+    assert!(waited < LEASE * 3, "{waited:?}");
+    drop(w2);
+}
+
+#[test]
+fn locks_quorum_loss_is_erofs_while_reads_work() {
+    require_fuse!();
+    use std::io::{Read, Seek, Write};
+    use Kind::{Daemon, Mount};
+    // One mount and two voter-only daemons: the daemons alone make the
+    // quorum for the mount's writes.
+    let mut c = lock_cluster(&[Mount, Daemon, Daemon], "2s", &["f"]);
+    let mnt = c.node(1).mnt();
+    let mut open = open_rw(&mnt.join("f")).unwrap();
+    open.write_all(b"one\n").unwrap();
+    std::fs::write(mnt.join("new"), b"x").unwrap();
+
+    // Partition: both voters hang. Node 1 sees them down after 3
+    // heartbeats; its lease lapses within one lease.
+    c.node(2).signal(libc::SIGSTOP);
+    c.node(3).signal(libc::SIGSTOP);
+    eventually("quorum lost", || {
+        let p = c.node(1).peers().unwrap();
+        (p["have_quorum"] == false)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other("still quorum"))
+    });
+    let t = Instant::now();
+    assert_eq!(
+        errno(std::fs::write(mnt.join("g"), b"x")),
+        Some(libc::EROFS)
+    );
+    assert_eq!(errno(open_rw(&mnt.join("new"))), Some(libc::EROFS));
+    assert_eq!(
+        errno(std::fs::remove_file(mnt.join("new"))),
+        Some(libc::EROFS)
+    );
+    assert_eq!(errno(std::fs::create_dir(mnt.join("d"))), Some(libc::EROFS));
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "EROFS took {:?}",
+        t.elapsed()
+    );
+    std::thread::sleep(LEASE);
+    // The already open file: its lease lapsed, re-acquiring fails.
+    assert_eq!(errno(open.write_all(b"two\n")), Some(libc::EROFS));
+    // Reads are local and keep working.
+    assert_eq!(std::fs::read(mnt.join("new")).unwrap(), b"x");
+    let mut s = String::new();
+    open.rewind().unwrap();
+    open.read_to_string(&mut s).unwrap();
+    assert_eq!(s, "one\nial\n");
+    assert!(std::fs::read_dir(&mnt).unwrap().count() >= 2);
+
+    // Heal: writes work again, including on the open handle.
+    c.node(2).signal(libc::SIGCONT);
+    c.node(3).signal(libc::SIGCONT);
+    c.converge("healed");
+    eventually("write after heal", || open.write_all(b"three\n"));
+    std::fs::write(mnt.join("g"), b"x").unwrap();
+    // Restarted voters wait one lease before voting again.
+    c.node(2).kill();
+    c.node(3).kill();
+    c.node(2).start();
+    c.node(3).start();
+    c.converge("voters restarted");
+    let t = Instant::now();
+    eventually("write after voter restart", || {
+        std::fs::write(mnt.join("h"), b"x")
+    });
+    eprintln!("writable {:?} after the voters came back", t.elapsed());
 }

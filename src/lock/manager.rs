@@ -98,6 +98,9 @@ struct Renewal {
 
 struct Held {
     ballot: Ballot,
+    /// The attempt that acquired it: grants arriving after the quorum get
+    /// a confirm too, so every reachable voter carries the lease.
+    req: u64,
     refs: u32,
     valid_until: Instant,
     since: Instant,
@@ -425,8 +428,24 @@ impl Inner {
                 st.voter.release(from, &Key::new(&key), ballot);
             }
             // Requester side.
-            Message::LockGrant { req, .. } => {
+            Message::LockGrant { req, ballot } => {
                 let Some(p) = st.pending.get_mut(&req) else {
+                    let late = st
+                        .held
+                        .iter()
+                        .find(|(_, h)| h.req == req && h.ballot == ballot);
+                    if let Some((key, _)) = late {
+                        q.push_back((
+                            self.s.me,
+                            from,
+                            Message::LockConfirm {
+                                req,
+                                key: key.as_bytes().to_vec(),
+                                ballot,
+                                lease_ms: self.lease_ms(),
+                            },
+                        ));
+                    }
                     return;
                 };
                 let step = p.attempt.on_grant(from);
@@ -527,10 +546,11 @@ impl Inner {
         let (mut st, res) = self.attempts(st, key, ballot, deadline);
         st.acquiring.remove(key);
         match res {
-            Ok(valid_until) => {
+            Ok((req, valid_until)) => {
                 st.counters.acquired += 1;
                 let h = st.held.entry(key.clone()).or_insert(Held {
                     ballot,
+                    req,
                     refs: 0,
                     valid_until,
                     since: Instant::now(),
@@ -540,6 +560,7 @@ impl Inner {
                 // Replaces a lapsed lock's ballot (its voters dropped it
                 // when we asked again).
                 h.ballot = ballot;
+                h.req = req;
                 h.valid_until = valid_until;
                 h.renewal = None;
                 h.lapsed_logged = false;
@@ -564,14 +585,15 @@ impl Inner {
     }
 
     /// Runs attempts with one ballot until one succeeds or the deadline
-    /// passes. Returns until when the lock is valid.
+    /// passes. Returns the successful request and until when the lock is
+    /// valid.
     fn attempts<'a>(
         &'a self,
         mut st: MutexGuard<'a, State>,
         key: &Key,
         ballot: Ballot,
         deadline: Instant,
-    ) -> (MutexGuard<'a, State>, Result<Instant, LockError>) {
+    ) -> (MutexGuard<'a, State>, Result<(u64, Instant), LockError>) {
         let mut backoff = Duration::from_millis(20);
         loop {
             if self.stop.load(Ordering::SeqCst) {
@@ -638,7 +660,7 @@ impl Inner {
             if p.attempt.phase == Phase::Acquired {
                 let sent = p.confirm_sent.expect("confirmed attempts sent confirms");
                 let valid = sent + self.s.lease.saturating_sub(self.s.margin());
-                return (st, Ok(valid));
+                return (st, Ok((req, valid)));
             }
             // Withdraw every vote this attempt may have got.
             let mut q = Queue::new();
