@@ -1,0 +1,21 @@
+[package]
+name = "syncfs"
+version = "0.1.0"
+edition = "2021"
+description = "A replicating FUSE filesystem: every node keeps a full local copy, writes need quorum and a whole-file lock"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/oliverclaude/syncfs"
+readme = "README.md"
+keywords = ["fuse", "filesystem", "replication", "quorum"]
+categories = ["filesystem"]
+
+[[bin]]
+name = "syncfs"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
