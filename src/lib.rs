@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod fs;
 pub mod helper;
+pub mod lock;
 pub mod logging;
 pub mod mount;
 pub mod net;

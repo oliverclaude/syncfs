@@ -362,6 +362,9 @@ pub enum DenyReason {
     Preempted,
     /// The voter restarted less than one lease ago and grants nothing yet.
     Quarantine,
+    /// The requested lease is longer than this voter's
+    /// `lock_lease_timeout` (the nodes are configured differently).
+    Lease,
     /// Confirm or renew for a grant the voter does not have.
     NotHeld,
 }
