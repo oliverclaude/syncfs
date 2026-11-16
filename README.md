@@ -3,8 +3,9 @@
 `syncfs` is a replicating FUSE filesystem for Linux. Several `syncfs` nodes
 form a cluster and keep a full copy of the same filesystem on every node.
 
-> **Status:** early development. Steps 1 (configuration) and 2 (single-node
-> passthrough FUSE filesystem, mount helper, fstab) are done. Clustering is
+> **Status:** early development. Steps 1 (configuration), 2 (single-node
+> passthrough FUSE filesystem, mount helper, fstab) and 3 (the `.syncfs`
+> status directory) are done. Clustering is
 > not implemented yet: a mount today is a local mirror of its backing
 > directory.
 
@@ -33,7 +34,8 @@ form a cluster and keep a full copy of the same filesystem on every node.
 - **Transport.** Plaintext TCP. There is no authentication or encryption yet,
   so run it only on a trusted network.
 - **Introspection.** A hidden, read-only `.syncfs` directory at the root of
-  the mount exposes node, peer, lock, queue and replication stats.
+  the mount exposes node, peer, lock, queue and replication stats (see
+  [below](#the-syncfs-status-directory)).
 - **Mounting.** `-o debug`, `allow_other` / `allow_root`, user and root
   mounts, and a `mount.syncfs` helper so it works from `/etc/fstab`.
 
@@ -131,6 +133,54 @@ Install the binary as `/usr/bin/syncfs` and link the helper:
 config file. The helper supports mount's `-f` (fake), `-s` (sloppy:
 ignore unknown options), `-v` and `-n`.
 
+## The `.syncfs` status directory
+
+Every mount has a hidden, read-only directory `.syncfs` at its root. It is
+not listed by `ls -a` of the root, but any path through it works:
+
+```sh
+cat /mnt/data/.syncfs/stats
+jq .peers /mnt/data/.syncfs/status.json
+```
+
+| File          | Contents (YAML)                                                                  |
+|---------------|----------------------------------------------------------------------------------|
+| `node`        | node id, mode, version, hostname, pid, start time, uptime, paths, mount options   |
+| `config`      | the effective configuration (all layers merged)                                  |
+| `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes |
+| `peers`       | cluster size, quorum, every peer with its state (step 4 fills in live state)     |
+| `locks`       | held whole-file locks and the lease timeout (step 5)                             |
+| `replication` | dirty files/blocks and journal queue length (step 7)                             |
+| `status.json` | all of the above as one JSON object, keyed by file name, plus `format_version`   |
+
+Sections whose subsystem does not exist yet say `implemented: false`.
+Field names and nesting are the same in the YAML files and in
+`status.json`; new fields may be added, and `format_version` changes only
+for incompatible changes.
+
+- **Contents are generated when a file is opened.** Each open takes one
+  snapshot and every read serves it (direct I/O), so `cat`, `less` and
+  `jq` see consistent text regardless of the size `stat` reported.
+- **Read-only.** Any change to the directory or its files (write, create,
+  truncate, unlink, rename into or out of it, link, chmod, xattrs) fails with
+  `EROFS`. Files are mode 0444 and the directory 0555, owned by the owner of
+  the backing directory, so for users other than root the kernel's
+  permission check usually refuses first with `EACCES`. Removing or
+  renaming `.syncfs` itself fails with `EROFS`.
+- **Nothing is stored in the backing directory.** If the backing directory
+  already contains a real `.syncfs`, it is shadowed: hidden from the mount
+  and untouchable through it (but left intact on disk). syncfs logs a warning
+  at mount and `node` reports `shadowed_backing_entry: true`. Rename it in
+  the backing directory to reach it through the mount.
+- **Counters** are relaxed atomics (one uncontended add per request).
+  Requests for `.syncfs` itself are counted only in `status_requests`, not
+  in the per-operation or byte counters. Errors are counted per operation,
+  including expected ones such as `ENOENT` lookups.
+- **Adding a file.** A subsystem implements `status::Provider` (a name and
+  a `render()` returning a JSON value) and registers it in
+  `mount::register_status`; it then appears as a YAML file and a
+  `status.json` key. See `src/status/`.
+
 ## Internals
 
 - **Inodes.** Each inode the kernel holds is an `O_PATH` descriptor on the
@@ -146,13 +196,15 @@ ignore unknown options), `-v` and `-n`.
   is applied, and open-for-write / release go through
   `open_write`/`release_write`. Step 2 uses `LocalOnly`; locking, quorum and
   dirty tracking plug in there. See `src/fs/hooks.rs`.
+- **`.syncfs` inodes.** The directory is inode `2^63` and its files
+  `2^63 + 1 + n`, far from the backing counter. See `src/fs/virt.rs`.
 
 ## Testing
 
 - `cargo test` runs unit tests plus FUSE mount tests (as the current user;
   they skip with a message when `/dev/fuse` or `fusermount3` is missing).
-  Run the mount test binary with `sudo` too for the root and multi-user
-  cases; CI does both on x86_64 and arm64.
+  Run the `mount` and `status` test binaries with `sudo` too for the root
+  and multi-user cases; CI does both on x86_64 and arm64.
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with
@@ -167,7 +219,8 @@ Each step ends with passing tests and a commit.
 2. **Local passthrough FUSE** (done): single-node mirror of the backing directory,
    `debug`, `allow_other`, user/root mounts, `mount.syncfs` for fstab.
    Integration tests and `pjdfstest`.
-3. **Hidden `.syncfs` folder** with stats.
+3. **Hidden `.syncfs` folder** (done): read-only status files, op counters,
+   provider registry for later steps.
 4. **Wire protocol and peer membership**: framed TCP, heartbeats, peer
    up/down tracking.
 5. **Quorum and lock table**: whole-file locks, leases, voter-only daemon
