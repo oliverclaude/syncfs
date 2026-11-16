@@ -2,7 +2,8 @@
 //! foreground or as a daemon.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use fuser::{MountOption, Session, SessionACL};
@@ -128,21 +129,121 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         .with_context(|| format!("opening backing_dir {}", backing.display()))?;
     log::debug!("fuse options: {:?}", fuse_cfg);
 
+    let mount = || -> anyhow::Result<Served> {
+        if rustix::process::geteuid().is_root() {
+            mount_direct(fs, backing, mountpoint, &fuse_cfg, kernel_flags)
+        } else {
+            let session = Session::new(fs, mountpoint, &fuse_cfg)?;
+            Ok(Served {
+                session,
+                direct: None,
+            })
+        }
+        .with_context(|| format!("mounting {}", mountpoint.display()))
+    };
     if cfg.foreground {
-        let session = Session::new(fs, mountpoint, &fuse_cfg)
-            .with_context(|| format!("mounting {}", mountpoint.display()))?;
+        let served = mount()?;
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
-        serve(session)
+        serve(served)
     } else {
-        daemonize(|| {
-            Session::new(fs, mountpoint, &fuse_cfg)
-                .with_context(|| format!("mounting {}", mountpoint.display()))
+        daemonize(mount)
+    }
+}
+
+/// A mounted session. `direct` is set when we called mount(2) ourselves
+/// and must unmount ourselves too.
+struct Served {
+    session: Session<SyncFs<LocalOnly>>,
+    direct: Option<PathBuf>,
+}
+
+/// Mounts with mount(2) as root, with filesystem type `fuse.syncfs` so the
+/// mount table, `findmnt -t fuse.syncfs` and `mount -a` see the real type
+/// (fuser's own root path always uses plain `fuse`).
+fn mount_direct(
+    fs: SyncFs<LocalOnly>,
+    backing: &Path,
+    mountpoint: &Path,
+    fuse_cfg: &fuser::Config,
+    kernel_flags: &[String],
+) -> anyhow::Result<Served> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .context("opening /dev/fuse (is the fuse module loaded?)")?;
+    let root_mode = std::fs::metadata(mountpoint)?.mode() & libc::S_IFMT;
+    let mut data = format!(
+        "fd={},rootmode={:o},user_id=0,group_id=0,default_permissions",
+        dev.as_raw_fd(),
+        root_mode
+    );
+    if fuse_cfg.acl != SessionACL::Owner {
+        data.push_str(",allow_other");
+    }
+    let has = |f: &str| {
+        kernel_flags.iter().rev().find(|k| {
+            let base = k.strip_prefix("no").unwrap_or(k);
+            base == f
         })
+    };
+    let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
+    if has("suid").is_some_and(|k| k == "suid") {
+        flags &= !libc::MS_NOSUID;
+    }
+    if has("dev").is_some_and(|k| k == "dev") {
+        flags &= !libc::MS_NODEV;
+    }
+    for (name, bit) in [
+        ("noexec", libc::MS_NOEXEC),
+        ("noatime", libc::MS_NOATIME),
+        ("sync", libc::MS_SYNCHRONOUS),
+        ("dirsync", libc::MS_DIRSYNC),
+    ] {
+        if has(name.trim_start_matches("no")).is_some_and(|k| k == name) {
+            flags |= bit;
+        }
+    }
+    let c = |s: &str| std::ffi::CString::new(s).map_err(anyhow::Error::from);
+    let source = c(&backing.display().to_string())?;
+    let target = c(&mountpoint.display().to_string())?;
+    let fstype = c("fuse.syncfs")?;
+    let data = c(&data)?;
+    // SAFETY: all pointers are valid NUL-terminated strings.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            data.as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        bail!("mount(2): {}", std::io::Error::last_os_error());
+    }
+    match Session::from_fd(fs, OwnedFd::from(dev), fuse_cfg.acl, fuse_cfg.clone()) {
+        Ok(session) => Ok(Served {
+            session,
+            direct: Some(mountpoint.to_path_buf()),
+        }),
+        Err(e) => {
+            // SAFETY: valid path string.
+            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            Err(e.into())
+        }
     }
 }
 
 /// Runs the session until unmounted; SIGINT/SIGTERM/SIGHUP unmount cleanly.
-fn serve(mut session: Session<SyncFs<LocalOnly>>) -> anyhow::Result<()> {
+fn serve(served: Served) -> anyhow::Result<()> {
+    let Served {
+        mut session,
+        direct,
+    } = served;
     let mut unmounter = session.unmount_callable();
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
@@ -152,7 +253,20 @@ fn serve(mut session: Session<SyncFs<LocalOnly>>) -> anyhow::Result<()> {
     std::thread::spawn(move || {
         if let Some(sig) = signals.forever().next() {
             log::info!("signal {sig}: unmounting");
-            if let Err(e) = unmounter.unmount() {
+            let res = match &direct {
+                Some(p) => std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+                    .map_err(std::io::Error::other)
+                    .and_then(|c| {
+                        // SAFETY: valid path string.
+                        if unsafe { libc::umount2(c.as_ptr(), 0) } == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    }),
+                None => unmounter.unmount(),
+            };
+            if let Err(e) = res {
                 log::error!("unmount failed: {e}");
             }
         }
@@ -164,9 +278,7 @@ fn serve(mut session: Session<SyncFs<LocalOnly>>) -> anyhow::Result<()> {
 
 /// Forks. The parent waits until the child reports the mount result over a
 /// pipe and exits with it; the child detaches and serves.
-fn daemonize(
-    mount: impl FnOnce() -> anyhow::Result<Session<SyncFs<LocalOnly>>>,
-) -> anyhow::Result<()> {
+fn daemonize(mount: impl FnOnce() -> anyhow::Result<Served>) -> anyhow::Result<()> {
     let (mut rx, mut tx) = {
         let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
         (std::fs::File::from(r), std::fs::File::from(w))
