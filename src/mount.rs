@@ -1,7 +1,6 @@
 //! Mounting: turns a [`Config`] into a running FUSE session, in the
 //! foreground or as a daemon.
 
-use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +11,8 @@ use signal_hook::iterator::Signals;
 
 use crate::config::Config;
 use crate::fs::{LocalOnly, SyncFs};
-use crate::logging;
+use crate::net::Network;
+use crate::process;
 use crate::status::{providers, Registry};
 
 /// FUSE session settings for `cfg`. `kernel_flags` are the generic mount
@@ -111,7 +111,13 @@ fn option_name(o: &MountOption) -> String {
 }
 
 /// Registers the `.syncfs` providers, in file order.
-fn register_status(status: &Registry, fs: &SyncFs<LocalOnly>, cfg: &Config, fc: &fuser::Config) {
+fn register_status(
+    status: &Registry,
+    fs: &SyncFs<LocalOnly>,
+    net: &Network,
+    cfg: &Config,
+    fc: &fuser::Config,
+) {
     let mut mount_options: Vec<String> = fc.mount_options.iter().map(option_name).collect();
     match fc.acl {
         SessionACL::All => mount_options.push("allow_other".into()),
@@ -123,7 +129,7 @@ fn register_status(status: &Registry, fs: &SyncFs<LocalOnly>, cfg: &Config, fc: 
         mount_options,
         shadowed_backing_entry: fs.shadows_backing_entry(),
     };
-    providers::register_builtin(status, info, fs.stats_provider());
+    providers::register_builtin(status, info, Some(fs.stats_provider()), net.provider());
 }
 
 fn check_dir(what: &str, p: &Path) -> anyhow::Result<()> {
@@ -168,32 +174,39 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
     raise_nofile_limit();
 
     let fuse_cfg = fuse_config(cfg, kernel_flags);
-    let status = Registry::new();
-    let fs = SyncFs::new(backing, LocalOnly, Arc::clone(&status))
-        .with_context(|| format!("opening backing_dir {}", backing.display()))?;
-    register_status(&status, &fs, cfg, &fuse_cfg);
     log::debug!("fuse options: {:?}", fuse_cfg);
 
-    let mount = || -> anyhow::Result<Served> {
-        if rustix::process::geteuid().is_root() {
+    // Runs after daemonizing: threads do not survive fork.
+    let start = || -> anyhow::Result<Served> {
+        let status = Registry::new();
+        let fs = SyncFs::new(backing, LocalOnly, Arc::clone(&status))
+            .with_context(|| format!("opening backing_dir {}", backing.display()))?;
+        let net = Network::start(cfg).with_context(|| format!("listening on {}", cfg.listen))?;
+        register_status(&status, &fs, &net, cfg, &fuse_cfg);
+        let mounted = if rustix::process::geteuid().is_root() {
             mount_direct(fs, backing, mountpoint, &fuse_cfg, kernel_flags)
         } else {
-            let session = Session::new(fs, mountpoint, &fuse_cfg)?;
-            Ok(Served {
-                session,
-                direct: None,
-            })
-        }
-        .with_context(|| format!("mounting {}", mountpoint.display()))
-    };
-    if cfg.foreground {
-        let signals = stop_signals()?;
-        let served = mount()?;
+            Session::new(fs, mountpoint, &fuse_cfg)
+                .map(|session| Served {
+                    session,
+                    direct: None,
+                    net: None,
+                })
+                .map_err(Into::into)
+        };
+        let mut served = match mounted.with_context(|| format!("mounting {}", mountpoint.display()))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                net.shutdown();
+                return Err(e);
+            }
+        };
+        served.net = Some(net);
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
-        serve(served, signals)
-    } else {
-        daemonize(mount)
-    }
+        Ok(served)
+    };
+    process::run(cfg.foreground, start, serve)
 }
 
 /// A mounted session. `direct` is set when we called mount(2) ourselves
@@ -201,6 +214,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
 struct Served {
     session: Session<SyncFs<LocalOnly>>,
     direct: Option<PathBuf>,
+    net: Option<Network>,
 }
 
 /// Mounts with mount(2) as root, with filesystem type `fuse.syncfs` so the
@@ -275,6 +289,7 @@ fn mount_direct(
         Ok(session) => Ok(Served {
             session,
             direct: Some(mountpoint.to_path_buf()),
+            net: None,
         }),
         Err(e) => {
             // SAFETY: valid path string.
@@ -284,22 +299,12 @@ fn mount_direct(
     }
 }
 
-/// Catches SIGINT, SIGTERM and SIGHUP. Installed before mounting so that a
-/// signal arriving as soon as the mount is visible is not fatal: it stays
-/// pending until [`serve`] handles it.
-fn stop_signals() -> std::io::Result<Signals> {
-    Signals::new([
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ])
-}
-
 /// Runs the session until unmounted; `signals` unmount cleanly.
 fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
     let Served {
         mut session,
         direct,
+        net,
     } = served;
     let mut unmounter = session.unmount_callable();
     std::thread::spawn(move || {
@@ -323,77 +328,11 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
             }
         }
     });
-    session.run().context("serving filesystem")?;
+    let res = session.run().context("serving filesystem");
+    if let Some(net) = net {
+        net.shutdown();
+    }
+    res?;
     log::info!("unmounted");
     Ok(())
-}
-
-/// Forks. The parent waits until the child reports the mount result over a
-/// pipe and exits with it; the child detaches and serves.
-fn daemonize(mount: impl FnOnce() -> anyhow::Result<Served>) -> anyhow::Result<()> {
-    let (mut rx, mut tx) = {
-        let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
-        (std::fs::File::from(r), std::fs::File::from(w))
-    };
-    // SAFETY: single-threaded at this point (no session or threads yet).
-    match unsafe { libc::fork() } {
-        -1 => bail!("fork: {}", std::io::Error::last_os_error()),
-        0 => {}
-        _child => {
-            drop(tx);
-            let mut msg = Vec::new();
-            rx.read_to_end(&mut msg)?;
-            return match msg.split_first() {
-                Some((0, _)) => Ok(()),
-                Some((_, err)) => bail!("{}", String::from_utf8_lossy(err)),
-                None => bail!("filesystem daemon exited during startup"),
-            };
-        }
-    }
-    drop(rx);
-    let _ = rustix::process::setsid();
-    let signals = match stop_signals() {
-        Ok(s) => s,
-        Err(e) => {
-            let mut msg = vec![1u8];
-            msg.extend_from_slice(format!("installing signal handlers: {e}").as_bytes());
-            let _ = tx.write_all(&msg);
-            std::process::exit(1);
-        }
-    };
-    match mount() {
-        Ok(session) => {
-            detach_stdio();
-            logging::switch_to_syslog();
-            let _ = tx.write_all(&[0]);
-            drop(tx);
-            if let Err(e) = serve(session, signals) {
-                log::error!("{e:#}");
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Err(e) => {
-            let mut msg = vec![1u8];
-            msg.extend_from_slice(format!("{e:#}").as_bytes());
-            let _ = tx.write_all(&msg);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn detach_stdio() {
-    use std::os::fd::AsRawFd;
-    let _ = std::env::set_current_dir("/");
-    let Ok(null) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-    else {
-        return;
-    };
-    for fd in 0..=2 {
-        // SAFETY: repoints the standard descriptors at /dev/null.
-        unsafe { libc::dup2(null.as_raw_fd(), fd) };
-    }
 }

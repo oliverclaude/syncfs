@@ -65,35 +65,6 @@ pub fn config(config: Config) -> Arc<dyn Provider> {
     Arc::new(FnProvider::new("config", move || v.clone()))
 }
 
-/// `peers`: cluster membership. Connection state arrives in step 4; until
-/// then every remote peer is `unknown`.
-pub fn peers(config: Config) -> Arc<dyn Provider> {
-    Arc::new(FnProvider::new("peers", move || {
-        let peers: Vec<Value> = config
-            .peers
-            .iter()
-            .map(|p| {
-                let me = p.id == config.node_id;
-                json!({
-                    "id": p.id,
-                    "address": p.address,
-                    "self": me,
-                    "state": if me { "up" } else { "unknown" },
-                    "last_seen_secs_ago": Value::Null,
-                })
-            })
-            .collect();
-        json!({
-            "implemented": false,
-            "cluster_size": config.cluster_size(),
-            "quorum": config.quorum(),
-            "reachable": 1,
-            "have_quorum": config.quorum() <= 1,
-            "peers": peers,
-        })
-    }))
-}
-
 /// `locks`: the whole-file lock table (step 5).
 pub fn locks(config: Config) -> Arc<dyn Provider> {
     Arc::new(FnProvider::new("locks", move || {
@@ -121,13 +92,20 @@ pub fn replication(config: Config) -> Arc<dyn Provider> {
 }
 
 /// Registers the built-in providers in file order. `stats` comes from the
-/// filesystem, which owns the counters.
-pub fn register_builtin(registry: &Registry, info: NodeInfo, stats: Arc<dyn Provider>) {
+/// filesystem (absent in daemon mode) and `peers` from the network.
+pub fn register_builtin(
+    registry: &Registry,
+    info: NodeInfo,
+    stats: Option<Arc<dyn Provider>>,
+    peers: Arc<dyn Provider>,
+) {
     let cfg = info.config.clone();
     registry.register(node(info));
     registry.register(config(cfg.clone()));
-    registry.register(stats);
-    registry.register(peers(cfg.clone()));
+    if let Some(stats) = stats {
+        registry.register(stats);
+    }
+    registry.register(peers);
     registry.register(locks(cfg.clone()));
     registry.register(replication(cfg));
 }

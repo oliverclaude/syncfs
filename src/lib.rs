@@ -8,4 +8,6 @@ pub mod helper;
 pub mod logging;
 pub mod mount;
 pub mod net;
+pub mod process;
 pub mod status;
+pub mod voter;

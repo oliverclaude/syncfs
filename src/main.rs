@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use syncfs::cli::Cli;
 use syncfs::config::{self, Environment, Loaded, Mode};
-use syncfs::{helper, logging, mount};
+use syncfs::{helper, logging, mount, voter};
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
@@ -60,8 +60,8 @@ fn run(cli: &Cli, sloppy: bool) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Mode::Daemon => {
-            eprintln!("syncfs: daemon mode is not implemented yet (step 5)");
-            Ok(ExitCode::from(2))
+            voter::run(cfg)?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
