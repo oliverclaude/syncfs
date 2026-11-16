@@ -63,21 +63,32 @@ pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
+/// Unmounts, retrying briefly while the kernel still reports the mount
+/// busy (closing a file finishes asynchronously).
 pub fn unmount(mountpoint: &Path) {
     let is_root = unsafe { libc::geteuid() } == 0;
-    let status = if is_root {
-        Command::new("umount").arg(mountpoint).status()
-    } else {
-        Command::new("fusermount3")
-            .arg("-u")
-            .arg(mountpoint)
-            .status()
-    };
-    assert!(
-        status.unwrap().success(),
-        "unmount {}",
-        mountpoint.display()
-    );
+    let start = Instant::now();
+    loop {
+        let out = if is_root {
+            Command::new("umount").arg(mountpoint).output()
+        } else {
+            Command::new("fusermount3")
+                .arg("-u")
+                .arg(mountpoint)
+                .output()
+        }
+        .unwrap();
+        if out.status.success() {
+            return;
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("busy") && start.elapsed() < Duration::from_secs(5),
+            "unmount {}: {err}",
+            mountpoint.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A syncfs mounted in the foreground in a temporary directory.
