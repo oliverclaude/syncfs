@@ -1,7 +1,9 @@
 //! Membership and handshake, in process over localhost TCP.
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use syncfs::config::{resolve, Config, Environment, Mode, NodeId, PartialConfig, Peer};
@@ -13,10 +15,7 @@ use syncfs::net::{Network, PeerState, Snapshot};
 const WAIT: Duration = Duration::from_secs(10);
 
 fn free_ports(n: usize) -> Vec<u16> {
-    let ls: Vec<_> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    ls.iter().map(|l| l.local_addr().unwrap().port()).collect()
+    common::listen_ports(n)
 }
 
 fn config(id: NodeId, ports: &[(NodeId, u16)], listen: u16, cluster: &str) -> Config {

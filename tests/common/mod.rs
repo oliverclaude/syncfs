@@ -175,3 +175,32 @@ impl Drop for Mounted {
         }
     }
 }
+
+/// `n` free TCP ports on 127.0.0.1 for node listeners, chosen below the
+/// kernel's ephemeral range so that outgoing connections (of this or a
+/// concurrent test) cannot take them before or between node restarts.
+pub fn listen_ports(n: usize) -> Vec<u16> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<u16>().ok())
+        .unwrap_or(32768);
+    let (base, span) = (10_000u16, low.saturating_sub(10_000).max(1000));
+    // Spread concurrent test binaries apart by pid.
+    let _ = NEXT.compare_exchange(
+        0,
+        (std::process::id() % u32::from(span)) as u16 + 1,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    let mut out = Vec::new();
+    while out.len() < n {
+        let off = NEXT.fetch_add(1, Ordering::SeqCst) % span;
+        let port = base + off;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            out.push(port);
+        }
+    }
+    out
+}

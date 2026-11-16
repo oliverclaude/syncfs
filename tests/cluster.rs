@@ -4,7 +4,6 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -38,6 +37,15 @@ impl Node {
         self.dir.join("mnt")
     }
 
+    /// The node's stderr, appended across restarts.
+    fn log(&self) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("log"))
+            .unwrap()
+    }
+
     fn status_file(&self) -> PathBuf {
         match self.kind {
             Kind::Mount => self.mnt().join(".syncfs/status.json"),
@@ -56,14 +64,15 @@ impl Node {
             .args(&self.args)
             .arg("--foreground")
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(self.log())
             .spawn()
             .unwrap();
         self.child = Some(child);
         let f = self.status_file();
         wait_until(&format!("node {} start", self.id), || {
             if let Some(st) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("node {} exited: {st}", self.id);
+                let log = std::fs::read_to_string(self.dir.join("log")).unwrap_or_default();
+                panic!("node {} exited: {st}\n{log}", self.id);
             }
             (self.kind == Kind::Daemon || is_mounted(&self.mnt())) && f.exists()
         });
@@ -132,12 +141,7 @@ impl Cluster {
             .prefix("syncfs-cluster-")
             .tempdir()
             .unwrap();
-        let ls: Vec<_> = kinds
-            .iter()
-            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        let ports: Vec<u16> = ls.iter().map(|l| l.local_addr().unwrap().port()).collect();
-        drop(ls);
+        let ports = common::listen_ports(kinds.len());
         let peers: Vec<String> = ports
             .iter()
             .enumerate()
