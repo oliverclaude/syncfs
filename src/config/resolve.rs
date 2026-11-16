@@ -87,6 +87,8 @@ pub struct Config {
     pub allow_other: bool,
     pub allow_root: bool,
     pub log_level: LogLevel,
+    /// Stay in the foreground instead of daemonizing. Implied by `debug`.
+    pub foreground: bool,
 }
 
 impl Config {
@@ -198,6 +200,7 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
     let block_size = p.block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
     let allow_other = p.allow_other.unwrap_or(false);
     let allow_root = p.allow_root.unwrap_or(false);
+    let foreground = p.foreground.unwrap_or(false) || debug;
 
     if node_id == 0 {
         errors.push(ValidationError::NodeIdZero);
@@ -281,6 +284,7 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
             allow_other,
             allow_root,
             log_level,
+            foreground,
         },
         warnings,
     })

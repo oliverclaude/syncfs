@@ -67,3 +67,7 @@ allow_root: false
 
 # error, warn, info, debug or trace.                      Default: info
 log_level: info
+
+# Stay in the foreground instead of daemonizing (debug implies it). Use this
+# under systemd with Type=simple.                         Default: false
+foreground: false

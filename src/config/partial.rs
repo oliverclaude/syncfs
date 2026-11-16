@@ -27,6 +27,7 @@ pub struct PartialConfig {
     pub allow_other: Option<bool>,
     pub allow_root: Option<bool>,
     pub log_level: Option<LogLevel>,
+    pub foreground: Option<bool>,
 }
 
 impl PartialConfig {
@@ -49,6 +50,7 @@ impl PartialConfig {
             allow_other: upper.allow_other.or(self.allow_other),
             allow_root: upper.allow_root.or(self.allow_root),
             log_level: upper.log_level.or(self.log_level),
+            foreground: upper.foreground.or(self.foreground),
         }
     }
 

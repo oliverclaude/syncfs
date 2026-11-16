@@ -92,6 +92,10 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
 
+    /// Stay in the foreground instead of daemonizing (implied by --debug)
+    #[arg(short, long)]
+    pub foreground: bool,
+
     /// Print the effective configuration as YAML and exit
     #[arg(long)]
     pub print_config: bool,
@@ -119,9 +123,11 @@ impl Cli {
                 allow_other: flag(self.allow_other),
                 allow_root: flag(self.allow_root),
                 log_level: self.log_level,
+                foreground: flag(self.foreground),
             },
             cli_config_file: abs(&self.config),
             mount_options: self.options.clone(),
+            sloppy: false,
         }
     }
 }

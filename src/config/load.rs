@@ -19,6 +19,8 @@ pub struct Sources {
     pub cli_config_file: Option<PathBuf>,
     /// Raw `-o` arguments, in order.
     pub mount_options: Vec<String>,
+    /// Tolerate unknown `-o` options (mount's `-s`).
+    pub sloppy: bool,
 }
 
 /// The effective configuration and where it came from.
@@ -28,6 +30,8 @@ pub struct Loaded {
     /// The YAML file that was read, or `None` if the default file does not
     /// exist and none was requested.
     pub config_file: Option<PathBuf>,
+    /// Generic kernel mount flags from `-o` (`nosuid`, `noexec`, ...).
+    pub kernel_flags: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -54,7 +58,11 @@ pub fn load(
     env: &Environment,
     read_file: impl Fn(&Path) -> io::Result<String>,
 ) -> Result<Loaded, LoadError> {
-    let opts = parse_mount_options(sources.mount_options.iter().map(String::as_str), &env.cwd)?;
+    let opts = parse_mount_options(
+        sources.mount_options.iter().map(String::as_str),
+        &env.cwd,
+        sources.sloppy,
+    )?;
 
     let requested = sources.cli_config_file.clone().or(opts.config_file);
     let path = requested
@@ -75,9 +83,16 @@ pub fn load(
     };
 
     let merged = file_layer.overlay(opts.layer).overlay(sources.cli.clone());
+    let mut resolved = resolve(merged, env)?;
+    for o in opts.ignored_unknown {
+        resolved
+            .warnings
+            .insert(0, format!("ignoring unknown mount option {o:?} (sloppy)"));
+    }
     Ok(Loaded {
-        resolved: resolve(merged, env)?,
+        resolved,
         config_file,
+        kernel_flags: opts.kernel_flags,
     })
 }
 

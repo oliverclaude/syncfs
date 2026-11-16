@@ -26,30 +26,30 @@ const IGNORED: &[&str] = &[
     "users",
     "owner",
     "group",
-    "exec",
-    "noexec",
-    "suid",
-    "nosuid",
-    "dev",
-    "nodev",
-    "atime",
-    "noatime",
     "relatime",
     "norelatime",
     "strictatime",
     "nostrictatime",
     "lazytime",
     "nolazytime",
-    "async",
     "diratime",
     "nodiratime",
     "loud",
     "silent",
 ];
 
+/// Generic mount flags that are handed on to the kernel FUSE mount.
+pub const KERNEL_FLAGS: &[&str] = &[
+    "exec", "noexec", "suid", "nosuid", "dev", "nodev", "atime", "noatime", "dirsync", "sync",
+    "async",
+];
+
 /// Prefixes of options that belong to other tools (systemd, userspace
 /// mount helpers) and are ignored.
-const IGNORED_PREFIXES: &[&str] = &["x-", "comment="];
+/// Prefixes of options that belong to other tools (systemd, mount(8),
+/// userspace mount helpers) and are ignored. mount(8) adds `user=NAME` for
+/// fstab `user` mounts.
+const IGNORED_PREFIXES: &[&str] = &["x-", "comment=", "user=", "uhelper=", "helper="];
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OptionError {
@@ -74,15 +74,21 @@ pub struct MountOptions {
     pub layer: PartialConfig,
     /// `config=PATH`, if given.
     pub config_file: Option<PathBuf>,
+    /// Generic flags for the kernel mount (`nosuid`, `noexec`, ...), in order.
+    pub kernel_flags: Vec<String>,
+    /// Unknown options skipped because `sloppy` was set (mount -s).
+    pub ignored_unknown: Vec<String>,
 }
 
 /// Parses one or more `-o` arguments (each a comma-separated list). Later
 /// occurrences of a key win, except `peer=`, which accumulates; any `peer=`
 /// replaces the YAML peer list as a whole. Relative paths are resolved
-/// against `cwd`.
+/// against `cwd`. With `sloppy` (mount's `-s`), unknown options are
+/// collected in [`MountOptions::ignored_unknown`] instead of failing.
 pub fn parse_mount_options<'a>(
     groups: impl IntoIterator<Item = &'a str>,
     cwd: &Path,
+    sloppy: bool,
 ) -> Result<MountOptions, OptionError> {
     let mut out = MountOptions::default();
     let mut peers: Vec<Peer> = Vec::new();
@@ -93,6 +99,10 @@ pub fn parse_mount_options<'a>(
             || IGNORED.contains(&item)
             || IGNORED_PREFIXES.iter().any(|p| item.starts_with(p))
         {
+            continue;
+        }
+        if KERNEL_FLAGS.contains(&item) {
+            out.kernel_flags.push(item.to_string());
             continue;
         }
         let (raw_key, value) = match item.split_once('=') {
@@ -143,6 +153,7 @@ pub fn parse_mount_options<'a>(
             "debug" => l.debug = Some(parse_bool(value).map_err(invalid)?),
             "allow_other" => l.allow_other = Some(parse_bool(value).map_err(invalid)?),
             "allow_root" => l.allow_root = Some(parse_bool(value).map_err(invalid)?),
+            "foreground" => l.foreground = Some(parse_bool(value).map_err(invalid)?),
             "nodebug" | "noallow_other" | "noallow_root" if value.is_none() => match &key[2..] {
                 "debug" => l.debug = Some(false),
                 "allow_other" => l.allow_other = Some(false),
@@ -154,6 +165,7 @@ pub fn parse_mount_options<'a>(
                     "read-only mounts are not implemented yet",
                 ))
             }
+            _ if sloppy => out.ignored_unknown.push(item.to_string()),
             _ => return Err(OptionError::Unknown(item.to_string())),
         }
     }
@@ -178,7 +190,7 @@ mod tests {
     use crate::config::{ByteSize, HumanDuration, LogLevel, Mode};
 
     fn parse(s: &str) -> Result<MountOptions, OptionError> {
-        parse_mount_options([s], Path::new("/work"))
+        parse_mount_options([s], Path::new("/work"), false)
     }
 
     #[test]
@@ -216,6 +228,7 @@ mod tests {
         let o = parse_mount_options(
             ["node-id=1,debug", "node_id=2,nodebug,block-size=4K"],
             Path::new("/"),
+            false,
         )
         .unwrap();
         assert_eq!(o.layer.node_id, Some(2));
@@ -225,8 +238,24 @@ mod tests {
 
     #[test]
     fn generic_mount_options_ignored() {
-        let o = parse("defaults,rw,noauto,nofail,_netdev,user,users,nosuid,nodev,noexec,x-systemd.automount,x-systemd.requires=network-online.target,comment=hi,,").unwrap();
+        let o = parse("defaults,rw,noauto,nofail,_netdev,user,users,user=henk,x-systemd.automount,x-systemd.requires=network-online.target,comment=hi,,").unwrap();
         assert_eq!(o, MountOptions::default());
+    }
+
+    #[test]
+    fn kernel_flags_passed_on() {
+        let o = parse("nosuid,nodev,noexec,noatime,foreground").unwrap();
+        assert_eq!(o.kernel_flags, vec!["nosuid", "nodev", "noexec", "noatime"]);
+        assert_eq!(o.layer.foreground, Some(true));
+    }
+
+    #[test]
+    fn sloppy_collects_unknown() {
+        let o = parse_mount_options(["node_id=2,bogus,what=1"], Path::new("/"), true).unwrap();
+        assert_eq!(o.layer.node_id, Some(2));
+        assert_eq!(o.ignored_unknown, vec!["bogus", "what=1"]);
+        // Sloppy does not hide invalid values of known options.
+        assert!(parse_mount_options(["node_id=x"], Path::new("/"), true).is_err());
     }
 
     #[test]
