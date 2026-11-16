@@ -883,8 +883,7 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
                 return Err(Errno::NO_XATTR);
             }
             let target = i.proc_path();
-            let len =
-                rustix::fs::getxattr(target.as_str(), name, &mut [0u8; 0][..]).map_err(errno)?;
+            let len = rustix::fs::getxattr_query(target.as_str(), name).map_err(errno)?;
             let mut buf = vec![0u8; len];
             let n = rustix::fs::getxattr(target.as_str(), name, &mut buf[..]).map_err(errno)?;
             buf.truncate(n);
@@ -899,7 +898,7 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
                 return Ok(Vec::new());
             }
             let target = i.proc_path();
-            let len = rustix::fs::listxattr(target.as_str(), &mut [0u8; 0][..]).map_err(errno)?;
+            let len = rustix::fs::listxattr_query(target.as_str()).map_err(errno)?;
             let mut buf = vec![0u8; len];
             let n = rustix::fs::listxattr(target.as_str(), &mut buf[..]).map_err(errno)?;
             buf.truncate(n);
