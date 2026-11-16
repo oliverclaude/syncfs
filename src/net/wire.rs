@@ -1,0 +1,452 @@
+//! The node-to-node wire format.
+//!
+//! A connection starts with an 8-byte preamble in each direction: the magic
+//! `SYNCFS` and the protocol version as a big-endian `u16`. The preamble
+//! never changes, so any two versions can tell that they disagree. After it
+//! come frames:
+//!
+//! ```text
+//! +----------------------+------------------------------+
+//! | length: u32, BE      | payload: postcard(Message)   |
+//! +----------------------+------------------------------+
+//! ```
+//!
+//! `length` counts the payload only, must be at least 1 and at most
+//! [`MAX_FRAME_LEN`] ([`HANDSHAKE_MAX_FRAME_LEN`] before the handshake
+//! completes). The payload must decode to exactly one [`Message`] with no
+//! bytes left over. Any violation closes the connection.
+//!
+//! [`Message`] variants are identified by their position, so variants and
+//! fields are only ever appended within a protocol version; anything else
+//! bumps [`PROTOCOL_VERSION`].
+
+use std::io::{self, Read, Write};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::config::NodeId;
+
+pub const MAGIC: [u8; 6] = *b"SYNCFS";
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const PREAMBLE_LEN: usize = 8;
+/// Largest payload: a 16 MiB block (the largest `block_size`) plus headroom.
+pub const MAX_FRAME_LEN: u32 = 32 << 20;
+/// Largest payload accepted before the peer is authenticated.
+pub const HANDSHAKE_MAX_FRAME_LEN: u32 = 64 << 10;
+
+#[derive(Debug, Error)]
+pub enum WireError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("not a syncfs peer (bad magic)")]
+    BadMagic,
+    #[error("frame of {0} bytes exceeds the limit of {1}")]
+    TooLarge(u32, u32),
+    #[error("empty frame")]
+    Empty,
+    #[error("undecodable frame: {0}")]
+    Decode(#[from] postcard::Error),
+    #[error("{0} trailing bytes after the message")]
+    Trailing(usize),
+}
+
+impl WireError {
+    /// The peer closed the connection cleanly between frames.
+    pub fn is_eof(&self) -> bool {
+        matches!(self, WireError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+    }
+}
+
+pub fn preamble() -> [u8; PREAMBLE_LEN] {
+    let mut p = [0; PREAMBLE_LEN];
+    p[..6].copy_from_slice(&MAGIC);
+    p[6..].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    p
+}
+
+/// Checks the magic and returns the peer's protocol version.
+pub fn parse_preamble(p: &[u8; PREAMBLE_LEN]) -> Result<u16, WireError> {
+    if p[..6] != MAGIC {
+        return Err(WireError::BadMagic);
+    }
+    Ok(u16::from_be_bytes([p[6], p[7]]))
+}
+
+/// Encodes `msg` as one frame (length prefix included).
+pub fn encode(msg: &Message) -> Vec<u8> {
+    let mut out = vec![0; 4];
+    out = postcard::to_extend(msg, out).expect("serializing to a Vec cannot fail");
+    let len = (out.len() - 4) as u32;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    out
+}
+
+/// Decodes one frame payload (without the length prefix).
+pub fn decode_payload(payload: &[u8]) -> Result<Message, WireError> {
+    if payload.is_empty() {
+        return Err(WireError::Empty);
+    }
+    let (msg, rest) = postcard::take_from_bytes(payload)?;
+    if !rest.is_empty() {
+        return Err(WireError::Trailing(rest.len()));
+    }
+    Ok(msg)
+}
+
+fn check_len(len: u32, max: u32) -> Result<usize, WireError> {
+    match len {
+        0 => Err(WireError::Empty),
+        n if n > max => Err(WireError::TooLarge(n, max)),
+        n => Ok(n as usize),
+    }
+}
+
+pub fn write_frame(w: &mut impl Write, msg: &Message) -> io::Result<()> {
+    w.write_all(&encode(msg))
+}
+
+/// Reads one frame of at most `max` payload bytes.
+pub fn read_frame(r: &mut impl Read, max: u32) -> Result<Message, WireError> {
+    let mut len = [0; 4];
+    r.read_exact(&mut len)?;
+    let n = check_len(u32::from_be_bytes(len), max)?;
+    let mut payload = vec![0; n];
+    r.read_exact(&mut payload)?;
+    decode_payload(&payload)
+}
+
+/// Incremental frame decoder for byte streams that arrive in pieces.
+#[derive(Debug)]
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+    max: u32,
+}
+
+impl FrameDecoder {
+    pub fn new(max: u32) -> Self {
+        Self {
+            buf: Vec::new(),
+            max,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// The next complete frame, `None` if more bytes are needed. After an
+    /// error the stream is unusable.
+    pub fn next_frame(&mut self) -> Result<Option<Message>, WireError> {
+        let Some(len) = self.buf.get(..4) else {
+            return Ok(None);
+        };
+        let n = check_len(
+            u32::from_be_bytes(len.try_into().expect("4 bytes")),
+            self.max,
+        )?;
+        if self.buf.len() < 4 + n {
+            return Ok(None);
+        }
+        let msg = decode_payload(&self.buf[4..4 + n]);
+        self.buf.drain(..4 + n);
+        msg.map(Some)
+    }
+}
+
+/// Everything nodes say to each other. Only the handshake, heartbeats and
+/// `Goodbye` are used so far; the rest is the planned vocabulary of later
+/// steps, which may still change their fields (bumping the version).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum Message {
+    /// First frame from the dialing node.
+    Hello(Hello),
+    /// Accepting node's answer to an acceptable `Hello`.
+    Welcome(Welcome),
+    /// Accepting node refuses the connection; it closes right after.
+    Reject(Reject),
+    /// Sent every `heartbeat_interval` in both directions.
+    Heartbeat(Heartbeat),
+    /// The sender is shutting down; the receiver marks it down at once.
+    Goodbye {
+        reason: String,
+    },
+
+    // Step 5: whole-file locks and quorum votes.
+    LockRequest {
+        req: u64,
+        path: Vec<u8>,
+        lease_ms: u64,
+    },
+    LockGrant {
+        req: u64,
+        path: Vec<u8>,
+        holder: NodeId,
+        lease_ms: u64,
+    },
+    LockDeny {
+        req: u64,
+        path: Vec<u8>,
+        holder: Option<NodeId>,
+        reason: String,
+    },
+    LockRenew {
+        path: Vec<u8>,
+        holder: NodeId,
+        lease_ms: u64,
+    },
+    LockRelease {
+        path: Vec<u8>,
+        holder: NodeId,
+    },
+    VoteRequest {
+        req: u64,
+        term: u64,
+        subject: Vec<u8>,
+    },
+    Vote {
+        req: u64,
+        term: u64,
+        granted: bool,
+    },
+
+    // Step 7: asynchronous replication.
+    JournalEntry {
+        origin: NodeId,
+        seq: u64,
+        entry: Vec<u8>,
+    },
+    JournalAck {
+        origin: NodeId,
+        seq: u64,
+    },
+    BlockPull {
+        req: u64,
+        path: Vec<u8>,
+        version: u64,
+        blocks: Vec<u64>,
+    },
+    BlockData {
+        req: u64,
+        path: Vec<u8>,
+        version: u64,
+        block: u64,
+        data: Vec<u8>,
+    },
+    BlockPush {
+        path: Vec<u8>,
+        version: u64,
+        block: u64,
+        data: Vec<u8>,
+    },
+
+    // Step 8: rejoin.
+    CatchUpRequest {
+        req: u64,
+        since: Vec<(NodeId, u64)>,
+    },
+    CatchUpDone {
+        req: u64,
+    },
+}
+
+impl Message {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Message::Hello(_) => "hello",
+            Message::Welcome(_) => "welcome",
+            Message::Reject(_) => "reject",
+            Message::Heartbeat(_) => "heartbeat",
+            Message::Goodbye { .. } => "goodbye",
+            Message::LockRequest { .. } => "lock-request",
+            Message::LockGrant { .. } => "lock-grant",
+            Message::LockDeny { .. } => "lock-deny",
+            Message::LockRenew { .. } => "lock-renew",
+            Message::LockRelease { .. } => "lock-release",
+            Message::VoteRequest { .. } => "vote-request",
+            Message::Vote { .. } => "vote",
+            Message::JournalEntry { .. } => "journal-entry",
+            Message::JournalAck { .. } => "journal-ack",
+            Message::BlockPull { .. } => "block-pull",
+            Message::BlockData { .. } => "block-data",
+            Message::BlockPush { .. } => "block-push",
+            Message::CatchUpRequest { .. } => "catch-up-request",
+            Message::CatchUpDone { .. } => "catch-up-done",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Hello {
+    pub node_id: NodeId,
+    pub cluster_name: String,
+    /// Sorted node ids of the sender's `peers`.
+    pub members: Vec<NodeId>,
+    /// Random per process start; a change means the peer restarted.
+    pub incarnation: u64,
+    /// `CARGO_PKG_VERSION` of the sender, for diagnostics.
+    pub software: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Welcome {
+    pub node_id: NodeId,
+    pub incarnation: u64,
+    pub software: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Reject {
+    pub reason: RejectReason,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum RejectReason {
+    /// Different `cluster_name`.
+    ClusterName,
+    /// Different set of node ids in `peers`.
+    Membership,
+    /// The dialer's node id is not a member.
+    UnknownNode,
+    /// The dialer claims the acceptor's own node id.
+    SameNodeId,
+    /// Only the lower node id dials; a higher one dialed.
+    WrongDirection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Heartbeat {
+    pub seq: u64,
+    /// Node ids the sender currently sees up, itself included.
+    pub up: Vec<NodeId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn hello() -> Message {
+        Message::Hello(Hello {
+            node_id: 2,
+            cluster_name: "syncfs".into(),
+            members: vec![1, 2, 3],
+            incarnation: 0xdead_beef,
+            software: "0.1.0".into(),
+        })
+    }
+
+    #[test]
+    fn preamble_roundtrip() {
+        assert_eq!(parse_preamble(&preamble()).unwrap(), PROTOCOL_VERSION);
+        assert!(matches!(
+            parse_preamble(b"HTTP/1.1"),
+            Err(WireError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn frame_layout_is_stable() {
+        // Variant 3 (Heartbeat), seq 1, up [1, 2]: pins the encoding.
+        let f = encode(&Message::Heartbeat(Heartbeat {
+            seq: 1,
+            up: vec![1, 2],
+        }));
+        assert_eq!(f, [0, 0, 0, 5, 3, 1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn rejects_bad_frames() {
+        let mut r: &[u8] = &[0, 0, 0, 0];
+        assert!(matches!(
+            read_frame(&mut r, MAX_FRAME_LEN),
+            Err(WireError::Empty)
+        ));
+        let mut r: &[u8] = &[0xff, 0, 0, 0];
+        assert!(matches!(
+            read_frame(&mut r, MAX_FRAME_LEN),
+            Err(WireError::TooLarge(..))
+        ));
+        let mut big = encode(&hello());
+        big.splice(..4, (HANDSHAKE_MAX_FRAME_LEN + 1).to_be_bytes());
+        assert!(matches!(
+            read_frame(&mut big.as_slice(), HANDSHAKE_MAX_FRAME_LEN),
+            Err(WireError::TooLarge(..))
+        ));
+        let mut f = encode(&hello());
+        f.push(0);
+        let n = (f.len() - 4) as u32;
+        f.splice(..4, n.to_be_bytes());
+        assert!(matches!(
+            read_frame(&mut f.as_slice(), MAX_FRAME_LEN),
+            Err(WireError::Trailing(1))
+        ));
+        let mut r: &[u8] = &[0, 0, 0, 1, 200];
+        assert!(matches!(
+            read_frame(&mut r, MAX_FRAME_LEN),
+            Err(WireError::Decode(_))
+        ));
+        let mut r: &[u8] = &[0, 0, 0, 9, 3];
+        assert!(read_frame(&mut r, MAX_FRAME_LEN).unwrap_err().is_eof());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn roundtrip(msg: Message) {
+            let f = encode(&msg);
+            let back = read_frame(&mut f.as_slice(), MAX_FRAME_LEN).unwrap();
+            prop_assert_eq!(back, msg);
+        }
+
+        #[test]
+        fn split_stream_roundtrip(msgs: Vec<Message>, cuts in proptest::collection::vec(any::<usize>(), 0..8)) {
+            let stream: Vec<u8> = msgs.iter().flat_map(encode).collect();
+            let mut points: Vec<usize> = cuts.iter().map(|c| c % (stream.len() + 1)).collect();
+            points.push(0);
+            points.push(stream.len());
+            points.sort_unstable();
+            let mut d = FrameDecoder::new(MAX_FRAME_LEN);
+            let mut out = Vec::new();
+            for w in points.windows(2) {
+                d.push(&stream[w[0]..w[1]]);
+                while let Some(m) = d.next_frame().unwrap() {
+                    out.push(m);
+                }
+            }
+            prop_assert_eq!(out, msgs);
+        }
+
+        #[test]
+        fn garbage_never_panics(bytes: Vec<u8>) {
+            let _ = decode_payload(&bytes);
+            let _ = read_frame(&mut bytes.as_slice(), HANDSHAKE_MAX_FRAME_LEN);
+            let mut d = FrameDecoder::new(HANDSHAKE_MAX_FRAME_LEN);
+            d.push(&bytes);
+            while let Ok(Some(_)) = d.next_frame() {}
+        }
+
+        #[test]
+        fn mutated_frames_never_panic(msg: Message, flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..6), cut: usize) {
+            let mut f = encode(&msg);
+            for (i, b) in flips {
+                let i = i % f.len();
+                f[i] ^= b;
+            }
+            f.truncate(cut % (f.len() + 1));
+            if let Ok(m) = read_frame(&mut f.as_slice(), MAX_FRAME_LEN) {
+                // Whatever decodes must re-encode to a valid frame.
+                let again = encode(&m);
+                prop_assert_eq!(read_frame(&mut again.as_slice(), MAX_FRAME_LEN).unwrap(), m);
+            }
+        }
+    }
+}
