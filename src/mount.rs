@@ -4,6 +4,7 @@
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use fuser::{MountOption, Session, SessionACL};
@@ -11,6 +12,7 @@ use fuser::{MountOption, Session, SessionACL};
 use crate::config::Config;
 use crate::fs::{LocalOnly, SyncFs};
 use crate::logging;
+use crate::status::{providers, Registry};
 
 /// FUSE session settings for `cfg`. `kernel_flags` are the generic mount
 /// flags (`nosuid`, `noexec`, ...) from `-o`.
@@ -83,6 +85,46 @@ pub fn fuse_config(cfg: &Config, kernel_flags: &[String]) -> fuser::Config {
     fc
 }
 
+/// `MountOption` as written in `-o`.
+fn option_name(o: &MountOption) -> String {
+    match o {
+        MountOption::FSName(n) => format!("fsname={n}"),
+        MountOption::Subtype(n) => format!("subtype={n}"),
+        MountOption::CUSTOM(c) => c.clone(),
+        MountOption::DefaultPermissions => "default_permissions".into(),
+        MountOption::Exec => "exec".into(),
+        MountOption::NoExec => "noexec".into(),
+        MountOption::Suid => "suid".into(),
+        MountOption::NoSuid => "nosuid".into(),
+        MountOption::Dev => "dev".into(),
+        MountOption::NoDev => "nodev".into(),
+        MountOption::Atime => "atime".into(),
+        MountOption::NoAtime => "noatime".into(),
+        MountOption::DirSync => "dirsync".into(),
+        MountOption::Sync => "sync".into(),
+        MountOption::Async => "async".into(),
+        MountOption::RO => "ro".into(),
+        MountOption::RW => "rw".into(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// Registers the `.syncfs` providers, in file order.
+fn register_status(status: &Registry, fs: &SyncFs<LocalOnly>, cfg: &Config, fc: &fuser::Config) {
+    let mut mount_options: Vec<String> = fc.mount_options.iter().map(option_name).collect();
+    match fc.acl {
+        SessionACL::All => mount_options.push("allow_other".into()),
+        SessionACL::RootAndOwner => mount_options.push("allow_root".into()),
+        _ => {}
+    }
+    let info = providers::NodeInfo {
+        config: cfg.clone(),
+        mount_options,
+        shadowed_backing_entry: fs.shadows_backing_entry(),
+    };
+    providers::register_builtin(status, info, fs.stats_provider());
+}
+
 fn check_dir(what: &str, p: &Path) -> anyhow::Result<()> {
     let md = std::fs::metadata(p).with_context(|| format!("{what} {}", p.display()))?;
     if !md.is_dir() {
@@ -125,8 +167,10 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
     raise_nofile_limit();
 
     let fuse_cfg = fuse_config(cfg, kernel_flags);
-    let fs = SyncFs::new(backing, LocalOnly, crate::status::Registry::new())
+    let status = Registry::new();
+    let fs = SyncFs::new(backing, LocalOnly, Arc::clone(&status))
         .with_context(|| format!("opening backing_dir {}", backing.display()))?;
+    register_status(&status, &fs, cfg, &fuse_cfg);
     log::debug!("fuse options: {:?}", fuse_cfg);
 
     let mount = || -> anyhow::Result<Served> {

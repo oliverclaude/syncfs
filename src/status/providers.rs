@@ -120,12 +120,13 @@ pub fn replication(config: Config) -> Arc<dyn Provider> {
     }))
 }
 
-/// Registers every built-in provider except `stats` (which the filesystem
-/// registers itself, as it owns the gauges).
-pub fn register_builtin(registry: &Registry, info: NodeInfo) {
+/// Registers the built-in providers in file order. `stats` comes from the
+/// filesystem, which owns the counters.
+pub fn register_builtin(registry: &Registry, info: NodeInfo, stats: Arc<dyn Provider>) {
     let cfg = info.config.clone();
     registry.register(node(info));
     registry.register(config(cfg.clone()));
+    registry.register(stats);
     registry.register(peers(cfg.clone()));
     registry.register(locks(cfg.clone()));
     registry.register(replication(cfg));
