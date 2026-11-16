@@ -4,10 +4,10 @@
 form a cluster and keep a full copy of the same filesystem on every node.
 
 > **Status:** early development. Steps 1 (configuration), 2 (single-node
-> passthrough FUSE filesystem, mount helper, fstab) and 3 (the `.syncfs`
-> status directory) are done. Clustering is
-> not implemented yet: a mount today is a local mirror of its backing
-> directory.
+> passthrough FUSE filesystem, mount helper, fstab), 3 (the `.syncfs`
+> status directory) and 4 (wire protocol, peer membership, daemon mode) are
+> done. Nodes find each other and track quorum, but nothing is replicated
+> yet: a mount today is a local mirror of its backing directory.
 
 ## Design
 
@@ -31,8 +31,9 @@ form a cluster and keep a full copy of the same filesystem on every node.
   a 3-node quorum from 2 data nodes and 1 cheap voter.
 - **Cluster size.** Static peer list in the config, 1 to 99 nodes. 3 is the
   intended starting point.
-- **Transport.** Plaintext TCP. There is no authentication or encryption yet,
-  so run it only on a trusted network.
+- **Transport.** Plaintext TCP in a full mesh (see
+  [Cluster networking](#cluster-networking)). There is no authentication or
+  encryption yet, so run it only on a trusted network.
 - **Introspection.** A hidden, read-only `.syncfs` directory at the root of
   the mount exposes node, peer, lock, queue and replication stats (see
   [below](#the-syncfs-status-directory)).
@@ -149,7 +150,7 @@ jq .peers /mnt/data/.syncfs/status.json
 | `node`        | node id, mode, version, hostname, pid, start time, uptime, paths, mount options   |
 | `config`      | the effective configuration (all layers merged)                                  |
 | `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes |
-| `peers`       | cluster size, quorum, every peer with its state (step 4 fills in live state)     |
+| `peers`       | cluster size, quorum, reachable nodes, quorum verdict, every peer's live state  |
 | `locks`       | held whole-file locks and the lease timeout (step 5)                             |
 | `replication` | dirty files/blocks and journal queue length (step 7)                             |
 | `status.json` | all of the above as one JSON object, keyed by file name, plus `format_version`   |
@@ -182,6 +183,125 @@ for incompatible changes.
   `mount::register_status`; it then appears as a YAML file and a
   `status.json` key. See `src/status/`.
 
+## Cluster networking
+
+Nodes talk plaintext TCP on `listen` (default port 7420). Run it only on a
+trusted network: there is no authentication or encryption.
+
+### Topology
+
+Full mesh: one TCP connection per pair of nodes, opened by the node with the
+lower `node_id` and accepted by the higher one. All traffic between two
+nodes uses that one connection in both directions, so messages between them
+arrive in order. A 99-node cluster has 4851 connections, 98 per node. Each
+connection has a reader and a writer thread, and each lower-id node has a
+dialer thread per higher peer, so a node runs at most about 250 small
+threads. That is fine at this size, so there is no gossip or relaying.
+
+### Wire format
+
+Every connection starts with an 8-byte preamble in each direction:
+`SYNCFS` and the protocol version as a big-endian u16 (currently 1). The
+preamble never changes, so nodes on different protocol versions recognise
+the mismatch, log it and close. After the preamble come frames:
+
+```
+u32 big-endian payload length | payload = one postcard-encoded Message
+```
+
+- The length must be from 1 to 32 MiB. Before the handshake completes the
+  limit is 64 KiB.
+- The payload must decode to exactly one message with nothing left over.
+- Anything else (bad magic, oversized, undecodable or trailing bytes)
+  closes the connection.
+- Messages are identified by position, so within one protocol version
+  variants and fields are only ever appended. Anything else bumps the
+  version.
+
+The message set already names what later steps need. Only the handshake,
+heartbeats and `Goodbye` are used so far; the others are logged and ignored.
+
+| Messages | Used by |
+|----------|---------|
+| `Hello`, `Welcome`, `Reject` | handshake (step 4) |
+| `Heartbeat {seq, up}`, `Goodbye {reason}` | liveness (step 4) |
+| `LockRequest`, `LockGrant`, `LockDeny`, `LockRenew`, `LockRelease`, `VoteRequest`, `Vote` | locks and quorum (step 5) |
+| `JournalEntry`, `JournalAck`, `BlockPull`, `BlockData`, `BlockPush` | replication (step 7) |
+| `CatchUpRequest`, `CatchUpDone` | rejoin (step 8) |
+
+### Handshake
+
+1. The dialer sends `Hello`: its node id, `cluster_name`, the sorted node ids
+   of its `peers`, a random incarnation number (new on every start) and its
+   software version.
+2. The acceptor refuses with `Reject {reason, detail}` and closes when:
+   - `cluster_name` differs (`ClusterName`)
+   - the dialer uses the acceptor's own id (`SameNodeId`)
+   - the dialer's id is not in the acceptor's peers (`UnknownNode`)
+   - the two sets of node ids differ (`Membership`)
+   - the dialer has the higher id (`WrongDirection`)
+3. Otherwise the acceptor answers `Welcome`, with its id and incarnation.
+4. The dialer checks that the node that answered is the one it meant to
+   reach at that address (otherwise `expected node N ..., node M answered`).
+
+Membership is compared by node ids only, not addresses, because nodes may
+legitimately reach the same peer by different names or addresses. Refused
+peers show as `rejected` with the reason; the refusal is logged at warn
+level at most once a minute.
+
+### Liveness and peer states
+
+- Both sides send a `Heartbeat` every `heartbeat_interval`. It carries the
+  ids the sender sees up, shown as `sees` in `.syncfs/peers`.
+- Any frame counts as a sign of life. A connection silent for 3 intervals
+  is closed and the peer becomes `down` ("heartbeat timeout").
+- A closed socket marks the peer down at once ("connection closed"), and so
+  does a `Goodbye` from a clean shutdown ("left: shutting down").
+- The dialer reconnects with exponential backoff: from
+  `heartbeat_interval / 2`, doubling, capped at 5 x the interval (between
+  1 s and 30 s), with +-20% jitter. A successful handshake resets it.
+- A new connection from a peer replaces the old one, which covers a peer
+  that restarted before the old connection timed out.
+
+| State | Meaning |
+|-------|---------|
+| `unknown` | never connected since this node started |
+| `connecting` | first connection attempt in progress (dialing side) |
+| `up` | connected and heartbeating |
+| `down` | was up, or connection attempts fail; `last_error` says why |
+| `rejected` | the handshake was refused because the configurations disagree |
+
+`reachable` is this node plus its `up` peers. `have_quorum` is
+`reachable >= quorum`, where quorum is a strict majority of all configured
+nodes, voters included.
+
+### Daemon mode
+
+`syncfs --mode daemon` (or `mode: daemon` in the YAML) runs a voter-only
+node: no backing directory, no mount, just membership (and, from step 5,
+lock and quorum votes). It daemonizes unless `--foreground` is given. With
+no `.syncfs` directory to read, it writes the same status as JSON to
+`<state_dir>/status.json`. The file is replaced atomically on every
+membership change and at least every 5 heartbeat intervals, and removed on
+a clean exit.
+
+```sh
+syncfs --mode daemon --node-id 3 --listen 0.0.0.0:7420 \
+  --peer 1@10.0.0.1:7420 --peer 2@10.0.0.2:7420 --peer 3@10.0.0.3:7420
+jq .peers /var/lib/syncfs/status.json
+```
+
+### Why threads and postcard
+
+- **Threads:** at most 98 connections per node is a small number of
+  threads, and the FUSE side is synchronous too, so an async runtime would
+  add a dependency and two programming models for no gain. Later steps can
+  queue messages to a peer with `Network::send`.
+- **postcard:** compact, serde-based (the messages are plain Rust types)
+  and has a documented, stable wire format, unlike bincode 2's
+  configuration-dependent one. Frame decoding is fuzzed: random bytes,
+  mutated frames, and streams split at random points must never panic.
+
 ## Internals
 
 - **Inodes.** Each inode the kernel holds is an `O_PATH` descriptor on the
@@ -204,8 +324,14 @@ for incompatible changes.
 
 - `cargo test` runs unit tests plus FUSE mount tests (as the current user;
   they skip with a message when `/dev/fuse` or `fusermount3` is missing).
-  Run the `mount` and `status` test binaries with `sudo` too for the root
-  and multi-user cases; CI does both on x86_64 and arm64.
+  Run the `mount`, `status` and `cluster` test binaries with `sudo` too for
+  the root and multi-user cases; CI does both on x86_64 and arm64.
+- `tests/net.rs` runs membership in process: handshake rejections, leave
+  and rejoin, and a 25-node mesh. `tests/cluster.rs` runs 3- and 5-node
+  clusters of real processes (mounts and daemons), kills, stops and
+  restarts nodes, and requires every survivor's view to converge within
+  8 s. `cargo test --release --test cluster -- --ignored` adds a 99-process
+  cluster.
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with
@@ -222,8 +348,8 @@ Each step ends with passing tests and a commit.
    Integration tests and `pjdfstest`.
 3. **Hidden `.syncfs` folder** (done): read-only status files, op counters,
    provider registry for later steps.
-4. **Wire protocol and peer membership**: framed TCP, heartbeats, peer
-   up/down tracking.
+4. **Wire protocol and peer membership** (done): framed TCP, handshake,
+   heartbeats, peer states, reconnect, voter daemon mode.
 5. **Quorum and lock table**: whole-file locks, leases, voter-only daemon
    mode.
 6. **Write path**: lock, quorum check, local write, mark dirty.
