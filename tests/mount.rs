@@ -478,3 +478,50 @@ fn mount_helper_invocation() {
     assert_eq!(fs::read(b.join("via-helper")).unwrap(), b"ok");
     unmount(&mnt);
 }
+
+/// As root with allow_other: other users can use the mount, new files belong
+/// to whoever created them, and the kernel enforces permissions.
+#[test]
+fn multi_user_as_root() {
+    require_fuse!();
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIPPED: needs root (run the test binary with sudo)");
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let m = Mounted::new(&["--allow-other"]);
+    fs::set_permissions(&m.tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&m.mnt, fs::Permissions::from_mode(0o1777)).unwrap();
+    let nobody = 65534;
+    let as_nobody = |script: &str| {
+        Command::new("sh")
+            .args(["-c", script])
+            .uid(nobody)
+            .gid(nobody)
+            .output()
+            .unwrap()
+    };
+    let mnt = m.mnt.display().to_string();
+    let out = as_nobody(&format!(
+        "echo hi > {mnt}/n && mkdir {mnt}/nd && ln -s n {mnt}/nl"
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for name in ["n", "nd", "nl"] {
+        let md = fs::symlink_metadata(m.b(name)).unwrap();
+        assert_eq!((md.uid(), md.gid()), (nobody, nobody), "{name}");
+    }
+    // Root's private file is not readable by nobody; sticky dir protects it.
+    fs::write(m.m("secret"), b"s").unwrap();
+    fs::set_permissions(m.m("secret"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!as_nobody(&format!("cat {mnt}/secret")).status.success());
+    assert!(!as_nobody(&format!("rm -f {mnt}/secret")).status.success());
+    assert!(m.b("secret").exists());
+    // chown by root is passed through.
+    std::os::unix::fs::chown(m.m("secret"), Some(nobody), None).unwrap();
+    assert_eq!(fs::metadata(m.b("secret")).unwrap().uid(), nobody);
+    m.finish();
+}
