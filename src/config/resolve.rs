@@ -20,6 +20,9 @@ pub const DEFAULT_PORT: u16 = 7420;
 /// Largest supported cluster, counting every node (voters included).
 pub const MAX_NODES: usize = 99;
 pub const DEFAULT_NODE_ID: NodeId = 1;
+pub const DEFAULT_CLUSTER_NAME: &str = "syncfs";
+/// Longest cluster name.
+pub const MAX_CLUSTER_NAME_LEN: usize = 64;
 pub const DEFAULT_LOCK_LEASE_TIMEOUT: HumanDuration = HumanDuration::from_secs(30);
 pub const DEFAULT_HEARTBEAT_INTERVAL: HumanDuration = HumanDuration::from_secs(1);
 pub const DEFAULT_BLOCK_SIZE: ByteSize = ByteSize(64 * ByteSize::KIB);
@@ -69,6 +72,9 @@ impl Environment {
 /// The complete effective configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Config {
+    /// Identifies the cluster; nodes only talk to nodes with the same name
+    /// and membership.
+    pub cluster_name: String,
     pub node_id: NodeId,
     pub mode: Mode,
     pub listen: SocketAddr,
@@ -107,6 +113,10 @@ impl Config {
 pub enum ValidationError {
     #[error("node_id must be between 1 and 65535, got 0")]
     NodeIdZero,
+    #[error(
+        "cluster_name {0:?} must be 1 to {MAX_CLUSTER_NAME_LEN} characters of A-Z a-z 0-9 . _ -"
+    )]
+    BadClusterName(String),
     #[error("peer ids must be between 1 and 65535, got 0")]
     PeerIdZero,
     #[error("cluster has {0} nodes; the maximum is {MAX_NODES}")]
@@ -184,6 +194,9 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
     let mut warnings = Vec::new();
 
     let node_id = p.node_id.unwrap_or(DEFAULT_NODE_ID);
+    let cluster_name = p
+        .cluster_name
+        .unwrap_or_else(|| DEFAULT_CLUSTER_NAME.to_string());
     let mode = p.mode.unwrap_or_default();
     let listen = p
         .listen
@@ -204,6 +217,13 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
 
     if node_id == 0 {
         errors.push(ValidationError::NodeIdZero);
+    }
+    let name_ok = (1..=MAX_CLUSTER_NAME_LEN).contains(&cluster_name.len())
+        && cluster_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if !name_ok {
+        errors.push(ValidationError::BadClusterName(cluster_name.clone()));
     }
     if listen.port() == 0 {
         errors.push(ValidationError::ListenPortZero);
@@ -270,6 +290,7 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
     }
     Ok(Resolved {
         config: Config {
+            cluster_name,
             node_id,
             mode,
             listen,
@@ -414,6 +435,25 @@ mod tests {
 
     fn errs(p: PartialConfig) -> Vec<ValidationError> {
         resolve(p, &env()).unwrap_err().0
+    }
+
+    #[test]
+    fn cluster_name_rules() {
+        assert_eq!(
+            resolve(mount_layer(), &env()).unwrap().config.cluster_name,
+            "syncfs"
+        );
+        for bad in ["", "has space", "slash/", &"x".repeat(65)] {
+            let mut p = mount_layer();
+            p.cluster_name = Some(bad.to_string());
+            assert_eq!(errs(p), [ValidationError::BadClusterName(bad.to_string())]);
+        }
+        let mut p = mount_layer();
+        p.cluster_name = Some("prod-eu_1.a".into());
+        assert_eq!(
+            resolve(p, &env()).unwrap().config.cluster_name,
+            "prod-eu_1.a"
+        );
     }
 
     #[test]

@@ -67,6 +67,7 @@ syncfs --mode daemon --node-id 3 --print-config
 | YAML key             | `-o` option                   | CLI flag                 | Default                         |
 |----------------------|-------------------------------|--------------------------|---------------------------------|
 | (file path)          | `config=PATH`                 | `-c`, `--config PATH`    | `/etc/syncfs/syncfs.yaml`       |
+| `cluster_name`       | `cluster_name=NAME`           | `--cluster-name NAME`    | `syncfs`                        |
 | `node_id`            | `node_id=N`                   | `--node-id N`            | `1`                             |
 | `mode`               | `mode=mount\|daemon`          | `--mode mount\|daemon`   | `mount`                         |
 | `listen`             | `listen=IP:PORT`              | `--listen IP:PORT`       | `0.0.0.0:7420`                  |

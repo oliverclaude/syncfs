@@ -13,6 +13,7 @@ use super::units::{ByteSize, HumanDuration};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialConfig {
+    pub cluster_name: Option<String>,
     pub node_id: Option<NodeId>,
     pub mode: Option<Mode>,
     pub listen: Option<SocketAddr>,
@@ -36,6 +37,7 @@ impl PartialConfig {
     #[must_use]
     pub fn overlay(self, upper: PartialConfig) -> PartialConfig {
         PartialConfig {
+            cluster_name: upper.cluster_name.or(self.cluster_name),
             node_id: upper.node_id.or(self.node_id),
             mode: upper.mode.or(self.mode),
             listen: upper.listen.or(self.listen),

@@ -146,6 +146,7 @@ pub fn parse_mount_options<'a>(
             "backing_dir" => l.backing_dir = Some(path(need()?)?),
             "mountpoint" => l.mountpoint = Some(path(need()?)?),
             "state_dir" => l.state_dir = Some(path(need()?)?),
+            "cluster_name" => l.cluster_name = Some(need()?.to_string()),
             "lock_lease_timeout" => l.lock_lease_timeout = Some(need()?.parse().map_err(invalid)?),
             "heartbeat_interval" => l.heartbeat_interval = Some(need()?.parse().map_err(invalid)?),
             "block_size" => l.block_size = Some(need()?.parse().map_err(invalid)?),
@@ -199,7 +200,8 @@ mod tests {
             "config=/etc/x.yaml,node_id=3,mode=daemon,listen=127.0.0.1:9000,\
              peer=1@a:1,peer=2@b:2,peer=3@c:3,backing_dir=/srv/d,mountpoint=/mnt/m,\
              state_dir=/var/s,lock_lease_timeout=1m,heartbeat_interval=250ms,\
-             block_size=1M,log_level=warn,debug,allow_other=yes,allow_root=off",
+             block_size=1M,log_level=warn,debug,allow_other=yes,allow_root=off,\
+             cluster_name=prod",
         )
         .unwrap();
         assert_eq!(o.config_file, Some("/etc/x.yaml".into()));
@@ -218,6 +220,7 @@ mod tests {
         );
         assert_eq!(l.block_size, Some(ByteSize(1 << 20)));
         assert_eq!(l.log_level, Some(LogLevel::Warn));
+        assert_eq!(l.cluster_name.as_deref(), Some("prod"));
         assert_eq!(l.debug, Some(true));
         assert_eq!(l.allow_other, Some(true));
         assert_eq!(l.allow_root, Some(false));

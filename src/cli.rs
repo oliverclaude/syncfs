@@ -52,6 +52,10 @@ pub struct Cli {
     #[arg(long = "peer", value_name = "ID@HOST:PORT")]
     pub peers: Vec<Peer>,
 
+    /// Cluster name; nodes with a different name are refused [default: syncfs]
+    #[arg(long, value_name = "NAME")]
+    pub cluster_name: Option<String>,
+
     /// Same as the BACKING_DIR argument.
     #[arg(long, value_name = "PATH")]
     pub backing_dir: Option<PathBuf>,
@@ -109,6 +113,7 @@ impl Cli {
         let flag = |b: bool| b.then_some(true);
         Sources {
             cli: PartialConfig {
+                cluster_name: self.cluster_name.clone(),
                 node_id: self.node_id,
                 mode: self.mode,
                 listen: self.listen,
