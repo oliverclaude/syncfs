@@ -1,0 +1,69 @@
+# syncfs configuration. Default location: /etc/syncfs/syncfs.yaml
+#
+# Every key is optional; the value shown is a typical setting and the
+# comment gives the built-in default. Settings here can be overridden by
+# mount options (-o key=value, e.g. from /etc/fstab) and those in turn by
+# command-line flags:
+#
+#   built-in defaults < this file < -o options < command-line flags
+#
+# Check the result with:  syncfs --config this-file --print-config
+
+# This node's id, 1..=65535. Must appear in `peers`.   Default: 1
+node_id: 1
+
+# mount  = store data in backing_dir and mount it at mountpoint (and vote).
+# daemon = voter-only: no data, no mount; only takes part in quorum and lock
+#          voting.                                        Default: mount
+mode: mount
+
+# Address for node-to-node traffic (plaintext TCP; trusted networks only).
+#                                                         Default: 0.0.0.0:7420
+listen: "0.0.0.0:7420"
+
+# Full cluster membership, this node included. Use the same list on every
+# node. 1 to 99 nodes; quorum is a strict majority: floor(n / 2) + 1.
+# Addresses are host:port (IPv6 as [addr]:port).
+# Default: empty, meaning a standalone single-node cluster.
+peers:
+  - { id: 1, address: "10.0.0.1:7420" }   # data node
+  - { id: 2, address: "10.0.0.2:7420" }   # data node
+  - { id: 3, address: "10.0.0.3:7420" }   # voter-only daemon
+
+# Local backing directory: this node's source of truth. Required in mount
+# mode, ignored in daemon mode. Absolute path.            Default: none
+backing_dir: /srv/syncfs
+
+# Mount point. Required in mount mode, ignored in daemon mode. Must not be
+# the same as, or nested with, backing_dir.               Default: none
+mountpoint: /mnt/syncfs
+
+# Persistent replication state (dirty-block bitmaps, metadata journal).
+# Must be outside backing_dir and mountpoint.
+# Default: /var/lib/syncfs as root, else $XDG_STATE_HOME/syncfs
+#          (or ~/.local/state/syncfs).
+state_dir: /var/lib/syncfs
+
+# A whole-file write lock held by a node that stops responding expires after
+# this long. Must be at least 3 x heartbeat_interval.     Default: 30s
+lock_lease_timeout: 30s
+
+# How often nodes ping each other.                        Default: 1s
+heartbeat_interval: 1s
+
+# Granularity of the dirty-block bitmap used for async replication: a write
+# marks whole blocks dirty. Power of two from 4K to 16M.  Default: 64K
+block_size: 64K
+
+# Debug mode: verbose logging (log_level becomes debug unless set). Default: false
+debug: false
+
+# Let other users access the mount. Non-root users also need
+# `user_allow_other` in /etc/fuse.conf. Exclusive with allow_root. Default: false
+allow_other: false
+
+# Let root access a user's mount.                         Default: false
+allow_root: false
+
+# error, warn, info, debug or trace.                      Default: info
+log_level: info
