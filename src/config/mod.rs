@@ -37,3 +37,26 @@ pub fn absolutize(p: &Path, cwd: &Path) -> PathBuf {
 
 mod resolve;
 pub use resolve::*;
+
+mod load;
+pub use load::{load, LoadError, Loaded, Sources};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolutize_is_lexical() {
+        let cwd = Path::new("/home/u");
+        assert_eq!(
+            absolutize(Path::new("a/./b"), cwd),
+            PathBuf::from("/home/u/a/b")
+        );
+        assert_eq!(absolutize(Path::new("../x"), cwd), PathBuf::from("/home/x"));
+        assert_eq!(absolutize(Path::new("/abs/../y"), cwd), PathBuf::from("/y"));
+        assert_eq!(
+            absolutize(Path::new("../../../.."), cwd),
+            PathBuf::from("/")
+        );
+    }
+}

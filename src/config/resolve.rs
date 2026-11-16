@@ -159,9 +159,9 @@ pub struct ValidationErrors(pub Vec<ValidationError>);
 
 impl fmt::Display for ValidationErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "invalid configuration:")?;
+        write!(f, "invalid configuration:")?;
         for e in &self.0 {
-            writeln!(f, "  - {e}")?;
+            write!(f, "\n  - {e}")?;
         }
         Ok(())
     }
