@@ -36,7 +36,7 @@ exec docker run --rm $platform --network host \
     cargo test 2>&1 | grep -E "^test result|FAILED|panicked|SKIPPED" 
     useradd -m tester
     chmod -R a+rX /build /work
-    for t in mount status; do
+    for t in mount status cluster; do
       bin=$(cargo test --test $t --no-run --message-format=json 2>/dev/null | jq -r "select(.executable != null) | .executable" | grep /$t-)
       echo "== $t tests as unprivileged user"
       su tester -c "cd /tmp && $bin -q" > /tmp/user.log 2>&1 || { grep -m3 -iE "fusermount|error|exited" /tmp/user.log; }; grep -E "^test result" /tmp/user.log
