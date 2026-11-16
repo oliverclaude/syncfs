@@ -146,7 +146,12 @@ struct Shared {
     /// Last time each refusal message was logged at warn level.
     logged: Mutex<HashMap<String, Instant>>,
     acceptor: Mutex<Option<std::thread::JoinHandle<()>>>,
+    handler: std::sync::RwLock<Option<Handler>>,
 }
+
+/// Receives every message other than handshake, heartbeat and goodbye.
+/// Runs on the connection's reader thread, so it must not block.
+pub type Handler = Arc<dyn Fn(NodeId, Message) + Send + Sync>;
 
 /// The running membership service. Cheap to clone.
 #[derive(Clone)]
@@ -211,6 +216,7 @@ impl Network {
             changed: Condvar::new(),
             logged: Mutex::new(HashMap::new()),
             acceptor: Mutex::new(None),
+            handler: std::sync::RwLock::new(None),
         });
         if shared.slots.is_empty() {
             return Ok(Network {
@@ -246,6 +252,21 @@ impl Network {
             shared,
             listen: Some(listen),
         })
+    }
+
+    /// Sets the receiver of application messages (locks, later
+    /// replication). Messages arriving before this is set are dropped.
+    pub fn set_handler(&self, h: Handler) {
+        *self
+            .shared
+            .handler
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+
+    /// The members other than this node.
+    pub fn peer_ids(&self) -> Vec<NodeId> {
+        self.shared.slots.iter().map(|s| s.id).collect()
     }
 
     /// The bound listen address (`None` for a standalone node).
@@ -640,7 +661,7 @@ fn run_session(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, incarnation: u6
     let reason = if spawned.is_err() {
         "cannot start writer thread".to_string()
     } else {
-        read_loop(slot, &stream)
+        read_loop(sh, slot, &stream)
     };
     let _ = stream.shutdown(Shutdown::Both);
     let mut i = lock(&slot.info);
@@ -655,7 +676,7 @@ fn run_session(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, incarnation: u6
     }
 }
 
-fn read_loop(slot: &Slot, mut stream: &TcpStream) -> String {
+fn read_loop(sh: &Shared, slot: &Slot, mut stream: &TcpStream) -> String {
     loop {
         let msg = match wire::read_frame(&mut stream, MAX_FRAME_LEN) {
             Ok(m) => m,
@@ -678,11 +699,14 @@ fn read_loop(slot: &Slot, mut stream: &TcpStream) -> String {
             m @ (Message::Hello(_) | Message::Welcome(_) | Message::Reject(_)) => {
                 return format!("protocol error: {} after handshake", m.kind())
             }
-            other => log::debug!(
-                "node {}: ignoring {} (not implemented yet)",
-                slot.id,
-                other.kind()
-            ),
+            other => {
+                drop(i);
+                let h = sh.handler.read().unwrap_or_else(|e| e.into_inner()).clone();
+                match h {
+                    Some(h) => h(slot.id, other),
+                    None => log::debug!("node {}: dropping {} (no handler)", slot.id, other.kind()),
+                }
+            }
         }
     }
 }

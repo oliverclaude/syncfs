@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::config::NodeId;
 
 pub const MAGIC: [u8; 6] = *b"SYNCFS";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const PREAMBLE_LEN: usize = 8;
 /// Largest payload: a 16 MiB block (the largest `block_size`) plus headroom.
 pub const MAX_FRAME_LEN: u32 = 32 << 20;
@@ -154,9 +154,13 @@ impl FrameDecoder {
     }
 }
 
-/// Everything nodes say to each other. Only the handshake, heartbeats and
-/// `Goodbye` are used so far; the rest is the planned vocabulary of later
-/// steps, which may still change their fields (bumping the version).
+/// Everything nodes say to each other. The handshake, heartbeats,
+/// `Goodbye` and the lock messages are used so far; the rest is the planned
+/// vocabulary of later steps, which may still change their fields (bumping
+/// the version).
+///
+/// Lock messages: `key` is the path relative to the mount root; `req`
+/// identifies one attempt of the requesting node, and replies echo it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub enum Message {
@@ -173,42 +177,53 @@ pub enum Message {
         reason: String,
     },
 
-    // Step 5: whole-file locks and quorum votes.
+    // Whole-file locks (see `crate::lock`).
+    /// Phase 1: asks a voter for a provisional grant.
     LockRequest {
         req: u64,
-        path: Vec<u8>,
-        lease_ms: u64,
+        key: Vec<u8>,
+        ballot: Ballot,
     },
+    /// Phase 1 reply: provisional grant.
     LockGrant {
         req: u64,
-        path: Vec<u8>,
-        holder: NodeId,
-        lease_ms: u64,
+        ballot: Ballot,
     },
+    /// Refusal of a request, confirmation or renewal; also sent unasked
+    /// when an older ballot preempts a provisional grant.
     LockDeny {
         req: u64,
-        path: Vec<u8>,
+        ballot: Ballot,
+        reason: DenyReason,
         holder: Option<NodeId>,
-        reason: String,
     },
-    LockRenew {
-        path: Vec<u8>,
-        holder: NodeId,
+    /// Phase 2: turns the provisional grant into a lease.
+    LockConfirm {
+        req: u64,
+        key: Vec<u8>,
+        ballot: Ballot,
         lease_ms: u64,
     },
+    /// Phase 2 reply: the lease started when the voter received the confirm.
+    LockConfirmed {
+        req: u64,
+        ballot: Ballot,
+    },
+    /// Extends a confirmed lease by `lease_ms` from receipt.
+    LockRenew {
+        req: u64,
+        key: Vec<u8>,
+        ballot: Ballot,
+        lease_ms: u64,
+    },
+    LockRenewed {
+        req: u64,
+        ballot: Ballot,
+    },
+    /// Drops whatever grant `ballot` has for `key`.
     LockRelease {
-        path: Vec<u8>,
-        holder: NodeId,
-    },
-    VoteRequest {
-        req: u64,
-        term: u64,
-        subject: Vec<u8>,
-    },
-    Vote {
-        req: u64,
-        term: u64,
-        granted: bool,
+        key: Vec<u8>,
+        ballot: Ballot,
     },
 
     // Step 7: asynchronous replication.
@@ -262,10 +277,11 @@ impl Message {
             Message::LockRequest { .. } => "lock-request",
             Message::LockGrant { .. } => "lock-grant",
             Message::LockDeny { .. } => "lock-deny",
+            Message::LockConfirm { .. } => "lock-confirm",
+            Message::LockConfirmed { .. } => "lock-confirmed",
             Message::LockRenew { .. } => "lock-renew",
+            Message::LockRenewed { .. } => "lock-renewed",
             Message::LockRelease { .. } => "lock-release",
-            Message::VoteRequest { .. } => "vote-request",
-            Message::Vote { .. } => "vote",
             Message::JournalEntry { .. } => "journal-entry",
             Message::JournalAck { .. } => "journal-ack",
             Message::BlockPull { .. } => "block-pull",
@@ -318,6 +334,36 @@ pub enum RejectReason {
     SameNodeId,
     /// Only the lower node id dials; a higher one dialed.
     WrongDirection,
+}
+
+/// Orders lock attempts: lower is older and wins conflicts. `counter` is a
+/// Lamport clock, `node` breaks ties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Ballot {
+    pub counter: u64,
+    pub node: NodeId,
+}
+
+impl std::fmt::Display for Ballot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.counter, self.node)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum DenyReason {
+    /// Another node holds a confirmed lease on a conflicting key.
+    Held,
+    /// An older attempt has a provisional grant on a conflicting key.
+    Older,
+    /// This attempt's provisional grant was taken over by an older one.
+    Preempted,
+    /// The voter restarted less than one lease ago and grants nothing yet.
+    Quarantine,
+    /// Confirm or renew for a grant the voter does not have.
+    NotHeld,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
