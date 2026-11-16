@@ -34,3 +34,6 @@ pub fn absolutize(p: &Path, cwd: &Path) -> PathBuf {
     }
     out
 }
+
+mod resolve;
+pub use resolve::*;
