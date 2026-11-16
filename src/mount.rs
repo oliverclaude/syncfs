@@ -125,7 +125,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
     raise_nofile_limit();
 
     let fuse_cfg = fuse_config(cfg, kernel_flags);
-    let fs = SyncFs::new(backing, LocalOnly)
+    let fs = SyncFs::new(backing, LocalOnly, crate::status::Registry::new())
         .with_context(|| format!("opening backing_dir {}", backing.display()))?;
     log::debug!("fuse options: {:?}", fuse_cfg);
 
