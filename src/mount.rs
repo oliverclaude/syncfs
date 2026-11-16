@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use fuser::{MountOption, Session, SessionACL};
+use signal_hook::iterator::Signals;
 
 use crate::config::Config;
 use crate::fs::{LocalOnly, SyncFs};
@@ -186,9 +187,10 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         .with_context(|| format!("mounting {}", mountpoint.display()))
     };
     if cfg.foreground {
+        let signals = stop_signals()?;
         let served = mount()?;
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
-        serve(served)
+        serve(served, signals)
     } else {
         daemonize(mount)
     }
@@ -282,18 +284,24 @@ fn mount_direct(
     }
 }
 
-/// Runs the session until unmounted; SIGINT/SIGTERM/SIGHUP unmount cleanly.
-fn serve(served: Served) -> anyhow::Result<()> {
+/// Catches SIGINT, SIGTERM and SIGHUP. Installed before mounting so that a
+/// signal arriving as soon as the mount is visible is not fatal: it stays
+/// pending until [`serve`] handles it.
+fn stop_signals() -> std::io::Result<Signals> {
+    Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ])
+}
+
+/// Runs the session until unmounted; `signals` unmount cleanly.
+fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
     let Served {
         mut session,
         direct,
     } = served;
     let mut unmounter = session.unmount_callable();
-    let mut signals = signal_hook::iterator::Signals::new([
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ])?;
     std::thread::spawn(move || {
         if let Some(sig) = signals.forever().next() {
             log::info!("signal {sig}: unmounting");
@@ -344,13 +352,22 @@ fn daemonize(mount: impl FnOnce() -> anyhow::Result<Served>) -> anyhow::Result<(
     }
     drop(rx);
     let _ = rustix::process::setsid();
+    let signals = match stop_signals() {
+        Ok(s) => s,
+        Err(e) => {
+            let mut msg = vec![1u8];
+            msg.extend_from_slice(format!("installing signal handlers: {e}").as_bytes());
+            let _ = tx.write_all(&msg);
+            std::process::exit(1);
+        }
+    };
     match mount() {
         Ok(session) => {
             detach_stdio();
             logging::switch_to_syslog();
             let _ = tx.write_all(&[0]);
             drop(tx);
-            if let Err(e) = serve(session) {
+            if let Err(e) = serve(session, signals) {
                 log::error!("{e:#}");
                 std::process::exit(1);
             }
