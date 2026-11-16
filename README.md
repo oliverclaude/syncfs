@@ -337,6 +337,9 @@ Consequences of path keys, by design:
 - A file deleted while open needs no lock for further writes (it is no
   longer shared); its old path stays locked until it is closed, so another
   node cannot create a new file there in the meantime.
+- A file whose backing path is longer than `PATH_MAX` cannot be named by
+  the kernel; changes to it lock the root (`/`), which is safe but blocks
+  every other node's writes for the duration.
 - Hard links are locked per path: two nodes writing the same inode through
   different names are not serialized. This is a known limitation.
 

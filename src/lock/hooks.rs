@@ -39,6 +39,16 @@ fn key_of(node: NodeRef<'_>) -> Result<Option<Key>, Errno> {
     match node.path() {
         Ok(p) => Ok(Some(Key::from_path(&p))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        // The kernel cannot name paths longer than PATH_MAX (with the
+        // backing directory prefix). Lock the root instead: it covers the
+        // file, at the cost of excluding every other node meanwhile.
+        Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+            log::debug!(
+                "locks: inode {} has a path too long to name; locking /",
+                node.ino()
+            );
+            Ok(Some(Key::new(b"")))
+        }
         Err(e) => {
             log::warn!("locks: cannot resolve inode {}: {e}", node.ino());
             Err(Errno::EIO)
