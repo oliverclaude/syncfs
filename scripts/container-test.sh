@@ -4,7 +4,7 @@
 #   scripts/container-test.sh bookworm            # native architecture
 #   scripts/container-test.sh trixie arm64        # emulated via qemu-user/binfmt
 #
-# Runs the whole test suite as root and the FUSE mount tests again as an
+# Runs the whole test suite as root and the FUSE tests again as an
 # unprivileged user (fusermount3 path). Needs docker; FUSE needs
 # /dev/fuse and CAP_SYS_ADMIN in the container.
 # Set APT_RELAY=http://HOST:PORT to fetch Debian packages through a local
@@ -34,9 +34,11 @@ exec docker run --rm $platform --network host \
     cp -a /src /work && cd /work
     echo "== $(. /etc/os-release; echo $PRETTY_NAME) $(uname -m), $(rustc --version)"
     cargo test 2>&1 | grep -E "^test result|FAILED|panicked|SKIPPED" 
-    bin=$(cargo test --test mount --no-run --message-format=json 2>/dev/null | jq -r "select(.executable != null) | .executable" | grep /mount-)
     useradd -m tester
     chmod -R a+rX /build /work
-    echo "== mount tests as unprivileged user"
-    su tester -c "cd /tmp && $bin -q" > /tmp/user.log 2>&1 || { grep -m3 -iE "fusermount|error|exited" /tmp/user.log; }; grep -E "^test result" /tmp/user.log
+    for t in mount status; do
+      bin=$(cargo test --test $t --no-run --message-format=json 2>/dev/null | jq -r "select(.executable != null) | .executable" | grep /$t-)
+      echo "== $t tests as unprivileged user"
+      su tester -c "cd /tmp && $bin -q" > /tmp/user.log 2>&1 || { grep -m3 -iE "fusermount|error|exited" /tmp/user.log; }; grep -E "^test result" /tmp/user.log
+    done
   '

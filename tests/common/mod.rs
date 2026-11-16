@@ -101,6 +101,12 @@ pub struct Mounted {
 
 impl Mounted {
     pub fn new(extra: &[&str]) -> Self {
+        Self::with_backing(|_| {}, extra)
+    }
+
+    /// Like [`new`](Self::new), running `prepare` on the backing
+    /// directory before mounting.
+    pub fn with_backing(prepare: impl FnOnce(&Path), extra: &[&str]) -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("syncfs-test-")
             .tempdir()
@@ -109,6 +115,7 @@ impl Mounted {
         let mnt = tmp.path().join("mnt");
         std::fs::create_dir(&backing).unwrap();
         std::fs::create_dir(&mnt).unwrap();
+        prepare(&backing);
         let child = Command::new(BIN)
             .arg(&backing)
             .arg(&mnt)

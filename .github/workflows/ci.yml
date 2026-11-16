@@ -33,8 +33,10 @@ jobs:
       - run: cargo test -- --nocapture 2>&1 | tee test.log; test ${PIPESTATUS[0]} -eq 0
       - name: Check that FUSE tests ran
         run: "! grep -E 'SKIPPED: (/dev/fuse|fusermount3)' test.log"
-      - name: Mount tests as root
+      - name: FUSE tests as root
         run: |
-          bin=$(cargo test --test mount --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.executable != null) | .executable' | grep '/mount-')
-          sudo env PATH="$PATH" "$bin" --nocapture
+          for t in mount status; do
+            bin=$(cargo test --test $t --no-run --message-format=json 2>/dev/null \
+              | jq -r 'select(.executable != null) | .executable' | grep "/$t-")
+            sudo env PATH="$PATH" "$bin" --nocapture
+          done
