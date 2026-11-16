@@ -289,3 +289,45 @@ fn handshake_rejection_cases() {
     assert_eq!(err, "heartbeat timeout");
     node2.shutdown();
 }
+
+fn raise_nofile() {
+    unsafe {
+        let mut l = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::getrlimit(libc::RLIMIT_NOFILE, &mut l);
+        l.rlim_cur = l.rlim_max;
+        libc::setrlimit(libc::RLIMIT_NOFILE, &l);
+    }
+}
+
+fn full_mesh(n: usize) {
+    raise_nofile();
+    let cfgs = cluster(n);
+    let t = Instant::now();
+    let nets: Vec<Network> = cfgs.iter().map(|c| Network::start(c).unwrap()).collect();
+    for net in &nets {
+        assert!(
+            net.wait_until(Duration::from_secs(60), all_up(n)),
+            "{:#?}",
+            net.snapshot()
+        );
+    }
+    eprintln!("{n}-node full mesh converged in {:?}", t.elapsed());
+    nets[n - 1].shutdown();
+    for net in &nets[..n - 1] {
+        assert!(net.wait_until(WAIT, all_up(n - 1)));
+    }
+    for net in &nets {
+        net.shutdown();
+    }
+}
+
+/// 25 nodes in one process: 300 connections, ~900 threads. (99 nodes do
+/// not fit in one process: ~12,000 threads exceed `vm.max_map_count`; see
+/// `cluster::daemons_99_nodes` for the real thing, one process per node.)
+#[test]
+fn full_mesh_25() {
+    full_mesh(25);
+}

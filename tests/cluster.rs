@@ -333,3 +333,23 @@ fn mixed_five_nodes() {
     }
     report("restart 2, 3, 4", c.converge("restart"));
 }
+
+/// The maximum cluster size: 99 voter processes (each with ~250 network
+/// threads), full mesh. Heavy, so opt-in:
+/// `cargo test --release --test cluster -- --ignored --nocapture`.
+#[test]
+#[ignore = "heavy: 99 processes"]
+fn daemons_99_nodes() {
+    let t = Instant::now();
+    let mut c = Cluster::new(&[Kind::Daemon; 99]);
+    eprintln!("99 nodes started in {:?}", t.elapsed());
+    report("start (99)", c.converge("start"));
+    for id in [7, 50, 99] {
+        c.node(id).stop();
+    }
+    report("kill 3 of 99", c.converge("kill 3"));
+    for id in [7, 50, 99] {
+        c.node(id).start();
+    }
+    report("restart 3 of 99", c.converge("restart 3"));
+}

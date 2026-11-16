@@ -37,6 +37,9 @@ use crate::status::{FnProvider, Provider};
 
 /// A peer silent for this many heartbeat intervals is considered down.
 pub const DOWN_AFTER_HEARTBEATS: u32 = 3;
+/// Stack size of network threads: they only shuffle frames, and a 99-node
+/// mesh runs about 250 of them.
+const NET_THREAD_STACK: usize = 256 << 10;
 /// Time allowed for connecting and for the handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -226,6 +229,7 @@ impl Network {
         );
         let sh = Arc::clone(&shared);
         let acceptor = std::thread::Builder::new()
+            .stack_size(NET_THREAD_STACK)
             .name("syncfs-accept".into())
             .spawn(move || accept_loop(sh, listener))?;
         *lock(&shared.acceptor) = Some(acceptor);
@@ -233,6 +237,7 @@ impl Network {
             if shared.me.dials(shared.slots[i].id) {
                 let sh = Arc::clone(&shared);
                 std::thread::Builder::new()
+                    .stack_size(NET_THREAD_STACK)
                     .name(format!("syncfs-dial-{}", shared.slots[i].id))
                     .spawn(move || dial_loop(sh, i))?;
             }
@@ -483,6 +488,7 @@ fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
         let Ok(stream) = stream else { continue };
         let sh = Arc::clone(&sh);
         let _ = std::thread::Builder::new()
+            .stack_size(NET_THREAD_STACK)
             .name("syncfs-conn".into())
             .spawn(move || accept_one(sh, stream));
     }
@@ -628,6 +634,7 @@ fn run_session(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, incarnation: u6
 
     let wsh = Arc::clone(sh);
     let spawned = std::thread::Builder::new()
+        .stack_size(NET_THREAD_STACK)
         .name(format!("syncfs-tx-{}", slot.id))
         .spawn(move || write_loop(&wsh, writer, &rx));
     let reason = if spawned.is_err() {
