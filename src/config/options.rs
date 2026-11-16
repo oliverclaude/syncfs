@@ -148,6 +148,7 @@ pub fn parse_mount_options<'a>(
             "state_dir" => l.state_dir = Some(path(need()?)?),
             "cluster_name" => l.cluster_name = Some(need()?.to_string()),
             "lock_lease_timeout" => l.lock_lease_timeout = Some(need()?.parse().map_err(invalid)?),
+            "lock_wait" => l.lock_wait = Some(need()?.parse().map_err(invalid)?),
             "heartbeat_interval" => l.heartbeat_interval = Some(need()?.parse().map_err(invalid)?),
             "block_size" => l.block_size = Some(need()?.parse().map_err(invalid)?),
             "log_level" => l.log_level = Some(need()?.parse().map_err(invalid)?),
@@ -199,7 +200,7 @@ mod tests {
         let o = parse(
             "config=/etc/x.yaml,node_id=3,mode=daemon,listen=127.0.0.1:9000,\
              peer=1@a:1,peer=2@b:2,peer=3@c:3,backing_dir=/srv/d,mountpoint=/mnt/m,\
-             state_dir=/var/s,lock_lease_timeout=1m,heartbeat_interval=250ms,\
+             state_dir=/var/s,lock_lease_timeout=1m,lock_wait=2s,heartbeat_interval=250ms,\
              block_size=1M,log_level=warn,debug,allow_other=yes,allow_root=off,\
              cluster_name=prod",
         )
@@ -214,6 +215,7 @@ mod tests {
         assert_eq!(l.mountpoint, Some("/mnt/m".into()));
         assert_eq!(l.state_dir, Some("/var/s".into()));
         assert_eq!(l.lock_lease_timeout, Some(HumanDuration::from_secs(60)));
+        assert_eq!(l.lock_wait, Some(HumanDuration::from_secs(2)));
         assert_eq!(
             l.heartbeat_interval,
             Some(HumanDuration(std::time::Duration::from_millis(250)))

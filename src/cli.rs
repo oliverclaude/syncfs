@@ -72,6 +72,11 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub lock_lease_timeout: Option<HumanDuration>,
 
+    /// How long a write waits for a lock held by another node before
+    /// failing with EBUSY; 0 fails at once [default: 10s]
+    #[arg(long, value_name = "DURATION")]
+    pub lock_wait: Option<HumanDuration>,
+
     /// Peer heartbeat interval [default: 1s]
     #[arg(long, value_name = "DURATION")]
     pub heartbeat_interval: Option<HumanDuration>,
@@ -122,6 +127,7 @@ impl Cli {
                 mountpoint: abs(&self.mountpoint_arg).or_else(|| abs(&self.mountpoint)),
                 state_dir: abs(&self.state_dir),
                 lock_lease_timeout: self.lock_lease_timeout,
+                lock_wait: self.lock_wait,
                 heartbeat_interval: self.heartbeat_interval,
                 block_size: self.block_size,
                 debug: flag(self.debug),

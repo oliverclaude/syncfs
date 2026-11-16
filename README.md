@@ -77,6 +77,7 @@ syncfs --mode daemon --node-id 3 --print-config
 | `mountpoint`         | `mountpoint=PATH`             | `--mountpoint`, 2nd arg  | none (required in mount mode)   |
 | `state_dir`          | `state_dir=PATH`              | `--state-dir PATH`       | `/var/lib/syncfs` (root) or `$XDG_STATE_HOME/syncfs` |
 | `lock_lease_timeout` | `lock_lease_timeout=30s`      | `--lock-lease-timeout`   | `30s`                           |
+| `lock_wait`          | `lock_wait=10s`               | `--lock-wait`            | `10s` (`0` = fail at once)      |
 | `heartbeat_interval` | `heartbeat_interval=1s`       | `--heartbeat-interval`   | `1s`                            |
 | `block_size`         | `block_size=64K`              | `--block-size`           | `64KiB`                         |
 | `debug`              | `debug`                       | `-d`, `--debug`          | `false`                         |

@@ -53,6 +53,10 @@ state_dir: /var/lib/syncfs
 # this long. Must be at least 3 x heartbeat_interval.     Default: 30s
 lock_lease_timeout: 30s
 
+# A write that needs a lock another node holds waits this long, then
+# fails with EBUSY. 0 fails at once.                      Default: 10s
+lock_wait: 10s
+
 # How often nodes ping each other.                        Default: 1s
 heartbeat_interval: 1s
 
