@@ -333,12 +333,17 @@ each other: the node serializes its own operations locally.
 | the same without a writable handle (`truncate(1)`, `chmod`, `setfattr`) | the path, for that one operation |
 | create, mkdir, mknod, symlink, link | the new path, for the operation |
 | unlink, rmdir | the path, for the operation (so a file open for writing elsewhere cannot be removed) |
-| rename | source and destination, for the operation, in a fixed order; locks under the source are then re-taken under the new path |
+| rename | source and destination, for the operation, in a fixed order. If another node holds a lock on either path, inside the source's subtree, or on an ancestor, the rename fails at once with `EBUSY` (it does not wait for `lock_wait`, and the other node's lock is never moved). This node's own write locks under the source are re-taken under the new path |
 
 Consequences of path keys, by design:
 
-- Renaming or removing a directory waits for (or fails on) every lock below
-  it anywhere in the cluster.
+- Renaming a file or directory that another node has locked (or that
+  contains a locked file), or renaming onto such a path, fails with
+  `EBUSY` immediately. Only a held lease counts: a rename that races with
+  another node's *attempt* is decided by ballots and retried within
+  `lock_wait` as usual.
+- Removing a directory waits for (or, after `lock_wait`, fails on) every
+  lock below it anywhere in the cluster.
 - A file this node renames while it is open keeps its lock, moved to the
   new path.
 - A file deleted while open needs no lock for further writes (it is no
@@ -356,6 +361,7 @@ Consequences of path keys, by design:
 |-----------|--------|
 | No quorum reachable | `EROFS` at once (reads keep working) |
 | Lock held by another node | wait up to `lock_wait` (default 10 s), then `EBUSY`; `lock_wait: 0` fails at once |
+| Rename involving a path another node holds a lock on | `EBUSY` at once |
 | Lease lapsed (quorum lost while holding) | writes try to re-acquire; `EROFS` if that fails |
 | Voters still in their start-up grace period (below), or not answering, until `lock_wait` | `EROFS` |
 

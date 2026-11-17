@@ -587,6 +587,71 @@ fn locks_five_nodes_with_voters_take_turns() {
     contend(&[Mount, Daemon, Mount, Daemon, Mount]);
 }
 
+/// Renames involving a path another node has locked fail with EBUSY at
+/// once (even with a long lock_wait); the holder's own renames move its
+/// lock.
+#[test]
+fn locks_rename_of_locked_paths_is_busy() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let files = ["d/f", "d/g", "other", "free"];
+    let mut c = Cluster::build(
+        &[Mount, Mount, Daemon],
+        &["--lock-lease-timeout", "1s", "--lock-wait", "10s"],
+    );
+    for n in &c.nodes {
+        std::fs::create_dir_all(n.backing().join("d")).unwrap();
+        for f in files {
+            std::fs::write(n.backing().join(f), b"x").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    let m1 = c.node(1).mnt();
+    let m2 = c.node(2).mnt();
+    let _w = open_rw(&m1.join("d/f")).unwrap();
+    let busy = |from: &str, to: &str| {
+        let t = Instant::now();
+        let e = errno(std::fs::rename(m2.join(from), m2.join(to)));
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "{from} -> {to} took {:?}",
+            t.elapsed()
+        );
+        e
+    };
+    // The locked file, its directory, and onto the locked file.
+    assert_eq!(busy("d/f", "f2"), Some(libc::EBUSY));
+    assert_eq!(busy("d", "d2"), Some(libc::EBUSY));
+    assert_eq!(busy("other", "d/f"), Some(libc::EBUSY));
+    // Nothing moved on node 2.
+    assert!(m2.join("d/f").exists() && m2.join("other").exists());
+    // Unrelated renames work, also next to the locked file.
+    std::fs::rename(m2.join("free"), m2.join("free2")).unwrap();
+    std::fs::rename(m2.join("d/g"), m2.join("d/g2")).unwrap();
+    // The holder renames its own open file: the lock moves with it.
+    std::fs::rename(m1.join("d/f"), m1.join("d/moved")).unwrap();
+    eventually("lock moved to /d/moved", || {
+        let l = c.node(1).status("locks").unwrap();
+        let paths: Vec<_> = l["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].clone())
+            .collect();
+        (paths == [serde_json::json!("/d/moved")])
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("{paths:?}")))
+    });
+    // Node 2 has no d/moved (no replication yet); renaming onto it is busy.
+    assert_eq!(busy("other", "d/moved"), Some(libc::EBUSY));
+    // The old path is free again.
+    eventually("rename d/f on node 2", || {
+        std::fs::rename(m2.join("d/f"), m2.join("d/f3"))
+    });
+}
+
 #[test]
 fn locks_killed_holder_expires() {
     require_fuse!();

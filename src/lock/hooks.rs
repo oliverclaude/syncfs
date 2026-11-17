@@ -74,6 +74,12 @@ impl ClusterHooks {
 
     /// Locks `keys` until the returned guard drops.
     fn op_lock(&self, keys: Vec<Option<Key>>) -> Result<OpGuard, Errno> {
+        self.op_lock_with(keys, false)
+    }
+
+    /// `fail_on_held`: EBUSY at once if another node holds a conflicting
+    /// lock, instead of waiting up to `lock_wait`.
+    fn op_lock_with(&self, keys: Vec<Option<Key>>, fail_on_held: bool) -> Result<OpGuard, Errno> {
         // A fixed order, so two renames in opposite directions don't wait
         // for each other.
         let mut keys: Vec<Key> = keys.into_iter().flatten().collect();
@@ -81,7 +87,12 @@ impl ClusterHooks {
         keys.dedup();
         let mut taken: Vec<Key> = Vec::new();
         for key in keys {
-            if let Err(e) = self.locks.acquire(&key) {
+            let res = if fail_on_held {
+                self.locks.acquire_unless_held(&key)
+            } else {
+                self.locks.acquire(&key)
+            };
+            if let Err(e) = res {
                 for k in &taken {
                     self.locks.release(k);
                 }
@@ -161,7 +172,10 @@ impl WriteHooks for ClusterHooks {
                 new_parent,
                 new_name,
                 ..
-            } => self.op_lock(vec![child(parent, name)?, child(new_parent, new_name)?]),
+            } => self.op_lock_with(
+                vec![child(parent, name)?, child(new_parent, new_name)?],
+                true,
+            ),
         }
     }
 

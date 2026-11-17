@@ -225,13 +225,21 @@ impl LockManager {
     /// Takes (another reference to) the write lock on `key`, waiting up to
     /// `lock_wait` while another node holds a conflicting lock.
     pub fn acquire(&self, key: &Key) -> Result<(), LockError> {
-        self.inner.acquire(key, true)
+        self.inner.acquire(key, true, false)
+    }
+
+    /// Like [`acquire`](Self::acquire), but fails with `Busy` at once,
+    /// without waiting, if another node holds a conflicting lease (used by
+    /// rename). Transient conflicts (competing attempts) are still retried
+    /// within `lock_wait`.
+    pub fn acquire_unless_held(&self, key: &Key) -> Result<(), LockError> {
+        self.inner.acquire(key, true, true)
     }
 
     /// Ok if this node holds `key` with a valid lease, re-acquiring it
     /// (without taking a reference) if it lapsed or is not held.
     pub fn ensure(&self, key: &Key) -> Result<(), LockError> {
-        self.inner.acquire(key, false)
+        self.inner.acquire(key, false, false)
     }
 
     /// Drops one reference; the last one releases the lock everywhere.
@@ -516,7 +524,7 @@ impl Inner {
         self.net.snapshot().have_quorum
     }
 
-    fn acquire(&self, key: &Key, add_ref: bool) -> Result<(), LockError> {
+    fn acquire(&self, key: &Key, add_ref: bool, fail_on_held: bool) -> Result<(), LockError> {
         let deadline = Instant::now() + self.s.wait;
         let mut st = lock(&self.st);
         loop {
@@ -543,7 +551,7 @@ impl Inner {
             node: self.s.me,
         };
         st.acquiring.insert(key.clone());
-        let (mut st, res) = self.attempts(st, key, ballot, deadline);
+        let (mut st, res) = self.attempts(st, key, ballot, deadline, fail_on_held);
         st.acquiring.remove(key);
         match res {
             Ok((req, valid_until)) => {
@@ -593,6 +601,7 @@ impl Inner {
         key: &Key,
         ballot: Ballot,
         deadline: Instant,
+        fail_on_held: bool,
     ) -> (MutexGuard<'a, State>, Result<(u64, Instant), LockError>) {
         let mut backoff = Duration::from_millis(20);
         loop {
@@ -672,7 +681,7 @@ impl Inner {
             drop(st);
             self.send(out);
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline || (fail_on_held && p.attempt.held_seen) {
                 let err = if p.attempt.conflict_seen {
                     LockError::Busy(p.attempt.conflict)
                 } else {

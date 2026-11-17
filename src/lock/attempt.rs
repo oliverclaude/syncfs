@@ -43,6 +43,8 @@ pub struct Attempt {
     /// Some refusal said another node holds or is about to hold the lock.
     pub conflict: Option<NodeId>,
     pub conflict_seen: bool,
+    /// Some voter said another node holds a confirmed lease.
+    pub held_seen: bool,
 }
 
 impl Attempt {
@@ -58,6 +60,7 @@ impl Attempt {
             lost: BTreeSet::new(),
             conflict: None,
             conflict_seen: false,
+            held_seen: false,
         }
     }
 
@@ -134,6 +137,9 @@ impl Attempt {
             self.conflict_seen = true;
             if holder.is_some() {
                 self.conflict = holder;
+            }
+            if reason == DenyReason::Held {
+                self.held_seen = true;
             }
         }
         self.lost.insert(from);

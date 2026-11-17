@@ -130,6 +130,32 @@ fn conflicting_requests_wait_or_fail_busy() {
 }
 
 #[test]
+fn rename_style_acquire_fails_at_once_when_held() {
+    let nodes = cluster(3, "5s");
+    nodes[0].locks.acquire(&k("d/f")).unwrap();
+    for key in ["d/f", "d", "", "d/f/x"] {
+        let t = Instant::now();
+        assert_eq!(
+            nodes[1].locks.acquire_unless_held(&k(key)),
+            Err(LockError::Busy(Some(1))),
+            "{key}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "{key}: {:?}",
+            t.elapsed()
+        );
+    }
+    assert_eq!(nodes[1].locks.acquire_unless_held(&k("d/g")), Ok(()));
+    nodes[1].locks.release(&k("d/g"));
+    // The holder's own node is not refused.
+    common::wait_until("node 1 takes d", || {
+        nodes[0].locks.acquire_unless_held(&k("d")).is_ok()
+    });
+    shutdown(&nodes);
+}
+
+#[test]
 fn waiter_gets_the_lock_when_released() {
     let nodes = cluster(3, "5s");
     nodes[0].locks.acquire(&k("f")).unwrap();
