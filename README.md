@@ -13,13 +13,14 @@ form a cluster and keep a full copy of the same filesystem on every node.
 
 Builds of each `v*` tag are on the
 [releases page](https://github.com/oliverclaude/syncfs/releases), with a
-`SHA256SUMS` file.
+`SHA256SUMS` file (`sha256sum -c SHA256SUMS`). Asset names spell the
+package version `0.1.0~pre` as `0.1.0.pre`, because GitHub rewrites `~`.
 
 **Debian 12 (bookworm) and 13 (trixie)**, amd64 and arm64: take the
 package for your suite (`+deb12` or `+deb13`) and architecture, then
 
 ```sh
-sudo apt install ./syncfs_0.1.0~pre-1+deb13_amd64.deb
+sudo apt install ./syncfs_0.1.0.pre-1+deb13_amd64.deb
 ```
 
 It depends on `fuse3` and installs:

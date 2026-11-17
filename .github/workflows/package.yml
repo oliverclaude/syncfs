@@ -99,6 +99,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
+          # GitHub turns "~" in asset names into "."; name them so up front
+          # so SHA256SUMS matches the downloads.
+          for f in *~*; do mv "$f" "$(echo "$f" | tr '~' .)"; done
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
           gh release create "$GITHUB_REF_NAME" * --repo "$GITHUB_REPOSITORY" \
