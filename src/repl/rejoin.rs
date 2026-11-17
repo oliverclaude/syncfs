@@ -49,7 +49,7 @@ impl Repl {
         let deadline = self.started + self.freshness_timeout;
         let mut waited = false;
         loop {
-            if self.caught_up() {
+            if self.caught_up() && self.reconciled.load(Ordering::Acquire) {
                 if waited {
                     log::info!("rejoin: caught up with the peers; taking changes");
                 }
@@ -69,6 +69,7 @@ impl Repl {
             let st = self.state();
             let _ = self.cv.wait_timeout(st, Duration::from_millis(50));
         }
+        let _g = super::core::lock(&self.reconcile_lock);
         self.rejoined.store(true, Ordering::Release);
     }
 }

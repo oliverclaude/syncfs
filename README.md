@@ -719,6 +719,17 @@ block hashes are compared with every connected data peer, the blocks that
 differ are marked dirty and a `Data` entry is sent. With no peer within
 `freshness_timeout`, every block is marked.
 
+Namespace changes of the crash window (a create, rename or remove on the
+disk whose entry was not flushed) are found by comparing trees: after an
+unclean stop the rejoin gate also waits until the node has listed a data
+peer's tree at a moment when both had applied the same entries and the
+peer had all of this node's. A path only here is sent as a new file
+(`Create`, and its data); a path only on the peer is restored from it, so
+nothing is lost (a lost rename leaves both names, a lost remove brings the
+file back). Counted in `reconcile_sent` and `reconcile_restored`. If no
+such moment comes within `freshness_timeout`, the comparison is skipped
+with a warning.
+
 ### Disk id
 
 A cluster mount keeps `<backing_dir>/.syncfs/disk` with the cluster name,
@@ -782,13 +793,18 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
 `blocks_sent`, `blocks_received`, `bytes_sent`, `bytes_received`,
 `fresh_checks`, `fresh_pulls`, `fresh_waits`, `fresh_fallbacks`,
 `suspects_resolved`, `entries_relayed` (applied from a forwarder),
-`entries_forwarded` (sent for another origin), `conflict_copies`), and `relay_entries` (kept
+`entries_forwarded` (sent for another origin), `conflict_copies`,
+`reconcile_sent`, `reconcile_restored`), and `relay_entries` (kept
 for forwarding). Daemons show their version table in `status.json`.
 
 ### Limits
 
-- Namespace changes made in the crash window may be lost; the
-  directory-tree reconciliation is part of step 8.
+- After an unclean stop with no data peer to compare with in time,
+  namespace changes of the crash window stay local (a warning is logged).
+- A new member with an empty backing directory and a new store starts
+  empty: it does not list a peer's tree (files arrive as they change).
+- Entries for a file this node has open for writing wait until that
+  session ends, and so do that origin's later entries.
 - Renaming over an existing file and removing one of several hard links
   are not versioned (no tombstone).
 - Attribute and data caches are dropped after a peer's change; directory
@@ -848,7 +864,9 @@ for forwarding). Daemons show their version table in `status.json`.
   change reaches a node through a third mount when its origin died, that a
   diverged change is kept as a conflict copy, that removes leave
   tombstones, that a restarted node catches up before it changes the
-  namespace, and that a lost disk and a daemon upgraded to a mount are
+  namespace, that namespace changes lost with an unflushed store are
+  reconciled (`SYNCFS_TEST_FLUSH_INTERVAL_MS` widens the crash window),
+  and that a lost disk and a daemon upgraded to a mount are
   rebuilt from peers (`SYNCFS_TEST_REBUILD_DELAY_MS` slows the background
   copies so the test sees the rebuild running); an
   exhaustive model check of forwarding and dirty marks
@@ -882,7 +900,8 @@ Each step ends with passing tests and a commit.
    metadata journal, peers pulling blocks, file versions, hash-based
    freshness check on lock acquisition with the timeout fallback, crash
    window.
-8. **Rejoin and recovery**. Planned:
+8. **Rejoin and recovery** (done; see Rejoin, Lineage and conflict copies,
+   Tombstones, Rebuild and Crash window). Planned as:
    - A node that rejoins with diverged, unreplicated changes keeps them as
      `name.syncfs-conflict-<node>-<timestamp>` instead of being
      overwritten; the count shows in `.syncfs/stats` and `status.json`.
@@ -897,16 +916,15 @@ Each step ends with passing tests and a commit.
      same per-file checksum comparison. Peers see the new disk id as a
      disk loss, not a normal rejoin, so the freshness check does not wait
      for that node's lost writes. The rebuilding node refuses writes
-     (`EROFS`) until it has caught up, then takes a new disk id and
-     becomes a normal writer. Progress (files and bytes done, ETA) shows
+     (`EROFS`) until it has caught up, then becomes a normal writer (it
+     takes its new disk id when the rebuild starts). Progress (files and bytes done, ETA) shows
      in `.syncfs/replication` and `status.json`.
    - **Upgrading a voter-only daemon to a mount** (restarting it with a
      `backing_dir`) takes the same rebuild path: mount at once, fetch on
      demand, fill in the background, `EROFS` until caught up. The only
      difference is that a daemon never had unreplicated writes, so there
      is nothing to wait for or keep as a conflict copy. Covered by the
-     cluster test `daemon_upgraded_to_mount_rebuilds_from_peers` (ignored
-     until step 8 lands).
+     cluster test `daemon_upgraded_to_mount_rebuilds_from_peers`.
 9. **Packaging**: `.deb` for bookworm and trixie on amd64 and arm64, static
    musl portable binaries, systemd unit for daemon mode.
 10. **Soak test**: randomized multi-node run with restarts and partitions.

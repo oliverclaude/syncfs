@@ -16,6 +16,7 @@ mod model;
 pub mod net;
 pub mod ranges;
 pub mod rebuild;
+pub mod reconcile;
 pub mod rejoin;
 pub mod relay;
 #[cfg(test)]

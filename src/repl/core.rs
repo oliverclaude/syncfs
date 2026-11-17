@@ -54,6 +54,10 @@ pub(crate) struct Counters {
     pub entries_forwarded: u64,
     /// This node's diverged changes kept as conflict copies.
     pub conflict_copies: u64,
+    /// After an unclean stop: unrecorded local paths sent to peers, and
+    /// paths restored from a peer (see `reconcile`).
+    pub reconcile_sent: u64,
+    pub reconcile_restored: u64,
 }
 
 pub(crate) struct State {
@@ -173,6 +177,11 @@ pub struct Repl {
     pub(crate) rejoined: AtomicBool,
     /// Rebuilding from peers (see `rebuild`): no writes.
     pub(crate) rebuilding: AtomicBool,
+    /// The namespace was compared with a peer after an unclean stop (or
+    /// needs no comparison): see `reconcile`.
+    pub(crate) reconciled: AtomicBool,
+    /// Held while comparing; the rejoin gate takes it before opening.
+    pub(crate) reconcile_lock: Mutex<()>,
     pub(crate) rebuild: Mutex<super::rebuild::Rebuild>,
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
@@ -339,6 +348,10 @@ impl Repl {
             started: Instant::now(),
             rejoined: AtomicBool::new(cfg.peers.iter().all(|p| p.id == cfg.node_id)),
             rebuilding: AtomicBool::new(rebuild.is_some()),
+            reconciled: AtomicBool::new(
+                clean || rebuild.is_some() || cfg.peers.iter().all(|p| p.id == cfg.node_id),
+            ),
+            reconcile_lock: Mutex::new(()),
             rebuild: Mutex::new(super::rebuild::Rebuild {
                 cause: rebuild,
                 marker: rebuild.map(|_| super::marker::Marker {
@@ -361,6 +374,13 @@ impl Repl {
             None => Batch::default(),
         }));
         super::net::start(&repl);
+        if !repl.reconciled.load(Ordering::Relaxed) {
+            let weak = Arc::downgrade(&repl);
+            let h = std::thread::Builder::new()
+                .name("syncfs-reconcile".into())
+                .spawn(move || super::reconcile::reconcile_loop(weak))?;
+            lock(&repl.threads).push(h);
+        }
         if rebuild.is_some() {
             let weak = Arc::downgrade(&repl);
             let h = std::thread::Builder::new()

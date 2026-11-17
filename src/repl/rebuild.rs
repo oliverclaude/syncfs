@@ -263,7 +263,7 @@ impl Repl {
     }
 
     /// `source`'s whole tree, or `None` if it is rebuilding itself.
-    fn fetch_tree(&self, source: NodeId) -> io::Result<Option<Tree>> {
+    pub(crate) fn fetch_tree(&self, source: NodeId) -> io::Result<Option<Tree>> {
         let mut nodes: Vec<TreeNode> = Vec::new();
         let mut first = None;
         loop {

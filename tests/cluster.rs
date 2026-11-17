@@ -1278,6 +1278,49 @@ fn restarted_node_catches_up_before_changes() {
     wait_same_tree(&c, 1, 2);
 }
 
+/// Namespace changes whose journal entries were not flushed when the node
+/// died are found by comparing trees on restart: paths only there are
+/// sent, paths only on the peer are restored (a lost rename keeps both
+/// names).
+#[test]
+fn crash_window_namespace_changes_are_reconciled() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster_with(&[Mount, Mount, Daemon], "5s", |b| {
+        std::fs::write(b.join("f"), b"f\n").unwrap();
+    });
+    // Node 1 flushes its store rarely: its next changes die with it.
+    c.node(1).stop();
+    c.node(1)
+        .env
+        .push(("SYNCFS_TEST_FLUSH_INTERVAL_MS".into(), "60000".into()));
+    c.node(1).start();
+    c.converge("node 1 back");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    let m1 = c.node(1).mnt();
+    std::fs::create_dir(m1.join("d2")).unwrap();
+    std::os::unix::fs::symlink("f", m1.join("s")).unwrap();
+    std::fs::rename(m1.join("f"), m1.join("g")).unwrap();
+    c.node(1).kill();
+    c.node(1).env.clear();
+    c.node(1).start();
+    c.converge("node 1 restarted");
+    wait_same_tree(&c, 1, 2);
+    let m2 = c.node(2).mnt();
+    for m in [&m1, &m2] {
+        assert!(m.join("d2").is_dir());
+        assert_eq!(
+            std::fs::read_link(m.join("s")).unwrap(),
+            std::path::Path::new("f")
+        );
+        assert_eq!(std::fs::read(m.join("f")).unwrap(), b"f\n");
+        assert_eq!(std::fs::read(m.join("g")).unwrap(), b"f\n");
+    }
+    let r = c.node(1).status("replication").unwrap();
+    assert_eq!(r["counters"]["reconcile_sent"], 3, "{r:#}");
+    assert_eq!(r["counters"]["reconcile_restored"], 1, "{r:#}");
+}
+
 /// A node whose disk is lost (backing directory wiped, marker gone)
 /// rebuilds from a peer; local leftovers move to `.syncfs/orphans`, and a
 /// version only the lost disk had does not block writers.

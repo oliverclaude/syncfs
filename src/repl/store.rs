@@ -253,12 +253,17 @@ impl Flusher {
         std::thread::Builder::new()
             .name("syncfs-flush".into())
             .spawn(move || {
+                // Tests widen the crash window to lose unflushed changes.
+                let every = std::env::var("SYNCFS_TEST_FLUSH_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .map_or(FLUSH_INTERVAL, Duration::from_millis);
                 while !me.stop.load(Ordering::SeqCst) {
                     let g = me.wake.0.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = me
                         .wake
                         .1
-                        .wait_timeout_while(g, FLUSH_INTERVAL, |_| !me.stop.load(Ordering::SeqCst));
+                        .wait_timeout_while(g, every, |_| !me.stop.load(Ordering::SeqCst));
                     let _ = me.flush_now();
                 }
             })
