@@ -52,6 +52,7 @@ fn data() -> Entry {
         version: V,
         size: 0,
         attrs: Attrs::default(),
+        lineage: Vec::new(),
     }
 }
 
@@ -288,6 +289,8 @@ impl Model {
                     id: None,
                     path: b"x".to_vec(),
                     dir: false,
+                    version: None,
+                    lineage: Vec::new(),
                 },
             );
             t.b_made = true;

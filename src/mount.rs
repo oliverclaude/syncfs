@@ -222,6 +222,9 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
             }
         };
         let inodes = fs.inode_table();
+        if let Some(r) = &repl {
+            r.set_stats(Arc::clone(fs.stats()));
+        }
         register_status(
             &status,
             &fs,

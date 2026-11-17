@@ -108,12 +108,73 @@ fn rebase(p: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
+/// How many earlier versions a copy remembers.
+pub const LINEAGE: usize = 16;
+
+/// How long a removed file's record (its tombstone) is kept.
+pub const TOMBSTONE_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRec {
-    /// Every path of the file (several for hard links), sorted.
+    /// Every path of the file (several for hard links), sorted. Empty for
+    /// a tombstone.
     pub paths: Vec<Vec<u8>>,
-    /// The version the local copy holds.
+    /// The version the local copy holds (a tombstone: the remove's).
     pub version: Option<Version>,
+    /// Earlier versions this copy went through, oldest first (at most
+    /// [`LINEAGE`]).
+    pub lineage: Vec<Version>,
+    /// Removed (a tombstone) at this time (seconds since the epoch).
+    pub removed_at: Option<u64>,
+}
+
+/// The record format before lineage and tombstones.
+#[derive(Deserialize)]
+struct FileRecV0 {
+    paths: Vec<Vec<u8>>,
+    version: Option<Version>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether `local`, a version this node (`me` on `disk`) made, is missing
+/// from a copy at `incoming` that went through `lineage`: that copy was
+/// written without this node's change (after a fallback), so the change
+/// must be kept aside before the copy replaces it.
+pub fn diverged(
+    local: Option<Version>,
+    me: crate::config::NodeId,
+    disk: u64,
+    incoming: Version,
+    lineage: &[Version],
+) -> bool {
+    let Some(l) = local else { return false };
+    l.seq > 0
+        && l.node == me
+        && l.disk == disk
+        && l < incoming
+        && !lineage.contains(&l)
+        // Older than everything a full lineage remembers: assume it is in.
+        && !(lineage.len() >= LINEAGE && lineage.first().is_some_and(|f| l < *f))
+}
+
+/// Whether a copy at `local` can take `incoming`'s changed blocks: it is
+/// that version already or one `incoming` went through. Otherwise the
+/// whole file is compared.
+pub fn same_base(local: Option<Version>, incoming: Version, lineage: &[Version]) -> bool {
+    match local {
+        None => true,
+        Some(l) => {
+            l == incoming
+                || lineage.contains(&l)
+                || (lineage.len() >= LINEAGE && lineage.first().is_some_and(|f| l < *f))
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -130,7 +191,17 @@ impl Index {
             let Ok(id) = <[u8; 16]>::try_from(k.as_slice()) else {
                 continue;
             };
-            let rec: FileRec = decode(&v)?;
+            let rec: FileRec = match decode(&v) {
+                Ok(r) => r,
+                Err(_) => {
+                    let old: FileRecV0 = decode(&v)?;
+                    FileRec {
+                        paths: old.paths,
+                        version: old.version,
+                        ..FileRec::default()
+                    }
+                }
+            };
             for p in &rec.paths {
                 ix.by_path.insert(p.clone(), FileId(id));
             }
@@ -139,20 +210,22 @@ impl Index {
         Ok(ix)
     }
 
+    /// Live files (not tombstones).
     pub fn len(&self) -> usize {
-        self.files.len()
+        self.files().count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.len() == 0
     }
 
     pub fn get(&self, path: &[u8]) -> Option<FileId> {
         self.by_path.get(path).copied()
     }
 
+    /// A live file's record (not a tombstone's).
     pub fn rec(&self, id: &FileId) -> Option<&FileRec> {
-        self.files.get(id)
+        self.files.get(id).filter(|r| !r.paths.is_empty())
     }
 
     /// A current path of `id`.
@@ -164,13 +237,85 @@ impl Index {
         self.files.get(id)?.version
     }
 
+    /// Earlier versions of the local copy (oldest first).
+    pub fn lineage(&self, id: &FileId) -> Vec<Version> {
+        self.files
+            .get(id)
+            .map(|r| r.lineage.clone())
+            .unwrap_or_default()
+    }
+
+    /// The local copy is now at `v`, a change on top of what it was.
     pub fn set_version(&mut self, id: FileId, v: Version) {
         if let Some(r) = self.files.get_mut(&id) {
             if r.version.is_none_or(|old| v > old) {
+                if let Some(old) = r.version {
+                    r.lineage.push(old);
+                    let excess = r.lineage.len().saturating_sub(LINEAGE);
+                    r.lineage.drain(..excess);
+                }
                 r.version = Some(v);
                 self.changed.insert(id);
             }
         }
+    }
+
+    /// The local copy is now a copy of another node's `v`, which went
+    /// through `lineage`.
+    pub fn take_version(&mut self, id: FileId, v: Version, lineage: &[Version]) {
+        if let Some(r) = self.files.get_mut(&id) {
+            if r.version.is_none_or(|old| v > old) {
+                r.version = Some(v);
+                r.lineage = lineage[lineage.len().saturating_sub(LINEAGE)..].to_vec();
+                self.changed.insert(id);
+            }
+        }
+    }
+
+    /// The version `id` was removed at, if it is a tombstone.
+    pub fn tombstone(&self, id: &FileId) -> Option<Version> {
+        let r = self.files.get(id)?;
+        r.removed_at.and(r.version)
+    }
+
+    /// `id`'s last path is gone (removed at `v`): keeps its record as a
+    /// tombstone.
+    pub fn bury(&mut self, id: FileId, v: Version) {
+        let r = self.files.entry(id).or_default();
+        for p in std::mem::take(&mut r.paths) {
+            self.by_path.remove(&p);
+        }
+        if let Some(old) = r.version.filter(|old| *old < v) {
+            r.lineage.push(old);
+            let excess = r.lineage.len().saturating_sub(LINEAGE);
+            r.lineage.drain(..excess);
+        }
+        if r.version.is_none_or(|old| old < v) {
+            r.version = Some(v);
+        }
+        r.removed_at = Some(now_secs());
+        self.changed.insert(id);
+    }
+
+    /// Drops tombstones older than [`TOMBSTONE_KEEP`].
+    pub fn expire_tombstones(&mut self) -> usize {
+        let cut = now_secs().saturating_sub(TOMBSTONE_KEEP.as_secs());
+        let old: Vec<FileId> = self
+            .files
+            .iter()
+            .filter(|(_, r)| r.paths.is_empty() && r.removed_at.is_some_and(|t| t < cut))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &old {
+            self.files.remove(id);
+            self.changed.insert(*id);
+        }
+        old.len()
+    }
+
+    /// Every live file: id, record.
+    pub fn files(&self) -> impl Iterator<Item = (&FileId, &FileRec)> {
+        self.files.iter().filter(|(_, r)| !r.paths.is_empty())
     }
 
     /// The id at `path`, adopting the file there if it has none.
@@ -191,6 +336,8 @@ impl Index {
         self.remove_path(path);
         self.by_path.insert(path.to_vec(), id);
         let r = self.files.entry(id).or_default();
+        // A tombstone comes back to life.
+        r.removed_at = None;
         if let Err(i) = r.paths.binary_search_by(|p| p.as_slice().cmp(path)) {
             r.paths.insert(i, path.to_vec());
         }
@@ -202,7 +349,7 @@ impl Index {
         let id = self.by_path.remove(path)?;
         if let Some(r) = self.files.get_mut(&id) {
             r.paths.retain(|p| p != path);
-            if r.paths.is_empty() {
+            if r.paths.is_empty() && r.removed_at.is_none() {
                 self.files.remove(&id);
             }
         }
@@ -314,6 +461,95 @@ mod tests {
 
     fn id(n: u8) -> FileId {
         FileId([n; 16])
+    }
+
+    fn ver(seq: u64, node: crate::config::NodeId) -> Version {
+        Version {
+            seq,
+            node,
+            disk: node as u64,
+        }
+    }
+
+    #[test]
+    fn lineage_and_divergence() {
+        let mut ix = Index::default();
+        ix.insert(b"f", id(1));
+        ix.set_version(id(1), ver(1, 2));
+        ix.set_version(id(1), ver(2, 1));
+        assert_eq!(ix.lineage(&id(1)), vec![ver(1, 2)]);
+        // A copy of node 2's version 3 that went through 1 and 2.
+        ix.take_version(id(1), ver(3, 2), &[ver(1, 2), ver(2, 1)]);
+        assert_eq!(ix.lineage(&id(1)), vec![ver(1, 2), ver(2, 1)]);
+        for n in 4..40 {
+            ix.set_version(id(1), ver(n, 1));
+        }
+        assert_eq!(ix.lineage(&id(1)).len(), LINEAGE);
+
+        // Node 1's version 5 is in the incoming lineage: no conflict.
+        let l = [ver(4, 2), ver(5, 1)];
+        assert!(!diverged(Some(ver(5, 1)), 1, 1, ver(6, 2), &l));
+        // Written over without it: a conflict, and not the same base.
+        let l = [ver(4, 2)];
+        assert!(diverged(Some(ver(5, 1)), 1, 1, ver(6, 2), &l));
+        assert!(!same_base(Some(ver(5, 1)), ver(6, 2), &l));
+        // Another node's version, or another disk's: no conflict here (but
+        // still the whole file is compared).
+        assert!(!diverged(Some(ver(5, 3)), 1, 1, ver(6, 2), &l));
+        assert!(!diverged(Some(ver(5, 1)), 1, 9, ver(6, 2), &l));
+        assert!(!same_base(Some(ver(5, 3)), ver(6, 2), &l));
+        // The same version (an interim entry) or a newer local one.
+        assert!(!diverged(Some(ver(6, 2)), 2, 2, ver(6, 2), &l));
+        assert!(!diverged(Some(ver(7, 1)), 1, 1, ver(6, 2), &l));
+        assert!(same_base(None, ver(6, 2), &l));
+        // Older than a full lineage remembers.
+        let full: Vec<Version> = (10..10 + LINEAGE as u64).map(|n| ver(n, 2)).collect();
+        assert!(!diverged(Some(ver(3, 1)), 1, 1, ver(40, 2), &full));
+        assert!(same_base(Some(ver(3, 1)), ver(40, 2), &full));
+    }
+
+    #[test]
+    fn tombstones_are_kept_and_come_back() {
+        let mut ix = Index::default();
+        ix.insert(b"f", id(1));
+        ix.set_version(id(1), ver(1, 1));
+        ix.bury(id(1), ver(2, 1));
+        assert_eq!(ix.get(b"f"), None);
+        assert!(ix.rec(&id(1)).is_none());
+        assert_eq!(ix.tombstone(&id(1)), Some(ver(2, 1)));
+        assert_eq!(ix.version(&id(1)), Some(ver(2, 1)));
+        assert_eq!(ix.lineage(&id(1)), vec![ver(1, 1)]);
+        assert_eq!(ix.len(), 0);
+        // Persisted and loaded again.
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = ix
+            .take_changed()
+            .into_iter()
+            .filter_map(|(_, k, v)| Some((k, v?)))
+            .collect();
+        let mut ix = Index::load(rows).unwrap();
+        assert_eq!(ix.tombstone(&id(1)), Some(ver(2, 1)));
+        assert_eq!(ix.expire_tombstones(), 0);
+        // A newer write brings it back.
+        ix.insert(b"f", id(1));
+        ix.take_version(id(1), ver(3, 2), &[ver(1, 1), ver(2, 1)]);
+        assert_eq!(ix.tombstone(&id(1)), None);
+        assert_eq!(ix.path_of(&id(1)), Some(&b"f"[..]));
+    }
+
+    #[test]
+    fn old_records_load() {
+        #[derive(Serialize)]
+        struct V0 {
+            paths: Vec<Vec<u8>>,
+            version: Option<Version>,
+        }
+        let v0 = encode(&V0 {
+            paths: vec![b"f".to_vec()],
+            version: Some(ver(1, 1)),
+        });
+        let ix = Index::load(vec![(id(1).0.to_vec(), v0)]).unwrap();
+        assert_eq!(ix.version(&id(1)), Some(ver(1, 1)));
+        assert_eq!(ix.get(b"f"), Some(id(1)));
     }
 
     #[test]

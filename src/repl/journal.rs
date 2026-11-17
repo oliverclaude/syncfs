@@ -201,6 +201,8 @@ mod tests {
             id: Some(FileId([n; 16])),
             path: vec![n],
             dir: false,
+            version: None,
+            lineage: Vec::new(),
         }
     }
 

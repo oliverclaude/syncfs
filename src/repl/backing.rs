@@ -321,6 +321,21 @@ impl Backing {
         Ok(changed)
     }
 
+    /// Copies the regular file `from` to the new path `to` (contents,
+    /// mode, owner, times and extended attributes).
+    pub fn copy_file(&self, from: &[u8], to: &[u8]) -> io::Result<()> {
+        let st = self.stat(from)?;
+        let attrs = attrs_of(&st);
+        self.create(to, NodeKind::File, &attrs, 0, &[])?;
+        let mut src = self.open_read(from)?;
+        let mut dst = self.open_write(to)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()?;
+        drop(dst);
+        self.sync_xattrs(to, &self.xattrs(from)?)?;
+        self.set_attrs(to, &attrs)
+    }
+
     /// Opens a regular file for reading (never following a symlink).
     pub fn open_read(&self, path: &[u8]) -> io::Result<File> {
         let (d, n) = self.parent(path)?;

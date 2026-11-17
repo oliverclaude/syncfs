@@ -49,6 +49,8 @@ pub struct Stats {
     /// Requests served from the virtual `.syncfs` directory (not counted
     /// in the per-operation counters).
     status_requests: AtomicU64,
+    /// Conflict copies replication made of this node's diverged changes.
+    conflict_copies: AtomicU64,
 }
 
 impl Default for Stats {
@@ -62,6 +64,7 @@ impl Default for Stats {
             open_files: AtomicI64::new(0),
             open_dirs: AtomicI64::new(0),
             status_requests: AtomicU64::new(0),
+            conflict_copies: AtomicU64::new(0),
         }
     }
 }
@@ -95,6 +98,10 @@ impl Stats {
         self.status_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn conflict_copy(&self) {
+        self.conflict_copies.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn calls(&self, op: Op) -> u64 {
         self.calls[op as usize].load(Ordering::Relaxed)
     }
@@ -126,6 +133,7 @@ impl Stats {
             "open_files": self.open_files.load(Ordering::Relaxed),
             "open_dirs": self.open_dirs.load(Ordering::Relaxed),
             "status_requests": self.status_requests.load(Ordering::Relaxed),
+            "conflict_copies": self.conflict_copies.load(Ordering::Relaxed),
         });
         let m = v.as_object_mut().expect("object");
         m.extend(extra);

@@ -4,6 +4,7 @@
 
 pub mod apply;
 pub mod backing;
+pub mod conflict;
 pub mod core;
 pub mod dirty;
 pub mod files;

@@ -52,6 +52,8 @@ pub(crate) struct Counters {
     pub entries_relayed: u64,
     /// Entries of other origins this node forwarded.
     pub entries_forwarded: u64,
+    /// This node's diverged changes kept as conflict copies.
+    pub conflict_copies: u64,
 }
 
 pub(crate) struct State {
@@ -157,6 +159,8 @@ pub struct Repl {
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
     invalidator: std::sync::OnceLock<Invalidator>,
+    /// The mount's counters (`.syncfs/stats`).
+    pub(crate) stats: std::sync::OnceLock<Arc<crate::status::Stats>>,
 }
 
 pub type Invalidator = Box<dyn Fn(&rustix::fs::Stat) + Send + Sync>;
@@ -302,6 +306,7 @@ impl Repl {
             unclean_start: !clean,
             this: std::sync::OnceLock::new(),
             invalidator: std::sync::OnceLock::new(),
+            stats: std::sync::OnceLock::new(),
         });
         let _ = repl.this.set(Arc::downgrade(&repl));
         let weak = Arc::downgrade(&repl);
@@ -316,6 +321,11 @@ impl Repl {
     /// Sets how to drop the kernel's caches of a file (once mounted).
     pub fn set_invalidator(&self, f: Invalidator) {
         let _ = self.invalidator.set(f);
+    }
+
+    /// Sets the mount's counters, where conflict copies are counted too.
+    pub fn set_stats(&self, stats: Arc<crate::status::Stats>) {
+        let _ = self.stats.set(stats);
     }
 
     /// Replication changed the file at `path`: the kernel must not serve
@@ -501,6 +511,8 @@ impl Repl {
                         id,
                         path,
                         dir: is_dir,
+                        version: None,
+                        lineage: Vec::new(),
                     },
                 );
             }
@@ -569,6 +581,7 @@ impl Repl {
                             node: self.me,
                             disk: self.disk,
                         });
+                        let lineage = s.index.lineage(&id);
                         self.append(
                             &mut s,
                             Entry::Attr {
@@ -576,6 +589,7 @@ impl Repl {
                                 path,
                                 version,
                                 attrs: attrs_of(&stat),
+                                lineage,
                             },
                         );
                     }
@@ -603,6 +617,11 @@ impl Repl {
                 let value = node.xattr(name)?;
                 let mut s = self.state();
                 let id = s.index.id_at(&path);
+                if let Some(sess) = s.sessions.get_mut(&id) {
+                    // The session's version goes out (with an `Attr`
+                    // entry), so peers' later versions descend from it.
+                    sess.meta = true;
+                }
                 self.append(
                     &mut s,
                     Entry::Xattr {
@@ -627,6 +646,7 @@ impl Repl {
         let path = st.index.path_of(&id)?.to_vec();
         let stat = self.backing.stat(&path).ok()?;
         let attrs = attrs_of(&stat);
+        let lineage = st.index.lineage(&id);
         Some(if sess.data {
             Entry::Data {
                 id,
@@ -634,6 +654,7 @@ impl Repl {
                 version: sess.version,
                 size: stat.st_size as u64,
                 attrs,
+                lineage,
             }
         } else {
             Entry::Attr {
@@ -641,6 +662,7 @@ impl Repl {
                 path,
                 version: sess.version,
                 attrs,
+                lineage,
             }
         })
     }

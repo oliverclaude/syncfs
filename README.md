@@ -152,7 +152,7 @@ jq .peers /mnt/data/.syncfs/status.json
 |---------------|----------------------------------------------------------------------------------|
 | `node`        | node id, mode, version, hostname, pid, start time, uptime, paths, mount options   |
 | `config`      | the effective configuration (all layers merged)                                  |
-| `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes |
+| `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes, conflict copies |
 | `peers`       | cluster size, quorum, reachable nodes, quorum verdict, every peer's live state  |
 | `locks`       | locks this node holds, the votes it has given, lease settings, counters          |
 | `replication` | disk id, dirty files and blocks per peer, journal position and lag, open sessions, crash window and suspects, freshness counters, the voter version table, `in_sync` |
@@ -573,6 +573,27 @@ checks that every written version is newer than every committed one and
 that no session writes on top of a copy older than a committed version. A
 variant whose fallback only asks the holders the voters know of fails it.
 
+### Lineage and conflict copies
+
+Every copy remembers the last 16 versions it went through (its
+*lineage*), and `Data` and `Attr` entries and hash replies carry it. Taking
+a peer's copy takes its lineage; a local session adds the version it
+replaces.
+
+- **Changed blocks need the same base.** A copy takes an incoming
+  version's changed blocks only if it is that version or one in its
+  lineage. Otherwise (the writer started from another copy, e.g. after a
+  freshness fallback) the whole file is compared by block hashes.
+- **Conflict copies.** If the local copy holds a version this node wrote
+  (on this disk) that the incoming copy's lineage lacks, the incoming
+  writer worked without this node's change. Before it is replaced, the
+  local copy is kept as `name.syncfs-conflict-<node>-<UTC time>` (for
+  example `report.txt.syncfs-conflict-1-20261117T081500Z`), a new file
+  that replicates like any other, and a warning is logged. The original
+  name gets the newer copy. Only the node that made the change keeps a
+  copy, so there is one per lost change. Counted in `conflict_copies` in
+  `.syncfs/stats` and in the replication counters.
+
 ### Freshness
 
 Before a new lock session on a file takes writes (at open for writing, or
@@ -692,7 +713,7 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
 `blocks_sent`, `blocks_received`, `bytes_sent`, `bytes_received`,
 `fresh_checks`, `fresh_pulls`, `fresh_waits`, `fresh_fallbacks`,
 `suspects_resolved`, `entries_relayed` (applied from a forwarder),
-`entries_forwarded` (sent for another origin)), and `relay_entries` (kept
+`entries_forwarded` (sent for another origin), `conflict_copies`), and `relay_entries` (kept
 for forwarding). Daemons show their version table in `status.json`.
 
 ### Limits

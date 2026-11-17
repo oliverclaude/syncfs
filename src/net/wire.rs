@@ -283,10 +283,10 @@ pub enum Message {
     },
     HashReply {
         req: u64,
-        found: bool,
+        presence: Presence,
         version: Option<Version>,
-        size: u64,
-        attrs: Attrs,
+        /// Size and attributes.
+        meta: FileMeta,
         from: u64,
         hashes: Vec<BlockHash>,
         /// More hashes follow (ask again from `from + hashes.len()`).
@@ -294,6 +294,8 @@ pub enum Message {
         /// The file's extended attributes, sorted by name (in the first
         /// reply only, `from == 0`).
         xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+        /// Earlier versions of the sender's copy (oldest first).
+        lineage: Vec<Version>,
     },
     /// How far the sender has durably applied each origin's journal (its
     /// own journal under its own id). Sent to data peers about once a
@@ -578,6 +580,28 @@ pub enum NodeKind {
     BlockDevice,
 }
 
+/// Whether the sender of a `HashReply` has the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum Presence {
+    Found,
+    /// Unknown there.
+    Absent,
+    /// Removed there at `version` (a tombstone).
+    Removed,
+    /// The sender is rebuilding and does not have the content yet: ask
+    /// another node.
+    Missing,
+}
+
+/// A file's size and attributes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct FileMeta {
+    pub size: u64,
+    pub attrs: Attrs,
+}
+
 /// One change in a metadata journal. Paths are relative to the mount
 /// root, as the origin saw them when it made the change.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,6 +626,10 @@ pub enum Entry {
         id: Option<FileId>,
         path: Vec<u8>,
         dir: bool,
+        /// The last link of a regular file: the remove's version (a
+        /// tombstone) and the copy's earlier versions.
+        version: Option<Version>,
+        lineage: Vec<Version>,
     },
     Rename {
         id: Option<FileId>,
@@ -615,6 +643,8 @@ pub enum Entry {
         path: Vec<u8>,
         version: Version,
         attrs: Attrs,
+        /// Earlier versions of the origin's copy (oldest first).
+        lineage: Vec<Version>,
     },
     Xattr {
         id: FileId,
@@ -629,6 +659,8 @@ pub enum Entry {
         version: Version,
         size: u64,
         attrs: Attrs,
+        /// Earlier versions of the origin's copy (oldest first).
+        lineage: Vec<Version>,
     },
 }
 

@@ -1171,6 +1171,46 @@ fn changes_are_forwarded_when_the_origin_is_down() {
     in_sync(&c, 3);
 }
 
+/// A node's change that a peer wrote over without having it (after the
+/// freshness fallback) is kept as a conflict copy when the node returns.
+#[test]
+fn diverged_change_is_kept_as_a_conflict_copy() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    // Node 1 writes while node 2 is frozen, and dies before node 2 gets it.
+    c.node(2).signal(libc::SIGSTOP);
+    std::fs::write(c.node(1).mnt().join("f"), b"from node 1\n").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    c.node(1).kill();
+    c.node(2).signal(libc::SIGCONT);
+    // Node 2 falls back to its own copy after freshness_timeout and writes.
+    let m2 = c.node(2).mnt();
+    eventually("write on node 2", || {
+        std::fs::write(m2.join("f"), b"from node 2\n")
+    });
+    // Node 1 comes back: its change is kept aside, node 2's wins.
+    c.node(1).start();
+    c.converge("node 1 back");
+    wait_same_tree(&c, 1, 2);
+    let names: Vec<String> = std::fs::read_dir(c.node(1).backing())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("f.syncfs-conflict-1-"))
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    let b1 = c.node(1).backing();
+    assert_eq!(std::fs::read(b1.join(&names[0])).unwrap(), b"from node 1\n");
+    assert_eq!(std::fs::read(b1.join("f")).unwrap(), b"from node 2\n");
+    let b2 = c.node(2).backing();
+    assert_eq!(std::fs::read(b2.join(&names[0])).unwrap(), b"from node 1\n");
+    assert_eq!(c.node(1).status("stats").unwrap()["conflict_copies"], 1);
+    assert_eq!(c.node(2).status("stats").unwrap()["conflict_copies"], 0);
+    let r = in_sync(&c, 1);
+    assert_eq!(r["counters"]["conflict_copies"], 1, "{r:#}");
+    in_sync(&c, 2);
+}
+
 /// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a
 /// mount has an empty backing directory with no marker: it must rebuild
 /// from its peers like a node that lost its disk (mount at once, fetch on

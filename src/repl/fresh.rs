@@ -181,6 +181,12 @@ impl Repl {
             .map(<[u8]>::to_vec)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         let remote = self.remote_hashes(source, id)?;
+        if remote.removed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{id} was removed at node {source}"),
+            ));
+        }
         let local = self.local_version(&id);
         let older = match how {
             Copy::Fresh => remote.version <= local,
@@ -191,6 +197,9 @@ impl Repl {
         if older {
             // Nothing newer there (never go back to an older copy).
             return Ok(remote.version);
+        }
+        if let Some(v) = remote.version {
+            self.keep_if_diverged(id, v, &remote.lineage)?;
         }
         let (mut diff, _) = self.differing(&path, &remote)?;
         // Blocks past the remote end go with the truncation.
@@ -214,7 +223,7 @@ impl Repl {
         self.invalidate(&path);
         let mut st = self.state();
         if let Some(v) = remote.version {
-            st.index.set_version(id, v);
+            st.index.take_version(id, v, &remote.lineage);
         }
         if how == Copy::Fresh {
             st.counters.fresh_pulls += 1;
@@ -306,6 +315,7 @@ impl Repl {
                     version,
                     size: stat.st_size as u64,
                     attrs: super::backing::attrs_of(&stat),
+                    lineage: st.index.lineage(&id),
                 };
                 self.append(&mut st, entry);
             }

@@ -9,7 +9,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::config::NodeId;
-use crate::net::wire::{Attrs, BlockHash, FileId, Message, PullMode, Version};
+use crate::net::wire::{Attrs, BlockHash, FileId, FileMeta, Message, Presence, PullMode, Version};
 
 use super::backing::{hash_block, Backing};
 use super::core::{lock, Repl};
@@ -411,24 +411,27 @@ impl Repl {
     }
 
     fn serve_hashes(&self, peer: NodeId, req: u64, file: FileId, first: u64, block_size: u64) {
-        let (path, version) = {
+        let (path, version, lineage, removed) = {
             let st = self.state();
             (
                 st.index.path_of(&file).map(<[u8]>::to_vec),
                 st.index.version(&file),
+                st.index.lineage(&file),
+                st.index.tombstone(&file).is_some(),
             )
         };
-        let reply = |found, size, attrs, hashes: Vec<BlockHash>, more, xattrs| Message::HashReply {
-            req,
-            found,
-            version,
-            size,
-            attrs,
-            from: first,
-            hashes,
-            more,
-            xattrs,
-        };
+        let reply =
+            |presence, size, attrs, hashes: Vec<BlockHash>, more, xattrs| Message::HashReply {
+                req,
+                presence,
+                version,
+                meta: FileMeta { size, attrs },
+                from: first,
+                hashes,
+                more,
+                xattrs,
+                lineage: lineage.clone(),
+            };
         let msg = (|| {
             let path = path?;
             let st = self.backing.stat(&path).ok()?;
@@ -456,9 +459,23 @@ impl Repl {
             } else {
                 Vec::new()
             };
-            Some(reply(true, size, attrs, hashes, end < total, xattrs))
+            Some(reply(
+                Presence::Found,
+                size,
+                attrs,
+                hashes,
+                end < total,
+                xattrs,
+            ))
         })()
-        .unwrap_or_else(|| reply(false, 0, Attrs::default(), Vec::new(), false, Vec::new()));
+        .unwrap_or_else(|| {
+            let presence = if removed {
+                Presence::Removed
+            } else {
+                Presence::Absent
+            };
+            reply(presence, 0, Attrs::default(), Vec::new(), false, Vec::new())
+        });
         self.net.send(peer, msg);
     }
 
@@ -479,24 +496,36 @@ impl Repl {
             )?;
             match rpc.recv()? {
                 Message::HashReply {
-                    found,
+                    presence,
                     version,
-                    size,
-                    attrs,
+                    meta,
                     hashes,
                     more,
                     xattrs,
+                    lineage,
                     ..
                 } => {
-                    if !found {
+                    let why = match presence {
+                        Presence::Found => None,
+                        Presence::Removed => {
+                            out.version = version;
+                            out.lineage = lineage;
+                            out.removed = true;
+                            return Ok(out);
+                        }
+                        Presence::Missing => Some("is still rebuilding and does not have"),
+                        Presence::Absent => Some("does not have"),
+                    };
+                    if let Some(why) = why {
                         return Err(io::Error::new(
                             io::ErrorKind::NotFound,
-                            format!("node {peer} does not have {file}"),
+                            format!("node {peer} {why} {file}"),
                         ));
                     }
                     out.version = version;
-                    out.size = size;
-                    out.attrs = attrs;
+                    out.lineage = lineage;
+                    out.size = meta.size;
+                    out.attrs = meta.attrs;
                     if out.hashes.is_empty() {
                         out.xattrs = xattrs;
                     }
@@ -581,6 +610,9 @@ pub(crate) struct RemoteFile {
     pub attrs: Attrs,
     pub hashes: Vec<BlockHash>,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub lineage: Vec<Version>,
+    /// The file was removed at `version` there.
+    pub removed: bool,
 }
 
 pub(crate) struct Pulled {

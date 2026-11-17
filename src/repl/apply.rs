@@ -45,10 +45,32 @@ impl Repl {
         }
     }
 
-    /// The local copy at `path` is now `version` of `id`.
-    fn record_version(&self, id: FileId, path: &[u8], version: Version) {
+    /// The local copy at `path` is now `version` of `id`, a copy of the
+    /// origin's, which went through `lineage`.
+    fn record_version(&self, id: FileId, path: &[u8], version: Version, lineage: &[Version]) {
         self.bind(id, path);
-        self.state().index.set_version(id, version);
+        self.state().index.take_version(id, version, lineage);
+    }
+
+    /// Whether the local copy of `id` is a base `version`'s changed blocks
+    /// apply to (see [`same_base`](super::files::same_base)).
+    fn has_base(&self, id: &FileId, version: Version, lineage: &[Version]) -> bool {
+        super::files::same_base(self.state().index.version(id), version, lineage)
+    }
+
+    /// Makes the local copy of `id` (bound at its path) a whole copy of
+    /// `source`'s, which must be at least `version` (keeping a diverged
+    /// local change aside first).
+    fn copy_whole(&self, source: NodeId, id: FileId, version: Version) -> Applied {
+        match self.copy_from(id, source, super::fresh::Copy::Relayed) {
+            Ok(Some(v)) if v >= version => Ok(true),
+            Ok(v) => Err(ApplyError::Retry(io::Error::other(format!(
+                "node {source} has {v:?} of {id}, not {version:?}"
+            )))),
+            // Gone there; a later entry says what happened.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(ApplyError::Retry(e)),
+        }
     }
 
     fn discard(&self, origin: NodeId, file: FileId, version: Version) {
@@ -107,7 +129,7 @@ impl Repl {
                 self.state().index.insert(path, *id);
                 Ok(true)
             }
-            Entry::Remove { id, path, dir } => {
+            Entry::Remove { id, path, dir, .. } => {
                 let known = self.state().index.get(path);
                 if let (Some(id), Some(k)) = (id, known) {
                     if *id != k {
@@ -161,16 +183,25 @@ impl Repl {
                 path,
                 version,
                 attrs,
+                lineage,
             } => {
+                let _g = self.hold(*id);
                 if self.superseded(id, *version) {
                     return Ok(false);
                 }
                 let Some(p) = self.local_path(Some(*id), path) else {
                     return Ok(false);
                 };
-                let _g = self.hold(*id);
+                if version.seq > 0 && !self.has_base(id, *version, lineage) {
+                    // The local content is not what the version changed
+                    // the attributes of.
+                    self.bind(*id, &p);
+                    return self.copy_whole(via, *id, *version);
+                }
                 self.backing.set_attrs(&p, attrs).map_err(skip)?;
-                self.record_version(*id, &p, *version);
+                if version.seq > 0 {
+                    self.record_version(*id, &p, *version, lineage);
+                }
                 self.invalidate(&p);
                 Ok(true)
             }
@@ -193,8 +224,9 @@ impl Repl {
                 path,
                 version,
                 attrs,
+                lineage,
                 ..
-            } if via == origin => self.apply_data(origin, *id, path, *version, attrs),
+            } if via == origin => self.apply_data(origin, *id, path, *version, attrs, lineage),
             Entry::Data {
                 id, path, version, ..
             } => self.apply_data_via(via, *id, path, *version),
@@ -215,15 +247,7 @@ impl Repl {
             return Ok(false);
         };
         self.bind(id, &path);
-        match self.copy_from(id, via, super::fresh::Copy::Relayed) {
-            Ok(Some(v)) if v >= version => Ok(true),
-            Ok(v) => Err(ApplyError::Retry(io::Error::other(format!(
-                "node {via} has {v:?} of {id}, not {version:?}"
-            )))),
-            // Gone there; a later entry says what happened.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(ApplyError::Retry(e)),
-        }
+        self.copy_whole(via, id, version)
     }
 
     fn apply_data(
@@ -233,6 +257,7 @@ impl Repl {
         hint: &[u8],
         version: Version,
         attrs: &crate::net::wire::Attrs,
+        lineage: &[Version],
     ) -> Applied {
         let _g = self.hold(id);
         if self.superseded(&id, version) {
@@ -243,6 +268,13 @@ impl Repl {
             self.discard(origin, id, version);
             return Ok(false);
         };
+        if !self.has_base(&id, version, lineage) {
+            // The local copy is not one the origin's changed blocks apply
+            // to (the origin wrote over a copy without this one's last
+            // changes): compare the whole file.
+            self.bind(id, &path);
+            return self.copy_whole(origin, id, version);
+        }
         let out = match self.backing.open_write(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -268,7 +300,7 @@ impl Repl {
         out.sync_all().map_err(ApplyError::Retry)?;
         drop(out);
         self.backing.set_attrs(&path, attrs).map_err(skip)?;
-        self.record_version(id, &path, version);
+        self.record_version(id, &path, version, lineage);
         self.invalidate(&path);
         Ok(true)
     }

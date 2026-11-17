@@ -259,6 +259,8 @@ mod tests {
                 id: None,
                 path: vec![n],
                 dir: false,
+                version: None,
+                lineage: Vec::new(),
             },
         }
     }
