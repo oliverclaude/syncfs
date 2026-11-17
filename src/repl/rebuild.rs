@@ -626,3 +626,64 @@ fn fill(weak: Weak<Repl>, queue: std::sync::Arc<std::sync::Mutex<VecDeque<FileId
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker(rebuilding: bool) -> Marker {
+        Marker {
+            cluster: "c".into(),
+            node: 1,
+            disk: 7,
+            rebuilding,
+        }
+    }
+
+    #[test]
+    fn rebuild_causes() {
+        let state = tempfile::tempdir().unwrap();
+        let backing = tempfile::tempdir().unwrap();
+        let b = backing.path();
+        let store = Store::open(state.path()).unwrap();
+        let m = marker(false);
+        // A new store: a new member starts empty, alone nobody rebuilds.
+        assert_eq!(cause(None, false, &store, b, true).unwrap(), None);
+        assert_eq!(
+            cause(Some(&marker(true)), true, &store, b, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            cause(Some(&marker(true)), true, &store, b, true).unwrap(),
+            Some(Cause::Resume)
+        );
+        // The store existed but never ran as a mount: a daemon upgrade.
+        assert_eq!(
+            cause(None, true, &store, b, true).unwrap(),
+            Some(Cause::Upgrade)
+        );
+        store
+            .commit(&[(
+                Table::Meta,
+                crate::repl::core::LINKS_SCANNED_KEY.to_vec(),
+                Some(super::super::store::encode(&true)),
+            )])
+            .unwrap();
+        assert_eq!(
+            cause(None, true, &store, b, true).unwrap(),
+            Some(Cause::DiskLost)
+        );
+        // Marker there, nothing indexed: an empty share, not a loss.
+        assert_eq!(cause(Some(&m), true, &store, b, true).unwrap(), None);
+        store
+            .commit(&[(Table::Files, vec![1; 16], Some(vec![0]))])
+            .unwrap();
+        marker::store(b, &m).unwrap();
+        assert_eq!(
+            cause(Some(&m), true, &store, b, true).unwrap(),
+            Some(Cause::Emptied)
+        );
+        std::fs::write(b.join("f"), b"x").unwrap();
+        assert_eq!(cause(Some(&m), true, &store, b, true).unwrap(), None);
+    }
+}

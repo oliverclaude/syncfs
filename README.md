@@ -805,6 +805,9 @@ for forwarding). Daemons show their version table in `status.json`.
   empty: it does not list a peer's tree (files arrive as they change).
 - Entries for a file this node has open for writing wait until that
   session ends, and so do that origin's later entries.
+- The rejoin gate runs after a start only, not after a reconnect.
+- Serving each 1024-node tree page lists the whole source tree again, so
+  listing a very large tree costs time quadratic in its size.
 - Renaming over an existing file and removing one of several hard links
   are not versioned (no tombstone).
 - Attribute and data caches are dropped after a peer's change; directory
