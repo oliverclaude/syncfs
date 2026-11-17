@@ -10,6 +10,8 @@ pub mod files;
 pub mod fresh;
 pub mod journal;
 pub mod marker;
+#[cfg(test)]
+mod model;
 pub mod net;
 pub mod ranges;
 pub mod store;

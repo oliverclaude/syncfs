@@ -107,7 +107,7 @@ pub struct Record {
 }
 
 /// A voter's versions table. Pure; persisted by `crate::repl::store`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct VersionTable {
     quorum: usize,
     files: BTreeMap<FileId, Record>,
@@ -125,6 +125,11 @@ impl VersionTable {
 
     pub fn load(&mut self, file: FileId, r: Record) {
         self.files.insert(file, r);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record(&self, file: &FileId) -> Option<&Record> {
+        self.files.get(file)
     }
 
     pub fn get(&self, file: &FileId) -> Option<&VersionInfo> {
