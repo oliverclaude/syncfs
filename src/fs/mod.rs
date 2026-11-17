@@ -311,12 +311,21 @@ impl<H: WriteHooks> SyncFs<H> {
         .map_err(errno)
     }
 
-    /// Runs `apply` between the `before` and `after` hooks for `op`.
+    /// Runs `apply` between the `before` and `after` (or `failed`) hooks
+    /// for `op`. The guard from `before` (an operation lock) is held until
+    /// the change is recorded.
     fn mutate<T>(&self, op: Mutation<'_>, apply: impl FnOnce() -> Res<T>) -> Res<T> {
         let _guard = self.hooks.before(&op)?;
-        let v = apply()?;
-        self.hooks.after(&op);
-        Ok(v)
+        match apply() {
+            Ok(v) => {
+                self.hooks.after(&op);
+                Ok(v)
+            }
+            Err(e) => {
+                self.hooks.failed(&op);
+                Err(e)
+            }
+        }
     }
 
     fn create_node(

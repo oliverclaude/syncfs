@@ -10,6 +10,7 @@ use fuser::{MountOption, Session, SessionACL};
 use signal_hook::iterator::Signals;
 
 use crate::config::Config;
+use crate::dirty::DirtyTracker;
 use crate::fs::{LocalOnly, SyncFs, WriteHooks};
 use crate::lock::{ClusterHooks, LockManager, Settings};
 use crate::net::Network;
@@ -117,6 +118,7 @@ fn register_status(
     fs: &SyncFs<Hooks>,
     net: &Network,
     locks: Option<&LockManager>,
+    dirty: Option<&Arc<DirtyTracker>>,
     cfg: &Config,
     fc: &fuser::Config,
 ) {
@@ -137,6 +139,7 @@ fn register_status(
         Some(fs.stats_provider()),
         net.provider(),
         locks.map(LockManager::provider),
+        dirty.map(DirtyTracker::provider),
     );
 }
 
@@ -191,9 +194,12 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         // A standalone node has nobody to agree with: no locks.
         let locks = (!cfg.peers.is_empty())
             .then(|| LockManager::start(Settings::from_config(cfg), net.clone()));
-        let hooks: Hooks = match &locks {
-            Some(l) => Arc::new(ClusterHooks::new(l.clone())),
-            None => Arc::new(LocalOnly),
+        let dirty = locks
+            .as_ref()
+            .map(|_| Arc::new(DirtyTracker::new(cfg.block_size.0)));
+        let hooks: Hooks = match (&locks, &dirty) {
+            (Some(l), Some(d)) => Arc::new(ClusterHooks::new(l.clone(), Arc::clone(d))),
+            _ => Arc::new(LocalOnly),
         };
         let stop = |net: &Network, locks: &Option<LockManager>| {
             if let Some(l) = locks {
@@ -209,7 +215,15 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
                     .with_context(|| format!("opening backing_dir {}", backing.display()));
             }
         };
-        register_status(&status, &fs, &net, locks.as_ref(), cfg, &fuse_cfg);
+        register_status(
+            &status,
+            &fs,
+            &net,
+            locks.as_ref(),
+            dirty.as_ref(),
+            cfg,
+            &fuse_cfg,
+        );
         let mounted = if rustix::process::geteuid().is_root() {
             mount_direct(fs, backing, mountpoint, &fuse_cfg, kernel_flags)
         } else {

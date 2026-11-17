@@ -12,16 +12,21 @@
 //! * After a local rename, write locks on paths that moved are re-taken
 //!   under the new path.
 //!
+//! * Every change that went through is then marked dirty
+//!   (`crate::dirty`), while the lock is still held: lock, quorum, local
+//!   write, mark dirty.
+//!
 //! No quorum: `EROFS`. Locked by another node for longer than `lock_wait`:
 //! `EBUSY`.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fuser::Errno;
 
+use crate::dirty::DirtyTracker;
 use crate::fs::{Mutation, NodeRef, OpGuard, WriteHooks};
 
 use super::key::Key;
@@ -29,6 +34,7 @@ use super::manager::LockManager;
 
 pub struct ClusterHooks {
     locks: LockManager,
+    dirty: Arc<DirtyTracker>,
     /// Write locks per inode: one key per open writable handle.
     by_ino: Mutex<HashMap<u64, Vec<Key>>>,
 }
@@ -61,9 +67,10 @@ fn child(parent: NodeRef<'_>, name: &OsStr) -> Result<Option<Key>, Errno> {
 }
 
 impl ClusterHooks {
-    pub fn new(locks: LockManager) -> ClusterHooks {
+    pub fn new(locks: LockManager, dirty: Arc<DirtyTracker>) -> ClusterHooks {
         ClusterHooks {
             locks,
+            dirty,
             by_ino: Mutex::new(HashMap::new()),
         }
     }
@@ -179,7 +186,12 @@ impl WriteHooks for ClusterHooks {
         }
     }
 
+    fn failed(&self, op: &Mutation<'_>) {
+        self.dirty.record_failed(op);
+    }
+
     fn after(&self, op: &Mutation<'_>) {
+        self.dirty.record(op);
         if let Mutation::Rename {
             parent,
             name,

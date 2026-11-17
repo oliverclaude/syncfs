@@ -79,7 +79,8 @@ pub fn locks(config: Config) -> Arc<dyn Provider> {
     }))
 }
 
-/// `replication`: dirty tracking and the journal queue (step 7).
+/// `replication` where nothing is tracked (standalone nodes and voter-only
+/// daemons); cluster mounts use `DirtyTracker::provider`.
 pub fn replication(config: Config) -> Arc<dyn Provider> {
     Arc::new(FnProvider::new("replication", move || {
         json!({
@@ -101,6 +102,7 @@ pub fn register_builtin(
     stats: Option<Arc<dyn Provider>>,
     peers: Arc<dyn Provider>,
     locks_provider: Option<Arc<dyn Provider>>,
+    replication_provider: Option<Arc<dyn Provider>>,
 ) {
     let cfg = info.config.clone();
     registry.register(node(info));
@@ -110,5 +112,5 @@ pub fn register_builtin(
     }
     registry.register(peers);
     registry.register(locks_provider.unwrap_or_else(|| locks(cfg.clone())));
-    registry.register(replication(cfg));
+    registry.register(replication_provider.unwrap_or_else(|| replication(cfg)));
 }

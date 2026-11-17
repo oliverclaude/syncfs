@@ -782,3 +782,67 @@ fn locks_quorum_loss_is_erofs_while_reads_work() {
     });
     eprintln!("writable {:?} after the voters came back", t.elapsed());
 }
+
+#[test]
+fn write_path_marks_dirty_blocks_after_the_lock() {
+    require_fuse!();
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    use Kind::{Daemon, Mount};
+    const B: u64 = 64 * 1024;
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "0s", &["f"]);
+    let mnt = c.node(1).mnt();
+    let mnt2 = c.node(2).mnt();
+    let c = c;
+    let rep = |n: usize| c.nodes[n - 1].status("replication").unwrap();
+    let r = rep(1);
+    assert_eq!(r["dirty_files"], 0, "{r:#}");
+    assert_eq!(r["in_sync"], true);
+    assert_eq!(r["block_size"], B);
+
+    let f = open_rw(&mnt.join("f")).unwrap();
+    f.write_all_at(b"0123456789", 0).unwrap();
+    // Two bytes straddling the end of block 2: blocks 2 and 3.
+    f.write_all_at(b"ab", 3 * B - 1).unwrap();
+    f.sync_all().unwrap();
+    let r = rep(1);
+    assert_eq!(r["dirty_files"], 1, "{r:#}");
+    assert_eq!(r["dirty_blocks"], 3, "{r:#}");
+    assert_eq!(r["in_sync"], false);
+    // Truncating to one block forgets the marks past it.
+    f.set_len(B).unwrap();
+    let r = rep(1);
+    assert_eq!(r["dirty_blocks"], 1, "{r:#}");
+    assert_eq!(r["truncated_files"], 1, "{r:#}");
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .unwrap();
+    assert_eq!(rep(1)["meta_dirty_files"], 1);
+    drop(f);
+
+    // Namespace changes are counted; a renamed file keeps its marks.
+    std::fs::write(mnt.join("g"), b"x").unwrap();
+    std::fs::rename(mnt.join("g"), mnt.join("h")).unwrap();
+    let r = rep(1);
+    assert_eq!(r["namespace_changes"], 2, "{r:#}");
+    assert_eq!(r["dirty_files"], 2, "{r:#}");
+    assert_eq!(r["dirty_blocks"], 2, "{r:#}");
+
+    // A write refused by the lock marks nothing, and each node only
+    // tracks its own changes.
+    let held = open_rw(&mnt2.join("f")).unwrap();
+    let before = rep(1);
+    assert_eq!(errno(open_rw(&mnt.join("f"))), Some(libc::EBUSY));
+    assert_eq!(
+        errno(std::fs::write(mnt.join("f"), b"no")),
+        Some(libc::EBUSY)
+    );
+    assert_eq!(rep(1), before);
+    held.write_all_at(b"z", 0).unwrap();
+    drop(held);
+    let r = rep(2);
+    assert_eq!(r["dirty_files"], 1, "{r:#}");
+    assert_eq!(r["dirty_blocks"], 1, "{r:#}");
+    assert_eq!(r["namespace_changes"], 0, "{r:#}");
+    // Voter-only daemons have nothing to track.
+    let r = rep(3);
+    assert_eq!(r["dirty_files"], 0, "{r:#}");
+}

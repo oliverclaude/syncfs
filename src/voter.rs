@@ -39,7 +39,14 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
             mount_options: Vec::new(),
             shadowed_backing_entry: false,
         };
-        providers::register_builtin(&status, info, None, net.provider(), Some(locks.provider()));
+        providers::register_builtin(
+            &status,
+            info,
+            None,
+            net.provider(),
+            Some(locks.provider()),
+            None,
+        );
         log::info!("voter node {} running", cfg.node_id);
         Ok((net, status, locks))
     };

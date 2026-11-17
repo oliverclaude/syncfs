@@ -155,7 +155,7 @@ jq .peers /mnt/data/.syncfs/status.json
 | `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes |
 | `peers`       | cluster size, quorum, reachable nodes, quorum verdict, every peer's live state  |
 | `locks`       | locks this node holds, the votes it has given, lease settings, counters          |
-| `replication` | dirty files/blocks and journal queue length (step 7)                             |
+| `replication` | what this node changed and has not replicated: dirty files and blocks, namespace changes |
 | `status.json` | all of the above as one JSON object, keyed by file name, plus `format_version`   |
 
 Sections whose subsystem does not exist yet say `implemented: false`.
@@ -486,6 +486,44 @@ All nodes should use the same `lock_lease_timeout`. A voter refuses to
 confirm a lease longer than its own (`LockDeny Lease`, logged), since its
 start-up grace would not cover it.
 
+## Write path
+
+On a cluster node every change goes through, in this order:
+
+1. **Lock**: the file's write lock (taken at open, see above) or a lock
+   for just the operation.
+2. **Quorum**: the lock is a quorum lease; without one the change fails
+   with `EROFS` before anything is touched.
+3. **Local write** to the backing directory.
+4. **Mark dirty**, while the lock is still held:
+   - writes and `fallocate`: the blocks (`block_size`) they touch;
+   - truncate: the new size, dropping marks past it;
+   - chmod, chown, utimens, xattrs: the file's metadata;
+   - create, link, unlink, rmdir, rename: counted as namespace changes
+     (the metadata journal, step 7, will carry them).
+
+   Marks are per inode, so a dirty file keeps them when renamed. A write
+   that failed half way is still marked (some bytes may have changed); a
+   change refused by the lock or quorum marks nothing.
+
+`.syncfs/replication` shows the marks (`dirty_files`, `dirty_blocks`,
+`truncated_files`, `meta_dirty_files`, `namespace_changes`, `in_sync`).
+For now they live in memory only (`persisted: false`), and nothing drains
+them until replication (step 7) does. Standalone nodes and voter-only
+daemons track nothing.
+
+### Freshness (planned)
+
+A node that takes a lock must first bring its copy up to the newest
+version the granting quorum knows of, pulling missing blocks from a node
+that has it. If only an unreachable node has the newest version, it waits
+up to `freshness_timeout` (default 30 s) and then continues from the
+newest version a majority has; when that node rejoins, its diverged
+version is kept as `name.syncfs-conflict-<node>-<timestamp>` (step 8).
+The option is parsed and shown in `.syncfs/config` but has no effect yet:
+how versions are stored and compared is still open, and pulling blocks
+needs the replication transfer of step 7.
+
 ## Internals
 
 - **Inodes.** Each inode the kernel holds is an `O_PATH` descriptor on the
@@ -500,8 +538,8 @@ start-up grace would not cover it.
   `Mutation` and passed through the `WriteHooks` trait before and after it
   is applied, and open-for-write / release go through
   `open_write`/`release_write`. A standalone node uses `LocalOnly`; a
-  cluster node uses `lock::ClusterHooks`, and dirty tracking (step 7) plugs
-  in there too. See `src/fs/hooks.rs`.
+  cluster node uses `lock::ClusterHooks`, which also marks changes dirty
+  (`src/dirty`). See `src/fs/hooks.rs`.
 - **`.syncfs` inodes.** The directory is inode `2^63` and its files
   `2^63 + 1 + n`, far from the backing counter. See `src/fs/virt.rs`.
 
@@ -545,7 +583,8 @@ Each step ends with passing tests and a commit.
    heartbeats, peer states, reconnect, voter daemon mode.
 5. **Quorum and lock table** (done): whole-file locks with quorum leases,
    voter-only daemons voting, `EROFS` without quorum, `.syncfs/locks`.
-6. **Write path**: lock, quorum check, local write, mark dirty.
+6. **Write path** (done, freshness pending): lock, quorum check, local
+   write, mark dirty (in memory); `freshness_timeout` option.
 7. **Async replication**: dirty-block bitmap and metadata journal.
 8. **Rejoin and recovery**.
 9. **Packaging**: `.deb` for bookworm and trixie on amd64 and arm64, static

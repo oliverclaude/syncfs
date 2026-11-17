@@ -7,8 +7,9 @@
 //! [`WriteHooks::release_write`].
 //!
 //! A standalone node uses [`LocalOnly`], which allows everything; a cluster
-//! node uses `lock::ClusterHooks` (whole-file write locks and the quorum
-//! check). Step 7 adds dirty tracking and the metadata journal (`after`).
+//! node uses `lock::ClusterHooks`: whole-file write locks and the quorum
+//! check in `before`, dirty marks (`crate::dirty`) in `after` and `failed`.
+//! Step 7 replicates what was marked.
 
 use std::ffi::OsStr;
 use std::io;
@@ -159,6 +160,10 @@ pub trait WriteHooks: Send + Sync + 'static {
     /// Called after `op` was applied successfully.
     fn after(&self, _op: &Mutation<'_>) {}
 
+    /// Called when `op` was allowed by `before` but then failed. A data
+    /// change may have been partly applied.
+    fn failed(&self, _op: &Mutation<'_>) {}
+
     /// Called when a file is opened (or created) for writing.
     fn open_write(&self, _node: NodeRef<'_>) -> Result<(), Errno> {
         Ok(())
@@ -181,6 +186,10 @@ impl<T: WriteHooks + ?Sized> WriteHooks for std::sync::Arc<T> {
 
     fn after(&self, op: &Mutation<'_>) {
         (**self).after(op)
+    }
+
+    fn failed(&self, op: &Mutation<'_>) {
+        (**self).failed(op)
     }
 
     fn open_write(&self, node: NodeRef<'_>) -> Result<(), Errno> {
