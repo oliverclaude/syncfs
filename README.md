@@ -957,7 +957,12 @@ for forwarding). Daemons show their version table in `status.json`.
   both types, a non-root `user` fstab mount and unmount, the units
   (`systemd-analyze verify`, and the template's command line mounting and
   unmounting on SIGTERM), and that remove keeps and purge deletes the
-  conffile. CI runs it for all four packages and smoke-tests the static
+  conffile. `scripts/unit-test.sh SUITE DEB` boots systemd in a
+  privileged container and starts and stops `syncfs-daemon` and
+  `syncfs@data` (mounted, used, unmounted on stop), and checks that an
+  instance without its config is skipped. Both take an optional
+  architecture to emulate (e.g. `arm64`); under qemu-user the setuid
+  `mount` is not setuid, so the `user` mount check fails there. CI runs both natively for all four packages and smoke-tests the static
   binaries (a mount, and `--version` in an empty container).
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with
   `allow_other`: 238 files, 8798 tests, all passing.

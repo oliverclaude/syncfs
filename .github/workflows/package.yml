@@ -39,6 +39,8 @@ jobs:
           dpkg-deb -I "$deb"
           dpkg-deb -c "$deb"
           scripts/deb-test.sh ${{ matrix.suite }} "$deb"
+      - name: systemd units under systemd in debian:${{ matrix.suite }}
+        run: scripts/unit-test.sh ${{ matrix.suite }} $(ls dist/*.deb)
       - uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.suite }}-${{ matrix.arch }}

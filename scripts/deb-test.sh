@@ -12,8 +12,10 @@
 set -eu
 suite=$1
 deb=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+# Optional third argument: an architecture to emulate (qemu-user/binfmt).
+platform=${3:+--platform linux/$3}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-exec docker run --rm --network host \
+exec docker run --rm --network host $platform \
   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined --security-opt seccomp=unconfined \
   -e APT_RELAY="${APT_RELAY:-}" -v "$deb":/pkg.deb:ro -v "$repo/scripts":/scripts:ro \
   "debian:$suite" sh /scripts/deb-test-inside.sh
