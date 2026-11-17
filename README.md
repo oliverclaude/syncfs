@@ -195,13 +195,26 @@ trusted network: there is no authentication or encryption.
 
 ### Topology
 
-Full mesh: one TCP connection per pair of nodes, opened by the node with the
-lower `node_id` and accepted by the higher one. All traffic between two
-nodes uses that one connection in both directions, so messages between them
-arrive in order. A 99-node cluster has 4851 connections, 98 per node. Each
-connection has a reader and a writer thread, and each lower-id node has a
-dialer thread per higher peer, so a node runs at most about 250 small
-threads. That is fine at this size, so there is no gossip or relaying.
+Full mesh: one main TCP connection per pair of nodes, opened by the node
+with the lower `node_id` and accepted by the higher one. Locks, heartbeats
+and other control messages between two nodes use that one connection in
+both directions, so they arrive in order. Two data nodes (mounts) also open
+a **bulk lane**: a second connection, dialed the same way right after the
+main one is up (its `Hello` says `lane: Bulk`), that carries journal
+entries, blocks and hash replies, so a large transfer never delays a lock
+or a heartbeat. The lane belongs to the main connection (same
+incarnations) and fails with it: either one closing closes both, and the
+peer reconnects both. Until the lane is up, bulk messages queue behind
+control messages on the main connection; receivers cope with bulk messages
+of one session arriving over both (journal entries are ordered by sequence
+number, `BlockDone` says how many blocks precede it). `.syncfs/peers`
+shows `bulk_lane` per peer.
+
+A 99-node cluster has 4851 main connections, 98 per node. Each connection
+has a reader and a writer thread, and each lower-id node has a dialer
+thread per higher peer, so a daemon runs at most about 250 small threads
+(a mount two more per data peer, for the bulk lane). That is fine at this size, so there is
+no gossip.
 
 ### Wire format
 
@@ -236,7 +249,8 @@ steps are logged and ignored.
 | `CatchUpRequest`, `CatchUpDone`, `LockFreshQuery`, `LockFreshReply` | rejoin (step 8), start-up grace probe (step 5) |
 
 `Hello` and `Welcome` carry the node's role: whether it stores data (a
-mount) and its disk id (0 for daemons).
+mount) and its disk id (0 for daemons). `Hello` also names the lane (main
+or bulk).
 
 ### Handshake
 
@@ -620,9 +634,8 @@ marked again if the connection drops or the peer starts over.
   origin told to drop its marks. A path that now names another file (by
   id) is left alone.
 - **Trim.** An entry is dropped once every data peer has acknowledged it.
-- **Bulk lane.** Journal entries, blocks and hash replies share the peer
-  connection with locks and heartbeats; the writer sends control messages
-  first and one bulk message at a time between them.
+- **Bulk lane.** Journal entries, blocks and hash replies go over the
+  bulk lane to the peer (see [Topology](#topology)).
 
 ### Crash window
 

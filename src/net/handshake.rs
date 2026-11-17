@@ -56,6 +56,7 @@ impl Identity {
             incarnation: self.incarnation,
             software: env!("CARGO_PKG_VERSION").into(),
             role: self.role,
+            lane: wire::Lane::Main,
         }
     }
 
@@ -173,8 +174,20 @@ pub fn exchange_preamble(s: &mut TcpStream) -> Result<(), HandshakeError> {
 
 /// Dialer side. Returns the peer's `Welcome`.
 pub fn dial(s: &mut TcpStream, me: &Identity, expect: NodeId) -> Result<Welcome, HandshakeError> {
+    dial_lane(s, me, expect, wire::Lane::Main)
+}
+
+/// Dialer side of a connection on `lane`.
+pub fn dial_lane(
+    s: &mut TcpStream,
+    me: &Identity,
+    expect: NodeId,
+    lane: wire::Lane,
+) -> Result<Welcome, HandshakeError> {
     exchange_preamble(s)?;
-    wire::write_frame(s, &Message::Hello(me.hello()))?;
+    let mut hello = me.hello();
+    hello.lane = lane;
+    wire::write_frame(s, &Message::Hello(hello))?;
     match wire::read_frame(s, HANDSHAKE_MAX_FRAME_LEN)? {
         Message::Welcome(w) if w.node_id == expect => Ok(w),
         Message::Welcome(w) => Err(HandshakeError::WrongNode {
@@ -223,6 +236,7 @@ mod tests {
             incarnation: 9,
             software: "x".into(),
             role: Role::default(),
+            lane: wire::Lane::Main,
         }
     }
 

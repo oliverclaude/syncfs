@@ -272,6 +272,7 @@ impl Repl {
             }
         };
         let mut size = 0;
+        let mut count = 0u64;
         let found = match path.as_deref().map(|p| self.backing.open_read(p)) {
             Some(Ok(f)) => {
                 size = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -285,6 +286,7 @@ impl Repl {
                         }
                     };
                     sent += data.len() as u64;
+                    count += 1;
                     self.net.send(
                         peer,
                         Message::BlockData {
@@ -296,7 +298,7 @@ impl Repl {
                     );
                 }
                 let mut st = self.state();
-                st.counters.blocks_sent += blocks.len();
+                st.counters.blocks_sent += count;
                 st.counters.bytes_sent += sent;
                 true
             }
@@ -306,6 +308,7 @@ impl Repl {
             peer,
             Message::BlockDone {
                 req,
+                blocks: count,
                 found,
                 size,
                 version,
@@ -431,7 +434,15 @@ impl Repl {
         let rpc = self.call(peer, req, Message::BlockPull { req, file, mode })?;
         let mut bytes = 0u64;
         let mut blocks = 0u64;
+        // The end, once it came; blocks may still follow it (see
+        // `Message::BlockDone`).
+        let mut done: Option<(u64, Pulled)> = None;
         loop {
+            if let Some((want, _)) = &done {
+                if blocks >= *want {
+                    break;
+                }
+            }
             match rpc.recv()? {
                 Message::BlockData {
                     block, hash, data, ..
@@ -447,25 +458,30 @@ impl Repl {
                     blocks += 1;
                 }
                 Message::BlockDone {
+                    blocks: want,
                     found,
                     size,
                     version,
                     more,
                     ..
                 } => {
-                    let mut st = self.state();
-                    st.counters.blocks_received += blocks;
-                    st.counters.bytes_received += bytes;
-                    return Ok(Pulled {
-                        found,
-                        size,
-                        version,
-                        more,
-                    });
+                    done = Some((
+                        want,
+                        Pulled {
+                            found,
+                            size,
+                            version,
+                            more,
+                        },
+                    ));
                 }
                 other => return Err(io::Error::other(format!("unexpected {}", other.kind()))),
             }
         }
+        let mut st = self.state();
+        st.counters.blocks_received += blocks;
+        st.counters.bytes_received += bytes;
+        Ok(done.expect("loop ends with the answer").1)
     }
 }
 

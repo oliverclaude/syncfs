@@ -265,9 +265,11 @@ pub enum Message {
         data: Vec<u8>,
     },
     /// End of the answer to a `BlockPull`. `more`: dirty blocks are left,
-    /// pull again.
+    /// pull again. `blocks`: how many `BlockData` came before it (they may
+    /// arrive after it when the bulk lane opened during the answer).
     BlockDone {
         req: u64,
+        blocks: u64,
         found: bool,
         size: u64,
         version: Option<Version>,
@@ -410,6 +412,21 @@ pub struct Hello {
     /// `CARGO_PKG_VERSION` of the sender, for diagnostics.
     pub software: String,
     pub role: Role,
+    /// Which connection of the pair this is.
+    pub lane: Lane,
+}
+
+/// The connections between two nodes. Every pair has a main connection;
+/// two data nodes also open a bulk lane for journal entries, blocks and
+/// hash replies, so transfers never queue in front of locks and
+/// heartbeats. The bulk lane belongs to the main connection with the same
+/// incarnations and lives and dies with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum Lane {
+    #[default]
+    Main,
+    Bulk,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,6 +674,7 @@ mod tests {
             incarnation: 0xdead_beef,
             software: "0.1.0".into(),
             role: Role::default(),
+            lane: Lane::Main,
         })
     }
 

@@ -17,6 +17,12 @@
 //!   after a successful handshake.
 //! - A new connection from a peer replaces an existing one (the peer
 //!   restarted before we noticed the old connection died).
+//! - Two data nodes also open a bulk lane: a second connection, dialed the
+//!   same way right after the main one is up, that carries journal entries,
+//!   blocks and hash replies ([`Message::is_bulk`]). It belongs to the main
+//!   connection and fails with it (either one closing closes both), so a
+//!   session number covers both. Until it is up, bulk messages queue
+//!   behind control messages on the main connection.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
@@ -31,7 +37,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::handshake::{self, HandshakeError, Identity};
-use super::wire::{self, Heartbeat, Message, Role, Welcome, MAX_FRAME_LEN};
+use super::wire::{self, Heartbeat, Lane, Message, Role, Welcome, MAX_FRAME_LEN};
 use crate::config::{Config, NodeId};
 use crate::status::{FnProvider, Provider};
 
@@ -83,6 +89,8 @@ pub struct PeerStatus {
     pub members_mismatch: Option<Vec<NodeId>>,
     /// What the peer stores, from its last handshake.
     pub role: Option<Role>,
+    /// The bulk lane to the peer is open.
+    pub bulk_lane: bool,
 }
 
 /// Membership at one instant.
@@ -140,6 +148,11 @@ struct PeerInfo {
     role: Option<Role>,
     session: u64,
     conn: Option<Conn>,
+    /// The bulk lane of the current session, and its number.
+    lane: Option<Conn>,
+    lane_id: u64,
+    /// Why the bulk lane closed the session, if it did.
+    lane_failed: Option<String>,
 }
 
 struct Slot {
@@ -225,6 +238,9 @@ impl Network {
                     role: None,
                     session: 0,
                     conn: None,
+                    lane: None,
+                    lane_id: 0,
+                    lane_failed: None,
                 }),
             })
             .collect();
@@ -316,20 +332,23 @@ impl Network {
     }
 
     /// Sends `msg` to peer `id` if it is connected. Bulk messages
-    /// ([`Message::is_bulk`]) queue behind control messages.
+    /// ([`Message::is_bulk`]) go on the bulk lane, or queue behind control
+    /// messages while there is none.
     pub fn send(&self, id: NodeId, msg: Message) -> bool {
         self.shared
             .slots
             .iter()
             .find(|s| s.id == id)
             .and_then(|s| {
-                lock(&s.info).conn.as_ref().map(|c| {
-                    if msg.is_bulk() {
-                        lock(&c.bulk).push_back(msg);
-                        c.tx.send(Out::Bulk).is_ok()
-                    } else {
-                        c.tx.send(Out::Msg(msg)).is_ok()
+                let i = lock(&s.info);
+                let main = i.conn.as_ref()?;
+                Some(match (&i.lane, msg.is_bulk()) {
+                    (Some(lane), true) => lane.tx.send(Out::Msg(msg)).is_ok(),
+                    (None, true) => {
+                        lock(&main.bulk).push_back(msg);
+                        main.tx.send(Out::Bulk).is_ok()
                     }
+                    (_, false) => main.tx.send(Out::Msg(msg)).is_ok(),
                 })
             })
             .unwrap_or(false)
@@ -402,7 +421,8 @@ impl Network {
             std::thread::sleep(Duration::from_millis(10));
         }
         for s in &sh.slots {
-            if let Some(c) = lock(&s.info).conn.take() {
+            let mut i = lock(&s.info);
+            for c in [i.conn.take(), i.lane.take()].into_iter().flatten() {
                 let _ = c.stream.shutdown(Shutdown::Both);
             }
         }
@@ -490,6 +510,7 @@ impl Shared {
                     sees: i.sees.clone(),
                     members_mismatch: i.members_mismatch.clone(),
                     role: i.role,
+                    bulk_lane: i.lane.is_some(),
                 }
             })
             .collect();
@@ -520,6 +541,7 @@ impl Shared {
             sees,
             members_mismatch: None,
             role: Some(self.me.role),
+            bulk_lane: false,
         });
         peers.sort_by_key(|p| p.id);
         let reachable = up + 1;
@@ -605,6 +627,10 @@ fn accept_one(sh: Arc<Shared>, mut stream: TcpStream) {
             let Some(slot) = sh.slots.iter().find(|s| s.id == hello.node_id) else {
                 return; // check_hello guarantees membership
             };
+            if hello.lane == Lane::Bulk {
+                accept_lane(&sh, slot, stream, hello.incarnation);
+                return;
+            }
             run_session(
                 &sh,
                 slot,
@@ -632,6 +658,14 @@ fn backoff_bounds(heartbeat: Duration) -> (Duration, Duration) {
 }
 
 fn connect(sh: &Shared, slot: &Slot) -> Result<(TcpStream, Welcome), HandshakeError> {
+    connect_lane(sh, slot, Lane::Main)
+}
+
+fn connect_lane(
+    sh: &Shared,
+    slot: &Slot,
+    lane: Lane,
+) -> Result<(TcpStream, Welcome), HandshakeError> {
     let addrs: Vec<SocketAddr> = slot.address.to_socket_addrs()?.collect();
     let mut last = io::Error::new(io::ErrorKind::NotFound, "address resolved to nothing");
     for addr in addrs {
@@ -640,7 +674,7 @@ fn connect(sh: &Shared, slot: &Slot) -> Result<(TcpStream, Welcome), HandshakeEr
                 let _ = s.set_nodelay(true);
                 s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
                 s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-                let w = handshake::dial(&mut s, &sh.me, slot.id)?;
+                let w = handshake::dial_lane(&mut s, &sh.me, slot.id, lane)?;
                 return Ok((s, w));
             }
             Err(e) => last = e,
@@ -756,9 +790,21 @@ fn run_session(
             tx,
             bulk: Arc::clone(&bulk),
         });
+        if let Some(old) = i.lane.take() {
+            let _ = old.stream.shutdown(Shutdown::Both);
+        }
+        i.lane_failed = None;
     }
     sh.notify();
     log::info!("node {} at {} is up", slot.id, slot.address);
+    if sh.me.dials(slot.id) && sh.me.role.data && role.data {
+        let sh2 = Arc::clone(sh);
+        let id = slot.id;
+        let _ = std::thread::Builder::new()
+            .stack_size(NET_THREAD_STACK)
+            .name(format!("syncfs-lane-{id}"))
+            .spawn(move || dial_lane(&sh2, id, session, incarnation));
+    }
 
     let wsh = Arc::clone(sh);
     let spawned = std::thread::Builder::new()
@@ -774,12 +820,118 @@ fn run_session(
     let mut i = lock(&slot.info);
     if i.session == session {
         i.conn = None;
+        if let Some(lane) = i.lane.take() {
+            let _ = lane.stream.shutdown(Shutdown::Both);
+        }
+        let reason = i.lane_failed.take().unwrap_or(reason);
         i.state = PeerState::Down;
         i.since = Instant::now();
         i.last_error = Some(reason.clone());
         drop(i);
         sh.notify();
         log::info!("node {} is down: {reason}", slot.id);
+    }
+}
+
+/// Dialer side of the bulk lane of main session `session` with `id` (whose
+/// process is `incarnation`). A few attempts; without a lane, bulk
+/// messages keep using the main connection.
+fn dial_lane(sh: &Arc<Shared>, id: NodeId, session: u64, incarnation: u64) {
+    let Some(slot) = sh.slots.iter().find(|s| s.id == id) else {
+        return;
+    };
+    let current = || lock(&slot.info).session == session && !sh.stopping();
+    for attempt in 0..5u32 {
+        if !current() {
+            return;
+        }
+        match connect_lane(sh, slot, Lane::Bulk) {
+            Ok((stream, w)) if w.incarnation == incarnation => {
+                run_lane(sh, slot, stream, session);
+                return;
+            }
+            Ok(_) => return, // the peer restarted: a new session follows
+            Err(e) => log::debug!("node {id}: bulk lane attempt {attempt}: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(100 << attempt));
+    }
+    log::warn!("node {id}: no bulk lane; transfers share the main connection");
+}
+
+/// Acceptor side: attaches a bulk lane from the process `incarnation` to
+/// its main connection (which may still be registering).
+fn accept_lane(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, incarnation: u64) {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    loop {
+        let session = {
+            let i = lock(&slot.info);
+            (i.conn.is_some() && i.incarnation == Some(incarnation)).then_some(i.session)
+        };
+        if let Some(session) = session {
+            run_lane(sh, slot, stream, session);
+            return;
+        }
+        if Instant::now() >= deadline || sh.stopping() {
+            log::debug!("node {}: bulk lane without a main connection", slot.id);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Runs the bulk lane of main session `session` until either fails.
+fn run_lane(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, session: u64) {
+    let (Ok(writer), Ok(handle)) = (stream.try_clone(), stream.try_clone()) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(sh.down_after));
+    let _ = writer.set_write_timeout(Some(sh.down_after));
+    let (tx, rx) = mpsc::channel();
+    let bulk = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let lane_id = sh.next_session.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut i = lock(&slot.info);
+        if i.session != session || i.conn.is_none() {
+            return;
+        }
+        if let Some(old) = i.lane.take() {
+            let _ = old.stream.shutdown(Shutdown::Both);
+        }
+        i.lane = Some(Conn {
+            stream: handle,
+            tx,
+            bulk: Arc::clone(&bulk),
+        });
+        i.lane_id = lane_id;
+    }
+    sh.notify();
+    log::debug!("node {}: bulk lane up", slot.id);
+    let wsh = Arc::clone(sh);
+    let spawned = std::thread::Builder::new()
+        .stack_size(NET_THREAD_STACK)
+        .name(format!("syncfs-ltx-{}", slot.id))
+        .spawn(move || write_loop(&wsh, writer, &rx, &bulk));
+    let reason = if spawned.is_err() {
+        "cannot start bulk lane writer".to_string()
+    } else {
+        read_loop(sh, slot, &stream)
+    };
+    let _ = stream.shutdown(Shutdown::Both);
+    let mut i = lock(&slot.info);
+    if i.lane_id == lane_id && i.lane.is_some() {
+        i.lane = None;
+        // The main connection goes too: what was in flight on the lane is
+        // lost, and a new session tells everyone to resend.
+        if i.session == session {
+            if i.conn.is_some() {
+                i.lane_failed = Some(format!("bulk lane: {reason}"));
+            }
+            if let Some(c) = &i.conn {
+                let _ = c.stream.shutdown(Shutdown::Both);
+            }
+        }
+        drop(i);
+        sh.notify();
     }
 }
 

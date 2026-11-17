@@ -229,6 +229,7 @@ fn hello(node_id: NodeId) -> Hello {
         incarnation: 42,
         software: "raw".into(),
         role: syncfs::net::wire::Role::default(),
+        lane: syncfs::net::wire::Lane::Main,
     }
 }
 
@@ -348,4 +349,66 @@ fn full_mesh(n: usize) {
 #[test]
 fn full_mesh_25() {
     full_mesh(25);
+}
+
+/// Two data nodes open a bulk lane next to the main connection; bulk
+/// messages go over it in order. A daemon gets none.
+#[test]
+fn data_nodes_open_a_bulk_lane() {
+    use std::sync::{Arc, Mutex};
+    let mut cfgs = cluster(3);
+    cfgs[0].mode = Mode::Mount;
+    cfgs[1].mode = Mode::Mount;
+    let nets: Vec<Network> = cfgs.iter().map(|c| Network::start(c).unwrap()).collect();
+    let lane = |n: &Network, peer: NodeId| {
+        n.snapshot()
+            .peers
+            .iter()
+            .find(|p| p.id == peer)
+            .is_some_and(|p| p.bulk_lane)
+    };
+    for n in &nets {
+        assert!(n.wait_until(WAIT, all_up(3)), "{:#?}", n.snapshot());
+    }
+    assert!(nets[0].wait_until(WAIT, |_| lane(&nets[0], 2)));
+    assert!(nets[1].wait_until(WAIT, |_| lane(&nets[1], 1)));
+    assert!(!lane(&nets[0], 3) && !lane(&nets[2], 1));
+
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let g = Arc::clone(&got);
+    nets[1].add_handler(
+        |m| matches!(m, Message::JournalAck { .. } | Message::BlockData { .. }),
+        Arc::new(move |_, m| g.lock().unwrap().push(m)),
+    );
+    for i in 0..200u64 {
+        // Bulk (on the lane) and control (on the main connection).
+        assert!(nets[0].send(
+            2,
+            Message::BlockData {
+                req: 1,
+                block: i,
+                hash: [0; 16],
+                data: vec![1; 1000],
+            }
+        ));
+    }
+    assert!(nets[0].send(2, Message::JournalAck { origin: 1, seq: 7 }));
+    let t = Instant::now();
+    while got.lock().unwrap().len() < 201 {
+        assert!(t.elapsed() < WAIT, "got {}", got.lock().unwrap().len());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let blocks: Vec<u64> = got
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|m| match m {
+            Message::BlockData { block, .. } => Some(*block),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, (0..200).collect::<Vec<_>>(), "in order");
+    for n in &nets {
+        n.shutdown();
+    }
 }
