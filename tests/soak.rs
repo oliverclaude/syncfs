@@ -1279,11 +1279,14 @@ impl<'a> Checker<'a> {
         let Some(w) = ops.iter().filter(|o| o.end < r.start).max_by_key(|o| o.end) else {
             return false;
         };
+        // Only when nothing else touched the path until the read ended: the
+        // lock is taken some time after the operation started (it may wait
+        // for another node's write).
         if w.outcome != Outcome::Ok
             || !matches!(w.kind, OpKind::Write | OpKind::Rmw)
             || ops
                 .iter()
-                .any(|o| o.id != w.id && o.end >= w.start && o.start <= r.start)
+                .any(|o| o.id != w.id && o.end >= w.start && o.start <= r.end)
             || self.excused(w)
         {
             return false;
