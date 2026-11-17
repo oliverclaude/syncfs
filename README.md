@@ -724,8 +724,48 @@ differ are marked dirty and a `Data` entry is sent. With no peer within
 A cluster mount keeps `<backing_dir>/.syncfs/disk` with the cluster name,
 node id and a random 64-bit disk id, created on first start. A marker for
 another node or cluster stops the mount. The disk id goes into versions and
-the handshake. Step 8 turns a missing marker on a node that has state into
-the disk-loss rebuild; for now a missing marker just gets a new disk id.
+the handshake.
+
+### Rebuild
+
+A node never treats its local data as the truth when:
+
+- its marker is missing although its store ran as a mount (the disk was
+  lost or replaced),
+- its backing directory is empty although its store knows files, or
+- its store ran as a voter-only daemon (restarted with a `backing_dir`).
+
+It takes a new disk id (the marker says `state = rebuilding` until done,
+so an interrupted rebuild resumes) and rebuilds from a data peer that is
+not rebuilding itself:
+
+1. It lists that peer's directory tree (`TreeRequest`, 1024 nodes per
+   reply) and makes it locally: directories, symlinks, special files and
+   hard links as they are, regular files as sparse files of the right
+   size, marked missing. Local files the peer does not have move to
+   `<backing_dir>/.syncfs/orphans/<UTC time>/` (hidden from the mount).
+   The mount waits up to `freshness_timeout` for this, so it shows the
+   whole tree from the start. Entries from peers wait meanwhile; the
+   positions the peer had applied when it listed count as applied.
+2. Missing files are copied in the background, four at a time, spread
+   over the connected data peers, block by block with BLAKE3 hashes. A
+   file opened before then is copied first (`EIO` if no peer has it).
+3. Writes fail with `EROFS` until every missing file is copied; then the
+   node is a normal writer. A rebuilding node answers `Missing` to hash
+   requests for files it lacks, serves no blocks of them and forwards no
+   entries.
+
+If every peer is connected and every data peer is rebuilding too, nobody
+has more: the rebuild ends with what is there.
+
+A version that only a lost disk had does not block other writers: when
+every node that held a committed version answers without it, freshness
+continues from the newest copy there is.
+
+Progress is in `rebuild` of `.syncfs/replication`: `active`, `cause`
+(`disk_lost`, `emptied`, `daemon_upgrade`, `resume`), `source`,
+`files_total`, `files_done`, `bytes_total`, `bytes_done`, `eta_secs`,
+`orphans`.
 
 ### Status
 
@@ -735,7 +775,7 @@ the disk-loss rebuild; for now a missing marker just gets a new disk id.
 `journal_queue`, `open_sessions`, `sessions` (up to 20: file id, path,
 version, ms since the last interim entry), `window`, `suspects`, `unclean_start`,
 `in_sync` (nothing dirty, unacknowledged or open), `freshness_timeout`,
-`rejoining`, `store_commits`, `store_failures`, `versions` (this node's voter table:
+`rejoining`, `rebuild` (see Rebuild), `store_commits`, `store_failures`, `versions` (this node's voter table:
 `files`, `pending`, `latest_committed`), per peer `stores_data`, `disk`,
 `journal_unacked`, `dirty_blocks`, `applied_from`, and `counters`
 (`entries_made`, `entries_applied`, `entries_skipped`, `apply_errors`,
@@ -805,7 +845,12 @@ for forwarding). Daemons show their version table in `status.json`.
   version table across a restart, that a node that missed a write catches
   up when it locks the file (and falls back after `freshness_timeout`), and
   that a node killed while writing resends after restart, and that a
-  change reaches a node through a third mount when its origin died; an
+  change reaches a node through a third mount when its origin died, that a
+  diverged change is kept as a conflict copy, that removes leave
+  tombstones, that a restarted node catches up before it changes the
+  namespace, and that a lost disk and a daemon upgraded to a mount are
+  rebuilt from peers (`SYNCFS_TEST_REBUILD_DELAY_MS` slows the background
+  copies so the test sees the rebuild running); an
   exhaustive model check of forwarding and dirty marks
   (`src/repl/relay_model.rs`: three nodes, a session with an interim
   entry, a dependent entry, link loss, a restart and the origin's death;

@@ -81,6 +81,7 @@ fn send_loop(weak: Weak<Repl>, peer: NodeId) {
     let mut last_acked = 0u64;
     let mut last_progress = Instant::now();
     let mut positions_sent: PositionsSent = None;
+    let mut dropped = false;
     loop {
         let Some(r) = weak.upgrade() else { return };
         if r.stopping() {
@@ -93,12 +94,23 @@ fn send_loop(weak: Weak<Repl>, peer: NodeId) {
             .find(|p| p.id == peer)
             .and_then(|p| p.role);
         if role.is_some_and(|ro| !ro.data) {
-            log::info!("replication: node {peer} stores no data; not replicating to it");
-            let mut st = r.state();
-            st.dirty.drop_peer(peer);
-            st.journal.drop_peer(peer);
-            st.relay.drop_peer(peer);
-            return;
+            if !dropped {
+                log::info!("replication: node {peer} stores no data; not replicating to it");
+                dropped = true;
+                let mut st = r.state();
+                st.dirty.drop_peer(peer);
+                st.journal.drop_peer(peer);
+                st.relay.drop_peer(peer);
+            }
+            let st = r.state();
+            let _ = r.cv.wait_timeout(st, Duration::from_millis(500));
+            continue;
+        }
+        if dropped && role.is_some() {
+            // Restarted with a backing directory (it rebuilds from peers).
+            log::info!("replication: node {peer} stores data now; replicating to it");
+            dropped = false;
+            r.add_data_peer(peer);
         }
         let s = r.net.session_of(peer);
         if s != session {
@@ -166,6 +178,14 @@ fn send_loop(weak: Weak<Repl>, peer: NodeId) {
 }
 
 impl Repl {
+    /// Replicates to `peer` from now on (it may have stored no data so far).
+    pub(crate) fn add_data_peer(&self, peer: NodeId) {
+        let mut st = self.state();
+        st.dirty.add_peer(peer);
+        st.journal.add_peer(peer);
+        st.relay.add_peer(peer);
+    }
+
     /// What this node tells peers in `Positions`.
     pub(crate) fn positions(&self) -> Vec<(NodeId, u64)> {
         let st = self.state();
@@ -215,6 +235,16 @@ impl Repl {
                 self.state().relay.learn(from, &applied);
                 self.cv.notify_all();
             }
+            Message::CatchUpRequest { req, .. } if self.is_rebuilding() => {
+                // Its entries may be ahead of its data: not a relay yet.
+                self.net.send(from, Message::CatchUpDone { req });
+            }
+            Message::TreeRequest { req, after } => {
+                let me = Arc::clone(self);
+                let _ = std::thread::Builder::new()
+                    .name("syncfs-repl-tree".into())
+                    .spawn(move || me.serve_tree(from, req, after));
+            }
             Message::CatchUpRequest { req, since } => {
                 let batches: Vec<(NodeId, Vec<(u64, Record)>)> = {
                     let st = self.state();
@@ -263,7 +293,8 @@ impl Repl {
             }
             Message::BlockData { req, .. }
             | Message::BlockDone { req, .. }
-            | Message::HashReply { req, .. } => {
+            | Message::HashReply { req, .. }
+            | Message::TreeReply { req, .. } => {
                 let tx = lock(&self.rpc).get(&req).cloned();
                 if let Some(tx) = tx {
                     let _ = tx.send(msg);
@@ -334,9 +365,15 @@ impl Repl {
     }
 
     fn serve_pull(&self, peer: NodeId, req: u64, file: FileId, mode: PullMode) {
+        // A rebuilding node has nothing to serve of a file it lacks.
+        let lacking = self.rebuild_missing(&file);
         let (blocks, more, path, version) = {
             let mut st = self.state();
-            let path = st.index.path_of(&file).map(<[u8]>::to_vec);
+            let path = st
+                .index
+                .path_of(&file)
+                .map(<[u8]>::to_vec)
+                .filter(|_| !lacking);
             let version = st.index.version(&file);
             match mode {
                 PullMode::Discard(v) => {
@@ -432,6 +469,18 @@ impl Repl {
                 xattrs,
                 lineage: lineage.clone(),
             };
+        if self.rebuild_missing(&file) {
+            let msg = reply(
+                Presence::Missing,
+                0,
+                Attrs::default(),
+                Vec::new(),
+                false,
+                Vec::new(),
+            );
+            self.net.send(peer, msg);
+            return;
+        }
         let msg = (|| {
             let path = path?;
             let st = self.backing.stat(&path).ok()?;
@@ -513,7 +562,13 @@ impl Repl {
                             out.removed = true;
                             return Ok(out);
                         }
-                        Presence::Missing => Some("is still rebuilding and does not have"),
+                        Presence::Missing => {
+                            // Not a "gone": ask again or elsewhere.
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                super::fresh::Missing,
+                            ));
+                        }
                         Presence::Absent => Some("does not have"),
                     };
                     if let Some(why) = why {
@@ -681,6 +736,12 @@ fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
         let Some(r) = weak.upgrade() else { return };
         if r.stopping() {
             return;
+        }
+        if r.rebuild_holds_entries() {
+            // The tree is being made; its positions say where to go on.
+            let st = r.state();
+            let _ = r.cv.wait_timeout(st, Duration::from_millis(200));
+            continue;
         }
         // The next entry to apply, if it and its dependencies are here.
         let next = {

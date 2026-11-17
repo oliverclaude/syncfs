@@ -55,7 +55,9 @@ impl Repl {
     /// Whether the local copy of `id` is a base `version`'s changed blocks
     /// apply to (see [`same_base`](super::files::same_base)).
     fn has_base(&self, id: &FileId, version: Version, lineage: &[Version]) -> bool {
-        super::files::same_base(self.state().index.version(id), version, lineage)
+        // A file a rebuild has not copied yet has no base.
+        !self.rebuild_missing(id)
+            && super::files::same_base(self.state().index.version(id), version, lineage)
     }
 
     /// Makes the local copy of `id` (bound at its path) a whole copy of

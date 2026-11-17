@@ -64,6 +64,11 @@ impl RelayLog {
         Ok(r)
     }
 
+    /// `peer` stores data now.
+    pub fn add_peer(&mut self, peer: NodeId) {
+        self.peers.insert(peer);
+    }
+
     /// `peer` stores no data: it needs no entries.
     pub fn drop_peer(&mut self, peer: NodeId) {
         if self.peers.remove(&peer) {

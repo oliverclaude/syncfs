@@ -209,6 +209,11 @@ pub trait WriteHooks: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Called when a file is opened read-only.
+    fn open_read(&self, _node: NodeRef<'_>) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// Called when a file opened for writing is released (last close).
     fn release_write(&self, _node: NodeRef<'_>) {}
 }
@@ -234,6 +239,10 @@ impl<T: WriteHooks + ?Sized> WriteHooks for std::sync::Arc<T> {
 
     fn open_write(&self, node: NodeRef<'_>) -> Result<(), Errno> {
         (**self).open_write(node)
+    }
+
+    fn open_read(&self, node: NodeRef<'_>) -> Result<(), Errno> {
+        (**self).open_read(node)
     }
 
     fn release_write(&self, node: NodeRef<'_>) {

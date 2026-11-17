@@ -29,6 +29,7 @@ struct Node {
     kind: Kind,
     dir: PathBuf,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     child: Option<Child>,
 }
 
@@ -62,6 +63,7 @@ impl Node {
         }
         let child = cmd
             .args(&self.args)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .arg("--foreground")
             .stdin(Stdio::null())
             .stderr(self.log())
@@ -213,6 +215,7 @@ impl Cluster {
                     kind,
                     dir,
                     args,
+                    env: Vec::new(),
                     child: None,
                 }
             })
@@ -1275,13 +1278,67 @@ fn restarted_node_catches_up_before_changes() {
     wait_same_tree(&c, 1, 2);
 }
 
-/// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a
-/// mount has an empty backing directory with no marker: it must rebuild
-/// from its peers like a node that lost its disk (mount at once, fetch on
-/// demand, fill in the background, `EROFS` until caught up), with no lost
-/// writes to wait for. The status field names here are provisional.
+/// A node whose disk is lost (backing directory wiped, marker gone)
+/// rebuilds from a peer; local leftovers move to `.syncfs/orphans`, and a
+/// version only the lost disk had does not block writers.
 #[test]
-#[ignore = "needs the step 8 rebuild path"]
+fn lost_disk_is_rebuilt_and_its_lost_writes_do_not_block() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m1 = c.node(1).mnt();
+    std::fs::create_dir(m1.join("d")).unwrap();
+    std::fs::write(m1.join("d/x"), vec![7u8; 200_000]).unwrap();
+    let f0 = std::fs::read(m1.join("f")).unwrap();
+    eventually("replicated to node 2", || {
+        std::fs::read(c.node(2).mnt().join("d/x")).and_then(|b| {
+            (b.len() == 200_000)
+                .then_some(())
+                .ok_or(std::io::Error::other("short"))
+        })
+    });
+    // Node 2 writes f while node 1 is down, then loses its disk.
+    c.node(1).stop();
+    std::fs::write(c.node(2).mnt().join("f"), b"only on the lost disk\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    c.node(2).stop();
+    let b2 = c.node(2).backing();
+    std::fs::remove_dir_all(&b2).unwrap();
+    std::fs::create_dir(&b2).unwrap();
+    std::fs::write(b2.join("stray"), b"left over\n").unwrap();
+    c.node(1).start();
+    c.node(2).start();
+    c.converge("both back");
+    eventually("rebuild finishes", || {
+        let r = c.node(2).status("replication").unwrap();
+        (r["rebuild"]["active"] == false)
+            .then_some(r)
+            .ok_or_else(|| std::io::Error::other("still rebuilding"))
+    });
+    let r = c.node(2).status("replication").unwrap();
+    assert_eq!(r["rebuild"]["cause"], "disk_lost", "{r:#}");
+    assert_eq!(r["rebuild"]["orphans"], 1, "{r:#}");
+    let m2 = c.node(2).mnt();
+    assert_eq!(std::fs::read(m2.join("d/x")).unwrap(), vec![7u8; 200_000]);
+    assert_eq!(std::fs::read(m2.join("f")).unwrap(), f0);
+    assert!(!m2.join("stray").exists());
+    let orphans: Vec<_> = std::fs::read_dir(b2.join(".syncfs/orphans"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("stray"))
+        .collect();
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(std::fs::read(&orphans[0]).unwrap(), b"left over\n");
+    // The version only node 2's lost disk had does not make f read-only.
+    std::fs::write(m1.join("f"), b"after the loss\n").unwrap();
+    wait_same_tree(&c, 1, 2);
+    assert_eq!(std::fs::read(b2.join("f")).unwrap(), b"after the loss\n");
+}
+
+/// A voter-only daemon restarted as a mount has an empty backing directory
+/// with no marker: it rebuilds from its peers like a node that lost its
+/// disk (tree at once, fetch on demand, fill in the background, `EROFS`
+/// until done), with no lost writes to wait for.
+#[test]
 fn daemon_upgraded_to_mount_rebuilds_from_peers() {
     require_fuse!();
     use Kind::{Daemon, Mount};
@@ -1297,6 +1354,10 @@ fn daemon_upgraded_to_mount_rebuilds_from_peers() {
     // Upgrade node 3: same id and peers, now with a backing directory.
     c.node(3).stop();
     c.node(3).kind = Mount;
+    // Slow the background copies down so the test sees the rebuild going.
+    c.node(3)
+        .env
+        .push(("SYNCFS_TEST_REBUILD_DELAY_MS".into(), "1500".into()));
     c.node(3).start();
     c.converge("node 3 back as a mount");
     let m3 = c.node(3).mnt();

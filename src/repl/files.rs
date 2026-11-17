@@ -272,6 +272,23 @@ impl Index {
         }
     }
 
+    /// Forgets which version the local copy of `id` is (it is not to be
+    /// trusted: a rebuild compares it with a peer's in full).
+    pub fn forget_version(&mut self, id: FileId) {
+        if let Some(r) = self.files.get_mut(&id) {
+            if r.version.is_some() || !r.lineage.is_empty() {
+                r.version = None;
+                r.lineage.clear();
+                self.changed.insert(id);
+            }
+        }
+    }
+
+    /// Every indexed path.
+    pub fn paths(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.by_path.keys().map(Vec::as_slice)
+    }
+
     /// The version `id` was removed at, if it is a tombstone.
     pub fn tombstone(&self, id: &FileId) -> Option<Version> {
         let r = self.files.get(id)?;

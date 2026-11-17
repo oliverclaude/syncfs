@@ -87,7 +87,7 @@ pub(crate) struct State {
 }
 
 const CLEAN_KEY: &[u8] = b"clean";
-const LINKS_SCANNED_KEY: &[u8] = b"links_scanned";
+pub(crate) const LINKS_SCANNED_KEY: &[u8] = b"links_scanned";
 
 fn applied_key(origin: NodeId) -> Vec<u8> {
     format!("applied.{origin}").into_bytes()
@@ -171,6 +171,9 @@ pub struct Repl {
     pub(crate) started: Instant,
     /// Caught up after the start (or gave up waiting): see `rejoin`.
     pub(crate) rejoined: AtomicBool,
+    /// Rebuilding from peers (see `rebuild`): no writes.
+    pub(crate) rebuilding: AtomicBool,
+    pub(crate) rebuild: Mutex<super::rebuild::Rebuild>,
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
     invalidator: std::sync::OnceLock<Invalidator>,
@@ -211,6 +214,7 @@ impl Repl {
         flusher: Arc<Flusher>,
         net: Network,
         locks: LockManager,
+        rebuild: Option<super::rebuild::Cause>,
     ) -> std::io::Result<Arc<Repl>> {
         let store = Arc::clone(flusher.store());
         let peers: Vec<NodeId> = cfg
@@ -274,7 +278,14 @@ impl Repl {
             .transpose()?
             // A new store has nothing to recover.
             .unwrap_or(true);
-        let suspects = if clean {
+        if rebuild.is_some() {
+            // The data the marks point at is gone; every file is compared.
+            dirty.clear();
+            let mut ops = dirty.take_changed();
+            ops.extend(index.take_changed());
+            store.commit(&ops)?;
+        }
+        let suspects = if clean || rebuild.is_some() {
             BTreeSet::new()
         } else {
             window.clone()
@@ -327,6 +338,17 @@ impl Repl {
             unclean_start: !clean,
             started: Instant::now(),
             rejoined: AtomicBool::new(cfg.peers.iter().all(|p| p.id == cfg.node_id)),
+            rebuilding: AtomicBool::new(rebuild.is_some()),
+            rebuild: Mutex::new(super::rebuild::Rebuild {
+                cause: rebuild,
+                marker: rebuild.map(|_| super::marker::Marker {
+                    cluster: cfg.cluster_name.clone(),
+                    node: u32::from(cfg.node_id),
+                    disk,
+                    rebuilding: true,
+                }),
+                ..Default::default()
+            }),
             this: std::sync::OnceLock::new(),
             invalidator: std::sync::OnceLock::new(),
             stats: std::sync::OnceLock::new(),
@@ -339,6 +361,13 @@ impl Repl {
             None => Batch::default(),
         }));
         super::net::start(&repl);
+        if rebuild.is_some() {
+            let weak = Arc::downgrade(&repl);
+            let h = std::thread::Builder::new()
+                .name("syncfs-rebuild".into())
+                .spawn(move || super::rebuild::rebuild_loop(weak))?;
+            lock(&repl.threads).push(h);
+        }
         Ok(repl)
     }
 
@@ -884,6 +913,7 @@ impl Repl {
     }
 
     fn render(&self) -> serde_json::Value {
+        let rebuild = self.rebuild_status();
         let snap = self.net.snapshot();
         let st = self.state();
         let blocks = st.dirty.blocks_per_peer();
@@ -936,6 +966,7 @@ impl Repl {
             "suspects": st.suspects.len(),
             "unclean_start": self.unclean_start,
             "rejoining": !self.rejoined.load(Ordering::Relaxed),
+            "rebuild": rebuild,
             "in_sync": st.dirty.files() == 0 && !lagging && st.sessions.is_empty(),
             "freshness_timeout": humantime::format_duration(self.freshness_timeout).to_string(),
             "store_commits": self.flusher.store().commits(),

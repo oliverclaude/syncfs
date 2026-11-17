@@ -117,6 +117,15 @@ impl Journal {
         self.acked.keys().copied()
     }
 
+    /// Starts replicating to `peer` (a node that now stores data), from
+    /// what is still kept.
+    pub fn add_peer(&mut self, peer: NodeId) {
+        if let std::collections::btree_map::Entry::Vacant(e) = self.acked.entry(peer) {
+            e.insert(0);
+            self.acks_changed = true;
+        }
+    }
+
     pub fn drop_peer(&mut self, peer: NodeId) {
         if self.acked.remove(&peer).is_some() {
             self.acks_changed = true;

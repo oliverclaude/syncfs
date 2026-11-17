@@ -16,7 +16,7 @@ use crate::net::Network;
 use crate::process;
 use crate::repl::core::Repl;
 use crate::repl::store::{Flusher, Store};
-use crate::repl::{marker, version};
+use crate::repl::{marker, rebuild, version};
 use crate::status::{providers, Registry};
 
 /// FUSE session settings for `cfg`. `kernel_flags` are the generic mount
@@ -316,9 +316,35 @@ impl Cluster {
 }
 
 fn start_cluster(cfg: &Config, backing: &Path) -> anyhow::Result<Cluster> {
-    let disk = marker::load_or_create(cfg, backing)?;
+    let found = marker::load(cfg, backing)?;
+    let existed = cfg.state_dir.join("store.redb").exists();
     let store = Store::open(&cfg.state_dir)
         .with_context(|| format!("opening the store in {}", cfg.state_dir.display()))?;
+    let cause = rebuild::cause(
+        found.as_ref(),
+        existed,
+        &store,
+        backing,
+        cfg.peers.iter().any(|p| p.id != cfg.node_id),
+    )?;
+    let disk = match (&found, cause) {
+        (Some(m), None) => m.disk,
+        (Some(m), Some(rebuild::Cause::Resume)) => m.disk,
+        (_, cause) => {
+            let m = marker::fresh(cfg, cause.is_some())?;
+            marker::store(backing, &m)
+                .with_context(|| format!("writing {}", marker::path(backing).display()))?;
+            log::info!(
+                "new disk id {:016x} in {}",
+                m.disk,
+                marker::path(backing).display()
+            );
+            m.disk
+        }
+    };
+    if let Some(c) = cause {
+        log::warn!("{c}: rebuilding from peers; writes fail (EROFS) until that is done");
+    }
     let flusher = Flusher::new(Arc::new(store));
     let mut settings = Settings::from_config(cfg);
     settings.disk = disk;
@@ -333,6 +359,7 @@ fn start_cluster(cfg: &Config, backing: &Path) -> anyhow::Result<Cluster> {
         Arc::clone(&flusher),
         net.clone(),
         locks.clone(),
+        cause,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -342,6 +369,10 @@ fn start_cluster(cfg: &Config, backing: &Path) -> anyhow::Result<Cluster> {
         }
     };
     let flush_thread = flusher.start();
+    if cause.is_some() {
+        // Mount with the tree complete if the peers answer in time.
+        repl.wait_for_tree(cfg.freshness_timeout.get());
+    }
     Ok(Cluster {
         net,
         locks,

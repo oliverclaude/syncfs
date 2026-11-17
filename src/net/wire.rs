@@ -321,6 +321,22 @@ pub enum Message {
     CatchUpDone {
         req: u64,
     },
+    /// Asks for the sender's directory tree, the nodes after path `after`
+    /// (in path order; empty: from the start).
+    TreeRequest {
+        req: u64,
+        after: Vec<u8>,
+    },
+    TreeReply {
+        req: u64,
+        /// The sender is rebuilding itself: not a source.
+        rebuilding: bool,
+        /// What the sender had applied before it listed (its `Positions`).
+        positions: Vec<(NodeId, u64)>,
+        nodes: Vec<TreeNode>,
+        /// More nodes follow (ask again after the last path).
+        more: bool,
+    },
 
     // Step 5 addendum: skipping the start-up grace on a cold start.
     /// "Could you be relying on a lease I granted before I restarted?"
@@ -362,6 +378,7 @@ impl Message {
                 | Message::BlockData { .. }
                 | Message::BlockDone { .. }
                 | Message::HashReply { .. }
+                | Message::TreeReply { .. }
         )
     }
 
@@ -379,6 +396,8 @@ impl Message {
                 | Message::Positions { .. }
                 | Message::CatchUpRequest { .. }
                 | Message::CatchUpDone { .. }
+                | Message::TreeRequest { .. }
+                | Message::TreeReply { .. }
         )
     }
 
@@ -408,6 +427,8 @@ impl Message {
             Message::VersionHolders { .. } => "version-holders",
             Message::CatchUpRequest { .. } => "catch-up-request",
             Message::CatchUpDone { .. } => "catch-up-done",
+            Message::TreeRequest { .. } => "tree-request",
+            Message::TreeReply { .. } => "tree-reply",
             Message::LockFreshQuery { .. } => "lock-fresh-query",
             Message::LockFreshReply { .. } => "lock-fresh-reply",
         }
@@ -592,6 +613,22 @@ pub enum Presence {
     /// The sender is rebuilding and does not have the content yet: ask
     /// another node.
     Missing,
+}
+
+/// One node of a directory tree listing (`TreeReply`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct TreeNode {
+    pub path: Vec<u8>,
+    pub id: FileId,
+    pub kind: NodeKind,
+    /// Size and attributes.
+    pub meta: FileMeta,
+    pub rdev: u64,
+    /// Symlink target.
+    pub target: Vec<u8>,
+    pub version: Option<Version>,
+    pub lineage: Vec<Version>,
 }
 
 /// A file's size and attributes.

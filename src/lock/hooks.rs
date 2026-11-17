@@ -267,6 +267,9 @@ impl ClusterHooks {
 
 impl WriteHooks for ClusterHooks {
     fn before(&self, op: &Mutation<'_>) -> Result<OpGuard, Errno> {
+        if self.repl.is_rebuilding() {
+            return Err(Errno::EROFS);
+        }
         self.repl.rejoin_gate();
         match *op {
             Mutation::Write { node, .. }
@@ -332,6 +335,9 @@ impl WriteHooks for ClusterHooks {
     }
 
     fn open_write(&self, node: NodeRef<'_>) -> Result<(), Errno> {
+        if self.repl.is_rebuilding() {
+            return Err(Errno::EROFS);
+        }
         self.repl.rejoin_gate();
         let Some(key) = key_of(node)? else {
             return Ok(());
@@ -339,6 +345,22 @@ impl WriteHooks for ClusterHooks {
         self.acquire_content(&key, node)?;
         self.by_ino().entry(node.ino()).or_default().push(key);
         Ok(())
+    }
+
+    fn open_read(&self, node: NodeRef<'_>) -> Result<(), Errno> {
+        if !self.repl.is_rebuilding() {
+            return Ok(());
+        }
+        // Rebuilding: a file not copied yet is copied first.
+        let Some(file) = self.file_of(node) else {
+            return Ok(());
+        };
+        if self.repl.fetch_missing(file, None) {
+            Ok(())
+        } else {
+            log::warn!("rebuild: no peer could provide {file} yet");
+            Err(Errno::EIO)
+        }
     }
 
     fn release_write(&self, node: NodeRef<'_>) {

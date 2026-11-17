@@ -75,10 +75,12 @@ fn ts((sec, nsec): (i64, u32)) -> Timespec {
 pub struct Backing {
     root: OwnedFd,
     as_root: bool,
+    path: std::path::PathBuf,
 }
 
 impl Backing {
     pub fn open(root: &Path) -> io::Result<Backing> {
+        let path = std::fs::canonicalize(root)?;
         let root = rustix::fs::open(
             root,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -87,7 +89,53 @@ impl Backing {
         Ok(Backing {
             root,
             as_root: rustix::process::geteuid().is_root(),
+            path,
         })
+    }
+
+    /// The backing directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn readlink(&self, path: &[u8]) -> io::Result<Vec<u8>> {
+        let (d, n) = self.parent(path)?;
+        Ok(rustix::fs::readlinkat(&d, n, Vec::new())?.into_bytes())
+    }
+
+    /// Every path below the root except the root's `.syncfs`, sorted
+    /// (a directory comes before what is in it). Does not follow symlinks
+    /// or cross into other filesystems.
+    pub fn list(&self) -> io::Result<Vec<Vec<u8>>> {
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::symlink_metadata(&self.path)?.dev();
+        let mut out = Vec::new();
+        let mut stack: Vec<Vec<u8>> = vec![Vec::new()];
+        while let Some(rel) = stack.pop() {
+            let dir = self.path.join(OsStr::from_bytes(&rel));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name();
+                if rel.is_empty() && name == crate::fs::virt::NAME {
+                    continue;
+                }
+                let mut p = rel.clone();
+                if !p.is_empty() {
+                    p.push(b'/');
+                }
+                p.extend_from_slice(name.as_bytes());
+                if let Ok(md) = e.metadata() {
+                    if md.is_dir() && md.dev() == dev {
+                        stack.push(p.clone());
+                    }
+                }
+                out.push(p);
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// The directory containing `path` and the last component. The root

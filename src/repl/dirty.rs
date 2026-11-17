@@ -64,6 +64,24 @@ impl Dirty {
         Ok(())
     }
 
+    /// Starts tracking `peer` (it stores data now).
+    pub fn add_peer(&mut self, peer: NodeId) {
+        self.peers.insert(peer);
+    }
+
+    /// Forgets every mark (the data they point at is gone).
+    pub fn clear(&mut self) {
+        let ids: Vec<FileId> = self
+            .pending
+            .keys()
+            .chain(self.inflight.keys().map(|(_, id)| id))
+            .copied()
+            .collect();
+        for id in ids {
+            self.forget(id);
+        }
+    }
+
     /// Stops tracking `peer` (it stores no data).
     pub fn drop_peer(&mut self, peer: NodeId) {
         if !self.peers.remove(&peer) {

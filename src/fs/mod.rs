@@ -827,6 +827,8 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
             let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
             if writable {
                 self.hooks.open_write(self.node(&inode))?;
+            } else {
+                self.hooks.open_read(self.node(&inode))?;
             }
             let opened = if flags.0 & libc::O_TRUNC != 0 {
                 let op = Mutation::SetAttr {

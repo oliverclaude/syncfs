@@ -28,6 +28,8 @@ pub(crate) enum Copy {
     Fresh,
     /// Applying a forwarded entry.
     Relayed,
+    /// Rebuilding: the local copy is not to be trusted.
+    Rebuild,
 }
 
 /// Why a session must not write.
@@ -53,6 +55,24 @@ impl std::fmt::Display for Removed {
 }
 
 impl std::error::Error for Removed {}
+
+/// The payload of the error for a source that is rebuilding and does not
+/// have the file yet.
+#[derive(Debug)]
+pub struct Missing;
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the node is rebuilding and does not have it yet")
+    }
+}
+
+impl std::error::Error for Missing {}
+
+/// Whether `e` says the source is rebuilding (see [`Missing`]).
+pub fn is_missing(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.is::<Missing>())
+}
 
 /// Whether `e` says the file was removed (see [`Removed`]).
 pub fn is_removed(e: &io::Error) -> bool {
@@ -154,14 +174,23 @@ impl Repl {
         let mut order: Vec<NodeId> = t.committed.iter().flat_map(|(_, h)| h.clone()).collect();
         order.extend(self.data_peers_up());
         let mut tried = std::collections::BTreeSet::new();
+        // Nodes that answered without the version (they lost it, e.g. with
+        // their disk).
+        let mut without = std::collections::BTreeSet::from([self.me]);
         for p in order {
             if p == self.me || !tried.insert(p) || self.net.session_of(p) == 0 {
                 continue;
             }
             match self.catch_up(id, p) {
                 Err(e) if is_removed(&e) => return Err(NotFresh::Removed),
+                Err(e) if is_missing(&e) || e.kind() == io::ErrorKind::NotFound => {
+                    without.insert(p);
+                    log::debug!("freshness: {id} from node {p}: {e}");
+                }
                 Err(e) => log::debug!("freshness: {id} from node {p}: {e}"),
-                Ok(_) => {}
+                Ok(_) => {
+                    without.insert(p);
+                }
             }
         }
         let local = self.local_version(&id);
@@ -173,6 +202,18 @@ impl Repl {
                     newest.seq,
                     local.map(|l| l.seq),
                     cv.seq
+                );
+                return Ok(());
+            }
+            if t.committed
+                .as_ref()
+                .is_some_and(|(_, holders)| holders.iter().all(|h| without.contains(h)))
+            {
+                log::warn!(
+                    "freshness: every node that held committed version {} of {id} answered \
+                     without it (lost with a disk); continuing from version {:?}",
+                    cv.seq,
+                    local.map(|l| l.seq)
                 );
                 return Ok(());
             }
@@ -229,6 +270,7 @@ impl Repl {
             // A relay's copy of the same version may have more of the
             // session's writes.
             Copy::Relayed => remote.version < local,
+            Copy::Rebuild => local.is_some() && remote.version <= local,
         };
         if older {
             // Nothing newer there (never go back to an older copy).
@@ -271,7 +313,8 @@ impl Repl {
         }
         drop(st);
         self.flusher.flush_now()?;
-        if let (Copy::Fresh, Some(v)) = (how, remote.version) {
+        self.rebuild_file_done(&id);
+        if let (Copy::Fresh | Copy::Rebuild, Some(v)) = (how, remote.version) {
             // This node holds that version now (durably). (A relay's copy
             // may be part of a session still writing: not announced.)
             self.announce_holders(id, v, vec![self.me, source]);
@@ -306,6 +349,7 @@ impl Repl {
         st.dirty.forget(id);
         drop(st);
         self.flusher.flush_now()?;
+        self.rebuild_file_done(&id);
         log::debug!("replication: {id} removed at version {}", version.seq);
         Ok(())
     }
