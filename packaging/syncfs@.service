@@ -1,0 +1,19 @@
+[Unit]
+Description=syncfs mount configured in /etc/syncfs/%i.yaml
+Documentation=https://github.com/oliverclaude/syncfs
+Wants=network-online.target
+After=network-online.target
+# The configuration must exist (with backing_dir and mountpoint set).
+ConditionPathExists=/etc/syncfs/%i.yaml
+
+[Service]
+Type=simple
+# Stops (SIGTERM) unmount cleanly. Each instance keeps its own state.
+ExecStart=/usr/bin/syncfs --config /etc/syncfs/%i.yaml --state-dir /var/lib/syncfs/%i --foreground
+Restart=on-failure
+RestartSec=2s
+StateDirectory=syncfs/%i
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

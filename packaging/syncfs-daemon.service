@@ -1,0 +1,17 @@
+[Unit]
+Description=syncfs voter-only daemon (quorum and lock voting, no data)
+Documentation=https://github.com/oliverclaude/syncfs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Settings (cluster_name, node_id, listen, peers) from /etc/syncfs/syncfs.yaml.
+ExecStart=/usr/bin/syncfs --mode daemon --foreground
+Restart=on-failure
+RestartSec=2s
+StateDirectory=syncfs
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

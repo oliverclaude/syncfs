@@ -3,11 +3,56 @@
 `syncfs` is a replicating FUSE filesystem for Linux. Several `syncfs` nodes
 form a cluster and keep a full copy of the same filesystem on every node.
 
-> **Status:** early development. Steps 1 (configuration), 2 (single-node
-> passthrough FUSE filesystem, mount helper, fstab), 3 (the `.syncfs`
-> status directory) and 4 (wire protocol, peer membership, daemon mode) are
-> done. Nodes find each other and track quorum, but nothing is replicated
-> yet: a mount today is a local mirror of its backing directory.
+> **Status:** pre-release. Build plan steps 1 to 9 are done: configuration,
+> the FUSE filesystem, the `.syncfs` status directory, membership, quorum
+> locks, the write path, replication, rejoin and recovery, and packaging
+> (`.deb` and static binaries, see [Installing](#installing)). Step 10, a
+> randomized soak test, is next.
+
+## Installing
+
+Builds of each `v*` tag are on the
+[releases page](https://github.com/oliverclaude/syncfs/releases), with a
+`SHA256SUMS` file.
+
+**Debian 12 (bookworm) and 13 (trixie)**, amd64 and arm64: take the
+package for your suite (`+deb12` or `+deb13`) and architecture, then
+
+```sh
+sudo apt install ./syncfs_0.1.0~pre-1+deb13_amd64.deb
+```
+
+It depends on `fuse3` and installs:
+
+| Path | What |
+| --- | --- |
+| `/usr/bin/syncfs` | the binary |
+| `/sbin/mount.syncfs`, `/sbin/mount.fuse.syncfs` | mount helpers for `/etc/fstab` (links to the binary, in `/usr/sbin` on merged-`/usr` systems) |
+| `/etc/syncfs/syncfs.yaml` | configuration, a conffile: every setting is commented out, so it describes a standalone node until you edit it. `apt remove` keeps it, `apt purge` deletes it |
+| `/usr/lib/systemd/system/syncfs-daemon.service` | voter-only daemon (`--mode daemon`) configured by `/etc/syncfs/syncfs.yaml`, state in `/var/lib/syncfs` |
+| `/usr/lib/systemd/system/syncfs@.service` | template for mounts: `syncfs@NAME` mounts what `/etc/syncfs/NAME.yaml` configures (it must set `backing_dir` and `mountpoint`), state in `/var/lib/syncfs/NAME` |
+| `/usr/share/doc/syncfs/` | this README and the fully commented example config |
+
+The package enables and starts nothing. To run a voter daemon, set
+`cluster_name`, `node_id`, `listen` and `peers` in
+`/etc/syncfs/syncfs.yaml` and `systemctl enable --now syncfs-daemon`. To
+mount through systemd instead of fstab, write `/etc/syncfs/data.yaml`
+(with the same cluster settings, plus `backing_dir` and `mountpoint`) and
+`systemctl enable --now syncfs@data`; stopping the unit unmounts cleanly.
+
+**Any Linux on x86_64 or aarch64**: the `syncfs-*-linux-musl.tar.gz`
+archives hold a static binary (no libraries needed; the kernel's FUSE and,
+for non-root mounts, `fusermount3` from fuse3), the docs, the example
+config and the two systemd units. Copy `syncfs` to `/usr/bin` and link the
+helpers as described under [/etc/fstab](#etcfstab).
+
+To build the packages yourself (needs Docker): `scripts/package.sh
+bookworm|trixie OUTDIR` builds the `.deb` for this machine's architecture
+in a clean `debian:SUITE` container, `scripts/deb-test.sh SUITE DEB`
+test-installs it in another one, and `scripts/build-musl.sh OUTDIR`
+builds the static archive (needs `musl-tools`). Set `SYNCFS_PRE=pre` for
+a `~pre` version. The `Package` workflow does all of this on x86_64 and
+arm64 runners and publishes a pre-release for each `v*` tag.
 
 ## Design
 
@@ -123,7 +168,9 @@ fusermount3 -u /mnt/data                   # unmount (or: umount /mnt/data as ro
 
 ### /etc/fstab
 
-Install the binary as `/usr/bin/syncfs` and link the helper:
+The `.deb` installs the helpers `/sbin/mount.syncfs` and
+`/sbin/mount.fuse.syncfs`. With the static binary, install it as
+`/usr/bin/syncfs` and link them yourself:
 `ln -s /usr/bin/syncfs /sbin/mount.syncfs` (and optionally
 `/sbin/mount.fuse.syncfs`). Then either type works:
 
@@ -131,6 +178,18 @@ Install the binary as `/usr/bin/syncfs` and link the helper:
 /srv/data  /mnt/data  syncfs       node_id=1,_netdev,allow_other  0 0
 /srv/data  /mnt/data  fuse.syncfs  node_id=1,_netdev,allow_other  0 0
 ```
+
+With the `user` option a normal user can mount the entry (`mount
+/home/me/m`; the mount point and backing directory must be theirs, and it
+runs as that user, through `fusermount3`) and unmount it again (`umount
+/home/me/m`):
+
+```
+/home/me/b  /home/me/m  syncfs  user,noauto  0 0
+```
+
+mount(8) clears the environment for such a mount, so the default state
+directory comes from the user's passwd home (`~/.local/state/syncfs`).
 
 `fuse.syncfs` also works through fuse3's `mount.fuse3` when `syncfs` is on
 `PATH`. The source field is the backing directory; a source without a `/`
@@ -892,6 +951,13 @@ for forwarding). Daemons show their version table in `status.json`.
   relay that keeps nothing, breaks it).
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
+- Packages: `scripts/deb-test.sh` installs a `.deb` in a clean container
+  of its suite and checks the files, the conffile, root fstab mounts of
+  both types, a non-root `user` fstab mount and unmount, the units
+  (`systemd-analyze verify`, and the template's command line mounting and
+  unmounting on SIGTERM), and that remove keeps and purge deletes the
+  conffile. CI runs it for all four packages and smoke-tests the static
+  binaries (a mount, and `--version` in an empty container).
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with
   `allow_other`: 238 files, 8798 tests, all passing.
 
@@ -941,8 +1007,11 @@ Each step ends with passing tests and a commit.
      difference is that a daemon never had unreplicated writes, so there
      is nothing to wait for or keep as a conflict copy. Covered by the
      cluster test `daemon_upgraded_to_mount_rebuilds_from_peers`.
-9. **Packaging**: `.deb` for bookworm and trixie on amd64 and arm64, static
-   musl portable binaries, systemd unit for daemon mode.
+9. **Packaging** (done; see [Installing](#installing)): `.deb` for
+   bookworm and trixie on amd64 and arm64 with the fstab helpers, a
+   conffile and systemd units (daemon mode, and a template for mounts);
+   static musl binaries for x86_64 and aarch64; built, test-installed
+   (including root and `user` fstab mounts) and released by CI.
 10. **Soak test**: randomized multi-node run with restarts and partitions.
 
 ## Building
