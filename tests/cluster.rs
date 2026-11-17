@@ -676,20 +676,22 @@ fn locks_cold_start_skips_grace_restart_does_not() {
     // At least a quorum skipped (a node still probing after the first
     // lock was taken sees a non-fresh holder and keeps its grace). Daemon
     // status files are rewritten every 5 heartbeats.
-    eventually("a quorum skipped the grace", || {
-        let skipped = [1, 2, 3]
-            .iter()
-            .filter(|&&id| c.node(id).status("locks").unwrap()["grace_skipped"] == true)
-            .count();
-        (skipped >= 2)
-            .then_some(())
-            .ok_or_else(|| std::io::Error::other(format!("{skipped} skipped")))
+    // Restart a daemon whose loss leaves a granting quorum: node 1 and the
+    // other daemon must have skipped the grace.
+    let victim = eventually("a quorum skipped the grace", || {
+        let skipped =
+            |id: u16| c.nodes[id as usize - 1].status("locks").unwrap()["grace_skipped"] == true;
+        match (skipped(1), skipped(2), skipped(3)) {
+            (true, true, _) => Ok(3),
+            (true, false, true) => Ok(2),
+            s => Err(std::io::Error::other(format!("skipped (1, 2, 3): {s:?}"))),
+        }
     });
-    c.node(3).kill();
-    c.node(3).start();
-    c.converge("voter 3 back");
-    let l = eventually("voter 3 status", || {
-        c.node(3)
+    c.node(victim).kill();
+    c.node(victim).start();
+    c.converge("voter back");
+    let l = eventually("restarted voter status", || {
+        c.node(victim)
             .status("locks")
             .filter(|l| l.is_object())
             .ok_or_else(|| std::io::Error::other("no status"))
@@ -799,13 +801,20 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
             let p = e.path();
             let rel = p.strip_prefix(root).unwrap().display().to_string();
             if rel == ".syncfs" {
                 continue;
             }
-            let md = std::fs::symlink_metadata(&p).unwrap();
+            // Replication may be renaming or removing it right now; the
+            // caller compares again.
+            let Ok(md) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
             let mut xattrs = Vec::new();
             let mut buf = vec![0u8; 65536];
             if let Ok(n) = rustix::fs::llistxattr(&p, &mut buf[..]) {
@@ -823,9 +832,9 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
                 stack.push(p.clone());
                 "dir".to_string()
             } else if md.file_type().is_symlink() {
-                format!("link->{}", std::fs::read_link(&p).unwrap().display())
+                format!("link->{:?}", std::fs::read_link(&p).ok())
             } else if md.is_file() {
-                let data = std::fs::read(&p).unwrap();
+                let data = std::fs::read(&p).unwrap_or_default();
                 format!("file {} {:x}", data.len(), md5ish(&data))
             } else {
                 format!("special {:o}", md.mode() & libc::S_IFMT)
@@ -961,6 +970,16 @@ fn replicates_changes_between_mounts() {
     );
     let r2 = in_sync(&c, 2);
     assert_eq!(r2["counters"]["blocks_received"].as_u64().unwrap(), before);
+
+    // A renamed file keeps its version: writing it again needs no
+    // freshness wait.
+    std::fs::write(m1.join("r1"), b"one").unwrap();
+    std::fs::rename(m1.join("r1"), m1.join("r2")).unwrap();
+    std::fs::write(m1.join("r2"), b"two").unwrap();
+    wait_same_tree(&c, 1, 2);
+    let r1 = in_sync(&c, 1);
+    assert_eq!(r1["counters"]["fresh_waits"], 0, "{r1:#}");
+    assert_eq!(std::fs::read(m2.join("r2")).unwrap(), b"two");
 
     // The daemon keeps the version table across a restart (its status
     // file is rewritten every 5 heartbeats).

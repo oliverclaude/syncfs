@@ -416,17 +416,23 @@ fn grants_carry_versions_and_sessions_announce_theirs() {
     nodes[0].locks.release(&k("f"));
 
     // Node 2's grants report node 1's written version with node 1 as the
-    // holder; node 2 announces version 2.
+    // holder (at least one granting voter saw it: majorities intersect; a
+    // voter that missed the confirm reports nothing); node 2 announces
+    // version 2.
     let b = common::wait_for("node 2 acquires", || {
         nodes[1].locks.acquire_file(&k("f"), ctx(None), false).ok()
     });
     let latest: Vec<_> = b.known.iter().filter_map(|i| i.latest).collect();
     assert!(
-        latest.len() >= 2 && latest.iter().all(|v| *v == v1),
+        !latest.is_empty() && latest.iter().all(|v| *v == v1),
         "{:?}",
         b.known
     );
-    assert!(b.known.iter().all(|i| !i.pending && i.holders == [1]));
+    assert!(b
+        .known
+        .iter()
+        .filter(|i| i.latest.is_some())
+        .all(|i| !i.pending && i.holders == [1]));
     let v2 = b.version.unwrap();
     assert_eq!((v2.seq, v2.node), (2, 2));
     // Node 2 writes nothing: its version is withdrawn on release.
@@ -437,7 +443,8 @@ fn grants_carry_versions_and_sessions_announce_theirs() {
             .locks
             .acquire_file(&k("f"), ctx(Some(v1)), false)
             .ok()?;
-        if c.known.iter().all(|i| i.latest == Some(v1)) {
+        let latest: Vec<_> = c.known.iter().filter_map(|i| i.latest).collect();
+        if !latest.is_empty() && latest.iter().all(|v| *v == v1) {
             return Some(c);
         }
         nodes[2].locks.release(&k("f"));
