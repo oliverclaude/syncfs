@@ -744,7 +744,10 @@ A node never treats its local data as the truth when:
 - its marker is missing although its store ran as a mount (the disk was
   lost or replaced),
 - its backing directory is empty although its store knows files, or
-- its store ran as a voter-only daemon (restarted with a `backing_dir`).
+- its store ran as a voter-only daemon (restarted with a `backing_dir`),
+  or
+- it is a new member: a new store and an empty backing directory (a new
+  node with files of its own brings them in as before).
 
 It takes a new disk id (the marker says `state = rebuilding` until done,
 so an interrupted rebuild resumes) and rebuilds from a data peer that is
@@ -756,7 +759,8 @@ not rebuilding itself:
    size, marked missing. Local files the peer does not have move to
    `<backing_dir>/.syncfs/orphans/<UTC time>/` (hidden from the mount).
    The mount waits up to `freshness_timeout` for this, so it shows the
-   whole tree from the start. Entries from peers wait meanwhile; the
+   whole tree from the start (a new member mounts at once: its peers may
+   still be starting). Entries from peers wait meanwhile; the
    positions the peer had applied when it listed count as applied.
 2. Missing files are copied in the background, four at a time, spread
    over the connected data peers, block by block with BLAKE3 hashes. A
@@ -774,7 +778,7 @@ every node that held a committed version answers without it, freshness
 continues from the newest copy there is.
 
 Progress is in `rebuild` of `.syncfs/replication`: `active`, `cause`
-(`disk_lost`, `emptied`, `daemon_upgrade`, `resume`), `source`,
+(`disk_lost`, `emptied`, `daemon_upgrade`, `new_member`, `resume`), `source`,
 `files_total`, `files_done`, `bytes_total`, `bytes_done`, `eta_secs`,
 `orphans`.
 
@@ -801,8 +805,8 @@ for forwarding). Daemons show their version table in `status.json`.
 
 - After an unclean stop with no data peer to compare with in time,
   namespace changes of the crash window stay local (a warning is logged).
-- A new member with an empty backing directory and a new store starts
-  empty: it does not list a peer's tree (files arrive as they change).
+- When every node of a new cluster starts empty, each rebuilds until all
+  peers are connected (writes fail with `EROFS` until then).
 - Entries for a file this node has open for writing wait until that
   session ends, and so do that origin's later entries.
 - The rejoin gate runs after a start only, not after a reconnect.

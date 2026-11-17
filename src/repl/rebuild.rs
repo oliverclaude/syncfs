@@ -54,6 +54,8 @@ pub enum Cause {
     Emptied,
     /// The store ran as a voter-only daemon.
     Upgrade,
+    /// A new store and an empty backing directory: a new member.
+    NewMember,
 }
 
 impl std::fmt::Display for Cause {
@@ -63,6 +65,7 @@ impl std::fmt::Display for Cause {
             Cause::DiskLost => "the disk marker is missing (disk lost or replaced)",
             Cause::Emptied => "the backing directory is empty",
             Cause::Upgrade => "this node ran as a voter-only daemon",
+            Cause::NewMember => "this is a new member with an empty backing directory",
         })
     }
 }
@@ -74,6 +77,7 @@ impl Cause {
             Cause::DiskLost => "disk_lost",
             Cause::Emptied => "emptied",
             Cause::Upgrade => "daemon_upgrade",
+            Cause::NewMember => "new_member",
         }
     }
 }
@@ -100,6 +104,7 @@ pub fn cause(
     Ok(match found {
         None if ran_as_mount => Some(Cause::DiskLost),
         None if existed => Some(Cause::Upgrade),
+        None if marker::backing_empty(backing) => Some(Cause::NewMember),
         Some(_)
             if ran_as_mount
                 && marker::backing_empty(backing)
@@ -647,8 +652,16 @@ mod tests {
         let b = backing.path();
         let store = Store::open(state.path()).unwrap();
         let m = marker(false);
-        // A new store: a new member starts empty, alone nobody rebuilds.
+        // A new store and an empty directory: a new member; alone nobody
+        // rebuilds; with files of its own a new node brings them in.
+        assert_eq!(
+            cause(None, false, &store, b, true).unwrap(),
+            Some(Cause::NewMember)
+        );
+        assert_eq!(cause(None, false, &store, b, false).unwrap(), None);
+        std::fs::write(b.join("seed"), b"x").unwrap();
         assert_eq!(cause(None, false, &store, b, true).unwrap(), None);
+        std::fs::remove_file(b.join("seed")).unwrap();
         assert_eq!(
             cause(Some(&marker(true)), true, &store, b, false).unwrap(),
             None

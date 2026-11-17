@@ -369,8 +369,9 @@ fn start_cluster(cfg: &Config, backing: &Path) -> anyhow::Result<Cluster> {
         }
     };
     let flush_thread = flusher.start();
-    if cause.is_some() {
-        // Mount with the tree complete if the peers answer in time.
+    if cause.is_some_and(|c| c != rebuild::Cause::NewMember) {
+        // Mount with the tree complete if the peers answer in time (a new
+        // member mounts at once: its peers may not be up yet).
         repl.wait_for_tree(cfg.freshness_timeout.get());
     }
     Ok(Cluster {

@@ -259,7 +259,13 @@ impl Cluster {
                     && p["reachable"] == up.len()
                     && p["quorum"] == quorum
                     && p["cluster_size"] == size
-                    && p["have_quorum"] == (up.len() >= quorum);
+                    && p["have_quorum"] == (up.len() >= quorum)
+                    // Mounts are done rebuilding (tests that watch a
+                    // rebuild slow it down and wait themselves).
+                    && (n.kind != Kind::Mount
+                        || n.env.iter().any(|(k, _)| k == "SYNCFS_TEST_REBUILD_DELAY_MS")
+                        || n.status("replication")
+                            .is_some_and(|r| r["rebuild"]["active"] == false));
                 last.push(format!(
                     "node {}: up {seen:?} have_quorum {}",
                     n.id, p["have_quorum"]
@@ -1319,6 +1325,34 @@ fn crash_window_namespace_changes_are_reconciled() {
     let r = c.node(1).status("replication").unwrap();
     assert_eq!(r["counters"]["reconcile_sent"], 3, "{r:#}");
     assert_eq!(r["counters"]["reconcile_restored"], 1, "{r:#}");
+}
+
+/// A new member (new store, empty backing directory) rebuilds from a peer
+/// instead of starting empty.
+#[test]
+fn new_member_rebuilds_from_peers() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &[]);
+    let m1 = c.node(1).mnt();
+    std::fs::create_dir(m1.join("d")).unwrap();
+    std::fs::write(m1.join("d/x"), b"x\n").unwrap();
+    c.node(2).stop();
+    let dir = c.node(2).dir.clone();
+    for sub in ["backing", "state"] {
+        std::fs::remove_dir_all(dir.join(sub)).unwrap();
+        std::fs::create_dir(dir.join(sub)).unwrap();
+    }
+    std::fs::write(m1.join("later"), b"later\n").unwrap();
+    c.node(2).start();
+    c.converge("new member");
+    let r = c.node(2).status("replication").unwrap();
+    assert_eq!(r["rebuild"]["cause"], "new_member", "{r:#}");
+    let m2 = c.node(2).mnt();
+    assert_eq!(std::fs::read(m2.join("d/x")).unwrap(), b"x\n");
+    assert_eq!(std::fs::read(m2.join("later")).unwrap(), b"later\n");
+    std::fs::write(m2.join("new"), b"n\n").unwrap();
+    wait_same_tree(&c, 1, 2);
 }
 
 /// A node whose disk is lost (backing directory wiped, marker gone)
