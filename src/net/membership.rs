@@ -31,7 +31,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::handshake::{self, HandshakeError, Identity};
-use super::wire::{self, Heartbeat, Message, Welcome, MAX_FRAME_LEN};
+use super::wire::{self, Heartbeat, Message, Role, Welcome, MAX_FRAME_LEN};
 use crate::config::{Config, NodeId};
 use crate::status::{FnProvider, Provider};
 
@@ -81,6 +81,8 @@ pub struct PeerStatus {
     /// The peer's member ids, when they differ from ours (accepted, with a
     /// warning).
     pub members_mismatch: Option<Vec<NodeId>>,
+    /// What the peer stores, from its last handshake.
+    pub role: Option<Role>,
 }
 
 /// Membership at one instant.
@@ -111,9 +113,18 @@ impl Snapshot {
     }
 }
 
+/// To the writer thread: a control message, or "a bulk message is
+/// queued". Control messages (heartbeats, locks) go out before queued bulk
+/// ones (journal entries, blocks), so transfers cannot delay them much.
+enum Out {
+    Msg(Message),
+    Bulk,
+}
+
 struct Conn {
     stream: TcpStream,
-    tx: Sender<Message>,
+    tx: Sender<Out>,
+    bulk: Arc<Mutex<std::collections::VecDeque<Message>>>,
 }
 
 struct PeerInfo {
@@ -126,6 +137,7 @@ struct PeerInfo {
     sees: Vec<NodeId>,
     members_mismatch: Option<Vec<NodeId>>,
     warning: Option<String>,
+    role: Option<Role>,
     session: u64,
     conn: Option<Conn>,
 }
@@ -153,12 +165,14 @@ struct Shared {
     /// Last time each refusal message was logged at warn level.
     logged: Mutex<HashMap<String, Instant>>,
     acceptor: Mutex<Option<std::thread::JoinHandle<()>>>,
-    handler: std::sync::RwLock<Option<Handler>>,
+    handlers: std::sync::RwLock<Vec<(Filter, Handler)>>,
 }
 
-/// Receives every message other than handshake, heartbeat and goodbye.
-/// Runs on the connection's reader thread, so it must not block.
+/// Receives the messages its filter accepts (never handshake, heartbeat
+/// and goodbye). Runs on the connection's reader thread, so it must not
+/// block.
 pub type Handler = Arc<dyn Fn(NodeId, Message) + Send + Sync>;
+pub type Filter = fn(&Message) -> bool;
 
 /// The running membership service. Cheap to clone.
 #[derive(Clone)]
@@ -181,7 +195,14 @@ impl Network {
     /// Binds `cfg.listen` and starts connecting to the peers. A standalone
     /// node (no peers) starts nothing.
     pub fn start(cfg: &Config) -> io::Result<Network> {
-        let me = Identity::from_config(cfg, random_u64());
+        Self::start_with_disk(cfg, 0)
+    }
+
+    /// Like [`start`](Self::start), announcing the backing directory's
+    /// disk id to peers.
+    pub fn start_with_disk(cfg: &Config, disk: u64) -> io::Result<Network> {
+        let mut me = Identity::from_config(cfg, random_u64());
+        me.role.disk = disk;
         let heartbeat = cfg.heartbeat_interval.get();
         let now = Instant::now();
         let slots = cfg
@@ -201,6 +222,7 @@ impl Network {
                     sees: Vec::new(),
                     members_mismatch: None,
                     warning: None,
+                    role: None,
                     session: 0,
                     conn: None,
                 }),
@@ -225,7 +247,7 @@ impl Network {
             changed: Condvar::new(),
             logged: Mutex::new(HashMap::new()),
             acceptor: Mutex::new(None),
-            handler: std::sync::RwLock::new(None),
+            handlers: std::sync::RwLock::new(Vec::new()),
         });
         if shared.slots.is_empty() {
             return Ok(Network {
@@ -263,14 +285,20 @@ impl Network {
         })
     }
 
-    /// Sets the receiver of application messages (locks, later
-    /// replication). Messages arriving before this is set are dropped.
-    pub fn set_handler(&self, h: Handler) {
-        *self
-            .shared
-            .handler
+    /// Adds a receiver for the application messages `filter` accepts (the
+    /// first matching handler gets each message). Messages nobody handles
+    /// are dropped.
+    pub fn add_handler(&self, filter: Filter, h: Handler) {
+        self.shared
+            .handlers
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(h);
+            .unwrap_or_else(|e| e.into_inner())
+            .push((filter, h));
+    }
+
+    /// This node's role as announced to peers.
+    pub fn role(&self) -> Role {
+        self.shared.me.role
     }
 
     /// The members other than this node.
@@ -287,14 +315,41 @@ impl Network {
         self.shared.snapshot()
     }
 
-    /// Sends `msg` to peer `id` if it is connected.
+    /// Sends `msg` to peer `id` if it is connected. Bulk messages
+    /// ([`Message::is_bulk`]) queue behind control messages.
     pub fn send(&self, id: NodeId, msg: Message) -> bool {
         self.shared
             .slots
             .iter()
             .find(|s| s.id == id)
-            .and_then(|s| lock(&s.info).conn.as_ref().map(|c| c.tx.send(msg).is_ok()))
+            .and_then(|s| {
+                lock(&s.info).conn.as_ref().map(|c| {
+                    if msg.is_bulk() {
+                        lock(&c.bulk).push_back(msg);
+                        c.tx.send(Out::Bulk).is_ok()
+                    } else {
+                        c.tx.send(Out::Msg(msg)).is_ok()
+                    }
+                })
+            })
             .unwrap_or(false)
+    }
+
+    /// The current connection's session number for peer `id` (changes on
+    /// every reconnect; 0 when not connected).
+    pub fn session_of(&self, id: NodeId) -> u64 {
+        self.shared
+            .slots
+            .iter()
+            .find(|s| s.id == id)
+            .map_or(0, |s| {
+                let i = lock(&s.info);
+                if i.conn.is_some() {
+                    i.session
+                } else {
+                    0
+                }
+            })
     }
 
     /// Waits until `pred` holds for a snapshot or `timeout` passes.
@@ -336,9 +391,9 @@ impl Network {
         }
         for s in &sh.slots {
             if let Some(c) = &lock(&s.info).conn {
-                let _ = c.tx.send(Message::Goodbye {
+                let _ = c.tx.send(Out::Msg(Message::Goodbye {
                     reason: "shutting down".into(),
-                });
+                }));
             }
         }
         // Give the writers a moment to flush the goodbyes.
@@ -434,6 +489,7 @@ impl Shared {
                     last_error: i.last_error.clone(),
                     sees: i.sees.clone(),
                     members_mismatch: i.members_mismatch.clone(),
+                    role: i.role,
                 }
             })
             .collect();
@@ -463,6 +519,7 @@ impl Shared {
             last_error: None,
             sees,
             members_mismatch: None,
+            role: Some(self.me.role),
         });
         peers.sort_by_key(|p| p.id);
         let reachable = up + 1;
@@ -548,7 +605,14 @@ fn accept_one(sh: Arc<Shared>, mut stream: TcpStream) {
             let Some(slot) = sh.slots.iter().find(|s| s.id == hello.node_id) else {
                 return; // check_hello guarantees membership
             };
-            run_session(&sh, slot, stream, hello.incarnation, &hello.members);
+            run_session(
+                &sh,
+                slot,
+                stream,
+                hello.incarnation,
+                &hello.members,
+                hello.role,
+            );
         }
         Err(HandshakeError::Refused(r)) => {
             sh.warn_limited(format!(
@@ -599,7 +663,7 @@ fn dial_loop(sh: Arc<Shared>, index: usize) {
         match connect(&sh, slot) {
             Ok((stream, w)) => {
                 backoff = initial;
-                run_session(&sh, slot, stream, w.incarnation, &w.members);
+                run_session(&sh, slot, stream, w.incarnation, &w.members, w.role);
             }
             Err(e) => {
                 let state = match e {
@@ -649,6 +713,7 @@ fn run_session(
     stream: TcpStream,
     incarnation: u64,
     members: &[NodeId],
+    role: Role,
 ) {
     let warning = sh.me.membership_warning(slot.id, members);
     if let Some(w) = &warning {
@@ -661,6 +726,8 @@ fn run_session(
     let _ = stream.set_read_timeout(Some(sh.down_after));
     let _ = writer.set_write_timeout(Some(sh.down_after));
     let (tx, rx) = mpsc::channel();
+    let bulk = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let wbulk = Arc::clone(&bulk);
     {
         let mut i = lock(&slot.info);
         if let Some(old) = i.conn.take() {
@@ -682,8 +749,13 @@ fn run_session(
             m
         });
         i.warning = warning;
+        i.role = Some(role);
         i.session = session;
-        i.conn = Some(Conn { stream: handle, tx });
+        i.conn = Some(Conn {
+            stream: handle,
+            tx,
+            bulk: Arc::clone(&bulk),
+        });
     }
     sh.notify();
     log::info!("node {} at {} is up", slot.id, slot.address);
@@ -692,7 +764,7 @@ fn run_session(
     let spawned = std::thread::Builder::new()
         .stack_size(NET_THREAD_STACK)
         .name(format!("syncfs-tx-{}", slot.id))
-        .spawn(move || write_loop(&wsh, writer, &rx));
+        .spawn(move || write_loop(&wsh, writer, &rx, &wbulk));
     let reason = if spawned.is_err() {
         "cannot start writer thread".to_string()
     } else {
@@ -736,7 +808,13 @@ fn read_loop(sh: &Shared, slot: &Slot, mut stream: &TcpStream) -> String {
             }
             other => {
                 drop(i);
-                let h = sh.handler.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let h = sh
+                    .handlers
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|(f, _)| f(&other))
+                    .map(|(_, h)| Arc::clone(h));
                 match h {
                     Some(h) => h(slot.id, other),
                     None => log::debug!("node {}: dropping {} (no handler)", slot.id, other.kind()),
@@ -746,24 +824,51 @@ fn read_loop(sh: &Shared, slot: &Slot, mut stream: &TcpStream) -> String {
     }
 }
 
-fn write_loop(sh: &Shared, mut stream: TcpStream, rx: &mpsc::Receiver<Message>) {
+fn write_loop(
+    sh: &Shared,
+    mut stream: TcpStream,
+    rx: &mpsc::Receiver<Out>,
+    bulk: &Mutex<std::collections::VecDeque<Message>>,
+) {
     let mut seq = 0u64;
     let mut next_beat = Instant::now();
+    // Bulk messages announced but not sent yet.
+    let mut queued = 0usize;
     loop {
         let now = Instant::now();
-        let msg = if now >= next_beat {
+        let out = if now >= next_beat {
             next_beat = now + sh.heartbeat;
             seq += 1;
-            Message::Heartbeat(Heartbeat {
+            Out::Msg(Message::Heartbeat(Heartbeat {
                 seq,
                 up: sh.up_ids(),
-            })
+            }))
+        } else if queued > 0 {
+            // Control messages first, then one bulk message.
+            match rx.try_recv() {
+                Ok(o) => o,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    queued -= 1;
+                    match lock(bulk).pop_front() {
+                        Some(m) => Out::Msg(m),
+                        None => continue,
+                    }
+                }
+            }
         } else {
             match rx.recv_timeout(next_beat - now) {
-                Ok(m) => m,
+                Ok(o) => o,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        };
+        let msg = match out {
+            Out::Bulk => {
+                queued += 1;
+                continue;
+            }
+            Out::Msg(m) => m,
         };
         let bye = matches!(msg, Message::Goodbye { .. });
         if wire::write_frame(&mut stream, &msg).is_err() || bye {

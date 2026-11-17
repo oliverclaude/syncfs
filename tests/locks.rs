@@ -388,3 +388,62 @@ fn randomized_stress() {
     assert_eq!(done.load(Ordering::SeqCst), 5 * 3 * 15);
     shutdown(&nodes);
 }
+
+#[test]
+fn grants_carry_versions_and_sessions_announce_theirs() {
+    use syncfs::lock::FileCtx;
+    use syncfs::net::wire::FileId;
+    let nodes = cluster(3, "2s");
+    let f = FileId([7; 16]);
+    let ctx = |local| Some(FileCtx { file: f, local });
+    // First session on node 1: nothing known, version 1 announced.
+    let a = nodes[0]
+        .locks
+        .acquire_file(&k("f"), ctx(None), false)
+        .unwrap();
+    assert!(a.new_session);
+    let v1 = a.version.unwrap();
+    assert_eq!((v1.seq, v1.node), (1, 1));
+    // A second reference continues the session.
+    let again = nodes[0]
+        .locks
+        .acquire_file(&k("f"), ctx(None), false)
+        .unwrap();
+    assert!(!again.new_session);
+    assert_eq!(again.version, Some(v1));
+    nodes[0].locks.release(&k("f"));
+    assert_eq!(nodes[0].locks.mark_written(&k("f")), Some((f, v1)));
+    nodes[0].locks.release(&k("f"));
+
+    // Node 2's grants report node 1's written version with node 1 as the
+    // holder; node 2 announces version 2.
+    let b = common::wait_for("node 2 acquires", || {
+        nodes[1].locks.acquire_file(&k("f"), ctx(None), false).ok()
+    });
+    let latest: Vec<_> = b.known.iter().filter_map(|i| i.latest).collect();
+    assert!(
+        latest.len() >= 2 && latest.iter().all(|v| *v == v1),
+        "{:?}",
+        b.known
+    );
+    assert!(b.known.iter().all(|i| !i.pending && i.holders == [1]));
+    let v2 = b.version.unwrap();
+    assert_eq!((v2.seq, v2.node), (2, 2));
+    // Node 2 writes nothing: its version is withdrawn on release.
+    nodes[1].locks.release(&k("f"));
+    // (Releases reach the voters asynchronously.)
+    let c = common::wait_for("node 3 sees the withdrawal", || {
+        let c = nodes[2]
+            .locks
+            .acquire_file(&k("f"), ctx(Some(v1)), false)
+            .ok()?;
+        if c.known.iter().all(|i| i.latest == Some(v1)) {
+            return Some(c);
+        }
+        nodes[2].locks.release(&k("f"));
+        None
+    });
+    assert_eq!(c.version.unwrap().seq, 2);
+    nodes[2].locks.release(&k("f"));
+    shutdown(&nodes);
+}

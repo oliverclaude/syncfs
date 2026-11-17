@@ -228,6 +228,7 @@ fn hello(node_id: NodeId) -> Hello {
         members: vec![1, 2, 3],
         incarnation: 42,
         software: "raw".into(),
+        role: syncfs::net::wire::Role::default(),
     }
 }
 

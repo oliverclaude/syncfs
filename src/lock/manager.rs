@@ -11,8 +11,9 @@ use fuser::Errno;
 use serde_json::json;
 
 use crate::config::{Config, NodeId};
-use crate::net::wire::{Ballot, DenyReason, Message};
+use crate::net::wire::{Ballot, DenyReason, FileId, Message, Outcome, Version, VersionInfo};
 use crate::net::{Network, PeerState};
+use crate::repl::version::{self, VersionTable};
 use crate::status::{FnProvider, Provider};
 
 use super::attempt::{Attempt, Phase, Step};
@@ -28,6 +29,8 @@ pub struct Settings {
     pub lease: Duration,
     pub wait: Duration,
     pub heartbeat: Duration,
+    /// This node's disk id, stamped into the versions it makes.
+    pub disk: u64,
 }
 
 impl Settings {
@@ -43,6 +46,7 @@ impl Settings {
             lease: cfg.lock_lease_timeout.get(),
             wait: cfg.lock_wait.get(),
             heartbeat: cfg.heartbeat_interval.get(),
+            disk: 0,
         }
     }
 
@@ -96,8 +100,33 @@ struct Renewal {
     acks: BTreeSet<NodeId>,
 }
 
+/// The file a lock is for, so that it takes part in versioning.
+#[derive(Clone, Copy, Debug)]
+pub struct FileCtx {
+    pub file: FileId,
+    /// The local copy's version.
+    pub local: Option<Version>,
+}
+
+/// What acquiring a lock on a file found out.
+#[derive(Clone, Debug, Default)]
+pub struct Acquired {
+    /// The granting voters' entries for the file.
+    pub known: Vec<VersionInfo>,
+    /// The version this session writes (announced to the voters unless
+    /// the lock was already held without a file).
+    pub version: Option<Version>,
+    /// A new lock session (as opposed to another reference to a held
+    /// lock): the caller must check freshness.
+    pub new_session: bool,
+}
+
 struct Held {
     ballot: Ballot,
+    file: Option<FileId>,
+    version: Option<Version>,
+    written: bool,
+    known: Vec<VersionInfo>,
     /// The attempt that acquired it: grants arriving after the quorum get
     /// a confirm too, so every reachable voter carries the lease.
     req: u64,
@@ -112,6 +141,11 @@ struct Pending {
     key: Key,
     attempt: Attempt,
     confirm_sent: Option<Instant>,
+    file: Option<FileCtx>,
+    /// Versions reported by granting voters.
+    known: Vec<VersionInfo>,
+    /// Version announced with the confirms; preset when re-acquiring.
+    announce: Option<Version>,
 }
 
 #[derive(Default, serde::Serialize)]
@@ -171,6 +205,7 @@ impl State {
 struct Inner {
     s: Settings,
     net: Network,
+    versions: Arc<Mutex<VersionTable>>,
     epoch: Instant,
     st: Mutex<State>,
     cv: Condvar,
@@ -197,9 +232,11 @@ impl LockManager {
             lease_ms,
             s.provisional_ttl().as_millis() as u64,
         );
+        let versions = Arc::new(Mutex::new(VersionTable::new(s.quorum())));
         let inner = Arc::new(Inner {
             s,
             net: net.clone(),
+            versions,
             epoch,
             st: Mutex::new(State {
                 clock: 0,
@@ -220,11 +257,14 @@ impl LockManager {
             renewer: Mutex::new(None),
         });
         let weak: Weak<Inner> = Arc::downgrade(&inner);
-        net.set_handler(Arc::new(move |from, msg| {
-            if let Some(inner) = weak.upgrade() {
-                inner.receive(from, msg);
-            }
-        }));
+        net.add_handler(
+            Message::is_lock,
+            Arc::new(move |from, msg| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.receive(from, msg);
+                }
+            }),
+        );
         let weak = Arc::downgrade(&inner);
         let h = std::thread::Builder::new()
             .name("syncfs-locks".into())
@@ -249,7 +289,48 @@ impl LockManager {
     /// Takes (another reference to) the write lock on `key`, waiting up to
     /// `lock_wait` while another node holds a conflicting lock.
     pub fn acquire(&self, key: &Key) -> Result<(), LockError> {
-        self.inner.acquire(key, true, false)
+        self.inner.acquire(key, true, false, None).map(|_| ())
+    }
+
+    /// [`acquire`](Self::acquire) for a file that takes part in versioning:
+    /// a new session announces the version it will write.
+    pub fn acquire_file(
+        &self,
+        key: &Key,
+        file: Option<FileCtx>,
+        fail_on_held: bool,
+    ) -> Result<Acquired, LockError> {
+        self.inner.acquire(key, true, fail_on_held, file)
+    }
+
+    /// The session on `key` changed its file: its version is written.
+    pub fn mark_written(&self, key: &Key) -> Option<(FileId, Version)> {
+        let mut st = lock(&self.inner.st);
+        let h = st.held.get_mut(key)?;
+        h.written = true;
+        Some((h.file?, h.version?))
+    }
+
+    /// The version the session on `key` writes.
+    pub fn session(&self, key: &Key) -> Option<(FileId, Version)> {
+        let st = lock(&self.inner.st);
+        let h = st.held.get(key)?;
+        Some((h.file?, h.version?))
+    }
+
+    /// This node's voter table of file versions.
+    pub fn versions(&self) -> Arc<Mutex<VersionTable>> {
+        Arc::clone(&self.inner.versions)
+    }
+
+    /// Sends `msg` to every member (this node included).
+    pub fn broadcast_versions(&self, msg: Message) {
+        let mut st = lock(&self.inner.st);
+        let mut q = Queue::new();
+        self.inner.broadcast(&mut q, |_| msg.clone());
+        let out = self.inner.pump(&mut st, q);
+        drop(st);
+        self.inner.send(out);
     }
 
     /// Like [`acquire`](Self::acquire), but fails with `Busy` at once,
@@ -257,13 +338,13 @@ impl LockManager {
     /// rename). Transient conflicts (competing attempts) are still retried
     /// within `lock_wait`.
     pub fn acquire_unless_held(&self, key: &Key) -> Result<(), LockError> {
-        self.inner.acquire(key, true, true)
+        self.inner.acquire(key, true, true, None).map(|_| ())
     }
 
     /// Ok if this node holds `key` with a valid lease, re-acquiring it
     /// (without taking a reference) if it lapsed or is not held.
     pub fn ensure(&self, key: &Key) -> Result<(), LockError> {
-        self.inner.acquire(key, false, false)
+        self.inner.acquire(key, false, false, None).map(|_| ())
     }
 
     /// Drops one reference; the last one releases the lock everywhere.
@@ -288,13 +369,18 @@ impl LockManager {
             let _ = h.join();
         }
         let mut st = lock(&inner.st);
-        let keys: Vec<(Key, Ballot)> = st.held.iter().map(|(k, h)| (k.clone(), h.ballot)).collect();
+        let keys: Vec<(Key, Ballot, Option<Outcome>)> = st
+            .held
+            .iter()
+            .map(|(k, h)| (k.clone(), h.ballot, h.outcome()))
+            .collect();
         st.held.clear();
         let mut q = Queue::new();
-        for (k, b) in keys {
+        for (k, b, outcome) in keys {
             inner.broadcast(&mut q, |_| Message::LockRelease {
                 key: k.as_bytes().to_vec(),
                 ballot: b,
+                outcome,
             });
         }
         let out = inner.pump(&mut st, q);
@@ -308,6 +394,16 @@ impl LockManager {
             Some(inner) => inner.render(),
             None => json!({"implemented": true, "running": false}),
         }))
+    }
+}
+
+impl Held {
+    fn outcome(&self) -> Option<Outcome> {
+        Some(Outcome {
+            file: self.file?,
+            version: self.version?,
+            written: self.written,
+        })
     }
 }
 
@@ -386,7 +482,12 @@ impl Inner {
         let now = self.now_ms();
         match msg {
             // Voter side.
-            Message::LockRequest { req, key, ballot } => {
+            Message::LockRequest {
+                req,
+                key,
+                ballot,
+                file,
+            } => {
                 st.observe(ballot);
                 let (r, pre) = st.voter.request(now, from, req, &Key::new(&key), ballot);
                 match r {
@@ -409,13 +510,22 @@ impl Inner {
                         },
                     ));
                 }
-                self.reply(q, from, req, ballot, r, Message::LockGrant { req, ballot });
+                let known = file.and_then(|f| lock(&self.versions).get(&f).cloned());
+                self.reply(
+                    q,
+                    from,
+                    req,
+                    ballot,
+                    r,
+                    Message::LockGrant { req, ballot, known },
+                );
             }
             Message::LockConfirm {
                 req,
                 key,
                 ballot,
                 lease_ms,
+                version,
             } => {
                 st.observe(ballot);
                 let r = if lease_ms > self.lease_ms() {
@@ -428,6 +538,9 @@ impl Inner {
                     st.voter
                         .confirm(now, from, &Key::new(&key), ballot, lease_ms)
                 };
+                if let (Reply::Grant, Some((file, v))) = (r, version) {
+                    lock(&self.versions).on_confirm(file, v);
+                }
                 self.reply(
                     q,
                     from,
@@ -458,18 +571,30 @@ impl Inner {
                     Message::LockRenewed { req, ballot },
                 );
             }
-            Message::LockRelease { key, ballot } => {
+            Message::LockRelease {
+                key,
+                ballot,
+                outcome,
+            } => {
                 st.observe(ballot);
                 st.voter.release(from, &Key::new(&key), ballot);
+                if let Some(o) = outcome.filter(|o| o.version.node == from) {
+                    lock(&self.versions).on_release(o);
+                }
             }
+            Message::VersionHolders {
+                file,
+                version,
+                holders,
+            } => lock(&self.versions).on_holders(file, version, &holders),
             // Requester side.
-            Message::LockGrant { req, ballot } => {
+            Message::LockGrant { req, ballot, known } => {
                 let Some(p) = st.pending.get_mut(&req) else {
                     let late = st
                         .held
                         .iter()
                         .find(|(_, h)| h.req == req && h.ballot == ballot);
-                    if let Some((key, _)) = late {
+                    if let Some((key, h)) = late {
                         q.push_back((
                             self.s.me,
                             from,
@@ -478,11 +603,15 @@ impl Inner {
                                 key: key.as_bytes().to_vec(),
                                 ballot,
                                 lease_ms: self.lease_ms(),
+                                version: h.file.zip(h.version),
                             },
                         ));
                     }
                     return;
                 };
+                if let Some(k) = known {
+                    p.known.push(k);
+                }
                 let step = p.attempt.on_grant(from);
                 self.step(st, req, step, q);
             }
@@ -557,9 +686,14 @@ impl Inner {
         let Step::Confirm(to) = step else {
             return;
         };
+        let (me, disk) = (self.s.me, self.s.disk);
         let p = st.pending.get_mut(&req).expect("pending attempt");
         // Leases start no earlier than this at any voter.
         p.confirm_sent.get_or_insert_with(Instant::now);
+        if let (None, Some(ctx)) = (p.announce, p.file) {
+            p.announce = Some(version::next(ctx.local, &p.known, me, disk));
+        }
+        let version = p.file.map(|c| c.file).zip(p.announce);
         for n in to {
             q.push_back((
                 self.s.me,
@@ -569,6 +703,7 @@ impl Inner {
                     key: p.key.as_bytes().to_vec(),
                     ballot: p.attempt.ballot,
                     lease_ms: self.lease_ms(),
+                    version,
                 },
             ));
         }
@@ -578,9 +713,17 @@ impl Inner {
         self.net.snapshot().have_quorum
     }
 
-    fn acquire(&self, key: &Key, add_ref: bool, fail_on_held: bool) -> Result<(), LockError> {
+    fn acquire(
+        &self,
+        key: &Key,
+        add_ref: bool,
+        fail_on_held: bool,
+        mut file: Option<FileCtx>,
+    ) -> Result<Acquired, LockError> {
         let deadline = Instant::now() + self.s.wait;
         let mut st = lock(&self.st);
+        // Re-acquiring a lapsed lock continues its session and version.
+        let mut reuse = None;
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Err(LockError::Shutdown);
@@ -589,12 +732,30 @@ impl Inner {
                 st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                 continue;
             }
+            let (me, disk) = (self.s.me, self.s.disk);
             if let Some(h) = st.held.get_mut(key) {
                 if h.valid_until > Instant::now() {
                     if add_ref {
                         h.refs += 1;
                     }
-                    return Ok(());
+                    if let (None, Some(ctx)) = (h.file, file) {
+                        // Held without a file so far (e.g. it was just
+                        // created): the session's version goes unannounced.
+                        h.file = Some(ctx.file);
+                        h.version = Some(version::next(ctx.local, &h.known, me, disk));
+                    }
+                    return Ok(Acquired {
+                        known: h.known.clone(),
+                        version: h.version,
+                        new_session: false,
+                    });
+                }
+                if let (Some(f), v) = (h.file, h.version) {
+                    file = Some(FileCtx {
+                        file: f,
+                        local: file.and_then(|c| c.local),
+                    });
+                    reuse = v;
                 }
             }
             break;
@@ -605,14 +766,25 @@ impl Inner {
             node: self.s.me,
         };
         st.acquiring.insert(key.clone());
-        let (mut st, res) = self.attempts(st, key, ballot, deadline, fail_on_held);
+        let (mut st, res) = self.attempts(st, key, ballot, deadline, fail_on_held, file, reuse);
         st.acquiring.remove(key);
-        match res {
-            Ok((req, valid_until)) => {
+        let mut acquired = Acquired::default();
+        match &res {
+            Ok((req, valid_until, known, announced)) => {
+                let (req, valid_until) = (*req, *valid_until);
                 st.counters.acquired += 1;
                 st.acquired_since_boot = true;
+                acquired = Acquired {
+                    known: known.clone(),
+                    version: *announced,
+                    new_session: reuse.is_none(),
+                };
                 let h = st.held.entry(key.clone()).or_insert(Held {
                     ballot,
+                    file: file.map(|c| c.file),
+                    version: *announced,
+                    written: false,
+                    known: known.clone(),
                     req,
                     refs: 0,
                     valid_until,
@@ -636,7 +808,7 @@ impl Inner {
                     drop(st);
                     self.cv.notify_all();
                     self.send(out);
-                    return Ok(());
+                    return Ok(acquired);
                 }
             }
             Err(LockError::Busy(_)) => st.counters.busy += 1,
@@ -644,12 +816,13 @@ impl Inner {
         }
         drop(st);
         self.cv.notify_all();
-        res.map(|_| ())
+        res.map(|_| acquired)
     }
 
     /// Runs attempts with one ballot until one succeeds or the deadline
-    /// passes. Returns the successful request and until when the lock is
-    /// valid.
+    /// passes. Returns the successful request, until when the lock is
+    /// valid, the voters' version entries and the announced version.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn attempts<'a>(
         &'a self,
         mut st: MutexGuard<'a, State>,
@@ -657,7 +830,12 @@ impl Inner {
         ballot: Ballot,
         deadline: Instant,
         fail_on_held: bool,
-    ) -> (MutexGuard<'a, State>, Result<(u64, Instant), LockError>) {
+        file: Option<FileCtx>,
+        reuse: Option<Version>,
+    ) -> (
+        MutexGuard<'a, State>,
+        Result<(u64, Instant, Vec<VersionInfo>, Option<Version>), LockError>,
+    ) {
         let mut backoff = Duration::from_millis(20);
         loop {
             if self.stop.load(Ordering::SeqCst) {
@@ -680,6 +858,9 @@ impl Inner {
                     key: key.clone(),
                     attempt,
                     confirm_sent: None,
+                    file,
+                    known: Vec::new(),
+                    announce: reuse,
                 },
             );
             let mut q = Queue::new();
@@ -687,6 +868,7 @@ impl Inner {
                 req,
                 key: key.as_bytes().to_vec(),
                 ballot,
+                file: file.map(|c| c.file),
             });
             let out = self.pump(&mut st, q);
             drop(st);
@@ -724,13 +906,21 @@ impl Inner {
             if p.attempt.phase == Phase::Acquired {
                 let sent = p.confirm_sent.expect("confirmed attempts sent confirms");
                 let valid = sent + self.s.lease.saturating_sub(self.s.margin());
-                return (st, Ok((req, valid)));
+                return (st, Ok((req, valid, p.known, p.announce)));
             }
-            // Withdraw every vote this attempt may have got.
+            // Withdraw every vote this attempt may have got (and the
+            // announced version, if confirms went out).
+            let outcome = file.zip(p.announce).map(|(c, v)| Outcome {
+                file: c.file,
+                version: v,
+                written: false,
+            });
+            let outcome = outcome.filter(|_| reuse.is_none());
             let mut q = Queue::new();
             self.broadcast(&mut q, |_| Message::LockRelease {
                 key: key.as_bytes().to_vec(),
                 ballot,
+                outcome,
             });
             let out = self.pump(&mut st, q);
             drop(st);
@@ -760,9 +950,11 @@ impl Inner {
             return Vec::new();
         };
         let mut q = Queue::new();
+        let outcome = h.outcome();
         self.broadcast(&mut q, |_| Message::LockRelease {
             key: key.as_bytes().to_vec(),
             ballot: h.ballot,
+            outcome,
         });
         self.pump(st, q)
     }

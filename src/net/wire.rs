@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::config::NodeId;
 
 pub const MAGIC: [u8; 6] = *b"SYNCFS";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const PREAMBLE_LEN: usize = 8;
 /// Largest payload: a 16 MiB block (the largest `block_size`) plus headroom.
 pub const MAX_FRAME_LEN: u32 = 32 << 20;
@@ -154,13 +154,15 @@ impl FrameDecoder {
     }
 }
 
-/// Everything nodes say to each other. The handshake, heartbeats,
-/// `Goodbye` and the lock messages are used so far; the rest is the planned
-/// vocabulary of later steps, which may still change their fields (bumping
-/// the version).
+/// Everything nodes say to each other. `CatchUp*` is the planned
+/// vocabulary of step 8 and may still change (bumping the version).
 ///
 /// Lock messages: `key` is the path relative to the mount root; `req`
 /// identifies one attempt of the requesting node, and replies echo it.
+/// They also carry file versions (see `crate::repl::version`): the request
+/// names the file, grants say what the voter knows about its versions,
+/// the confirm announces the version the holder's session will write, and
+/// the release says whether it did.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub enum Message {
@@ -183,11 +185,15 @@ pub enum Message {
         req: u64,
         key: Vec<u8>,
         ballot: Ballot,
+        /// The file at `key`, if it exists on the requester.
+        file: Option<FileId>,
     },
     /// Phase 1 reply: provisional grant.
     LockGrant {
         req: u64,
         ballot: Ballot,
+        /// What this voter knows about the requested file's versions.
+        known: Option<VersionInfo>,
     },
     /// Refusal of a request, confirmation or renewal; also sent unasked
     /// when an older ballot preempts a provisional grant.
@@ -203,6 +209,8 @@ pub enum Message {
         key: Vec<u8>,
         ballot: Ballot,
         lease_ms: u64,
+        /// The version this lock session will write, if it writes.
+        version: Option<(FileId, Version)>,
     },
     /// Phase 2 reply: the lease started when the voter received the confirm.
     LockConfirmed {
@@ -224,36 +232,71 @@ pub enum Message {
     LockRelease {
         key: Vec<u8>,
         ballot: Ballot,
+        /// Whether the announced version was written.
+        outcome: Option<Outcome>,
     },
 
-    // Step 7: asynchronous replication.
+    // Asynchronous replication (see `crate::repl`).
+    /// One entry of `origin`'s metadata journal. `deps` are the journal
+    /// positions of other origins the sender had applied when it made the
+    /// entry; receivers apply it only after those.
     JournalEntry {
         origin: NodeId,
         seq: u64,
-        entry: Vec<u8>,
+        deps: Vec<(NodeId, u64)>,
+        entry: Entry,
     },
+    /// Everything of `origin`'s journal up to `seq` is applied and durable.
     JournalAck {
         origin: NodeId,
         seq: u64,
     },
+    /// Asks for blocks of `file`: the ones this node is missing according
+    /// to the sender's dirty bitmap (`blocks: None`), or the listed ranges.
     BlockPull {
         req: u64,
-        path: Vec<u8>,
-        version: u64,
-        blocks: Vec<u64>,
+        file: FileId,
+        blocks: Option<Vec<(u64, u64)>>,
     },
+    /// One block (shorter at the end of the file; empty past it).
     BlockData {
         req: u64,
-        path: Vec<u8>,
-        version: u64,
         block: u64,
+        hash: BlockHash,
         data: Vec<u8>,
     },
-    BlockPush {
-        path: Vec<u8>,
-        version: u64,
-        block: u64,
-        data: Vec<u8>,
+    /// End of the answer to a `BlockPull`. `more`: dirty blocks are left,
+    /// pull again.
+    BlockDone {
+        req: u64,
+        found: bool,
+        size: u64,
+        version: Option<Version>,
+        more: bool,
+    },
+    /// Asks for the block hashes of `file` from block `from` on.
+    HashRequest {
+        req: u64,
+        file: FileId,
+        from: u64,
+        block_size: u64,
+    },
+    HashReply {
+        req: u64,
+        found: bool,
+        version: Option<Version>,
+        size: u64,
+        attrs: Attrs,
+        from: u64,
+        hashes: Vec<BlockHash>,
+        /// More hashes follow (ask again from `from + hashes.len()`).
+        more: bool,
+    },
+    /// The nodes known to hold `version` of `file` completely.
+    VersionHolders {
+        file: FileId,
+        version: Version,
+        holders: Vec<NodeId>,
     },
 
     // Step 8: rejoin.
@@ -279,6 +322,32 @@ pub enum Message {
 }
 
 impl Message {
+    /// Lock and version messages (handled by `crate::lock`).
+    pub fn is_lock(&self) -> bool {
+        matches!(
+            self,
+            Message::LockRequest { .. }
+                | Message::LockGrant { .. }
+                | Message::LockDeny { .. }
+                | Message::LockConfirm { .. }
+                | Message::LockConfirmed { .. }
+                | Message::LockRenew { .. }
+                | Message::LockRenewed { .. }
+                | Message::LockRelease { .. }
+                | Message::LockFreshQuery { .. }
+                | Message::LockFreshReply { .. }
+                | Message::VersionHolders { .. }
+        )
+    }
+
+    /// Large or numerous messages that queue behind control messages.
+    pub fn is_bulk(&self) -> bool {
+        matches!(
+            self,
+            Message::JournalEntry { .. } | Message::BlockData { .. } | Message::HashReply { .. }
+        )
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Message::Hello(_) => "hello",
@@ -298,7 +367,10 @@ impl Message {
             Message::JournalAck { .. } => "journal-ack",
             Message::BlockPull { .. } => "block-pull",
             Message::BlockData { .. } => "block-data",
-            Message::BlockPush { .. } => "block-push",
+            Message::BlockDone { .. } => "block-done",
+            Message::HashRequest { .. } => "hash-request",
+            Message::HashReply { .. } => "hash-reply",
+            Message::VersionHolders { .. } => "version-holders",
             Message::CatchUpRequest { .. } => "catch-up-request",
             Message::CatchUpDone { .. } => "catch-up-done",
             Message::LockFreshQuery { .. } => "lock-fresh-query",
@@ -318,6 +390,7 @@ pub struct Hello {
     pub incarnation: u64,
     /// `CARGO_PKG_VERSION` of the sender, for diagnostics.
     pub software: String,
+    pub role: Role,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +401,7 @@ pub struct Welcome {
     pub software: String,
     /// Sorted ids of the acceptor's members, so the dialer can compare too.
     pub members: Vec<NodeId>,
+    pub role: Role,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +426,147 @@ pub enum RejectReason {
     SameNodeId,
     /// Only the lower node id dials; a higher one dialed.
     WrongDirection,
+}
+
+/// What a node stores.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Role {
+    /// Has a backing directory (a mount), as opposed to a voter-only
+    /// daemon.
+    pub data: bool,
+    /// Identity of the backing directory's disk (0 for daemons).
+    pub disk: u64,
+}
+
+/// Cluster-wide identity of a file, directory or other node, kept across
+/// renames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct FileId(pub [u8; 16]);
+
+impl std::fmt::Display for FileId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in &self.0[..8] {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// BLAKE3 of a block, truncated.
+pub type BlockHash = [u8; 16];
+
+/// One version of a file's contents and attributes. Ordered by `seq`, then
+/// `node`. See `crate::repl::version` for how versions are made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Version {
+    pub seq: u64,
+    pub node: NodeId,
+    /// The writer's disk id.
+    pub disk: u64,
+}
+
+/// What a voter knows about one file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct VersionInfo {
+    /// Newest version announced; `pending` while its writer's session may
+    /// still be writing it (or ended without saying).
+    pub latest: Option<Version>,
+    pub pending: bool,
+    /// Nodes known to hold `latest` completely.
+    pub holders: Vec<NodeId>,
+    /// Newest version known to be on a quorum of nodes, and those nodes.
+    pub committed: Option<Version>,
+    pub committed_holders: Vec<NodeId>,
+}
+
+/// End of a lock session, for the version table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Outcome {
+    pub file: FileId,
+    pub version: Version,
+    pub written: bool,
+}
+
+/// Attributes carried by journal entries and hash replies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub struct Attrs {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: (i64, u32),
+    pub atime: (i64, u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum NodeKind {
+    File,
+    Dir,
+    Symlink,
+    Fifo,
+    Socket,
+    CharDevice,
+    BlockDevice,
+}
+
+/// One change in a metadata journal. Paths are relative to the mount
+/// root, as the origin saw them when it made the change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum Entry {
+    Create {
+        id: FileId,
+        path: Vec<u8>,
+        kind: NodeKind,
+        attrs: Attrs,
+        rdev: u64,
+        /// Symlink target.
+        target: Vec<u8>,
+    },
+    /// New hard link `path` to the file at `existing`.
+    Link {
+        id: FileId,
+        existing: Vec<u8>,
+        path: Vec<u8>,
+    },
+    Remove {
+        id: Option<FileId>,
+        path: Vec<u8>,
+        dir: bool,
+    },
+    Rename {
+        id: Option<FileId>,
+        from: Vec<u8>,
+        to: Vec<u8>,
+        flags: u32,
+    },
+    /// Mode, owner and times after a change.
+    Attr {
+        id: FileId,
+        path: Vec<u8>,
+        version: Version,
+        attrs: Attrs,
+    },
+    Xattr {
+        id: FileId,
+        path: Vec<u8>,
+        name: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    /// Contents changed: pull the dirty blocks from the origin.
+    Data {
+        id: FileId,
+        path: Vec<u8>,
+        version: Version,
+        size: u64,
+        attrs: Attrs,
+    },
 }
 
 /// Orders lock attempts: lower is older and wins conflicts. `counter` is a
@@ -407,6 +622,7 @@ mod tests {
             members: vec![1, 2, 3],
             incarnation: 0xdead_beef,
             software: "0.1.0".into(),
+            role: Role::default(),
         })
     }
 

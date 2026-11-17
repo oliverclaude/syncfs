@@ -204,3 +204,19 @@ pub fn listen_ports(n: usize) -> Vec<u16> {
     }
     out
 }
+
+/// Retries `f` until it returns `Some`, for up to 10 s.
+#[allow(dead_code)]
+pub fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

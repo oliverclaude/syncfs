@@ -10,7 +10,7 @@ pub mod voter;
 pub use key::Key;
 pub mod manager;
 
-pub use manager::{LockError, LockManager, Settings};
+pub use manager::{Acquired, FileCtx, LockError, LockManager, Settings};
 pub mod hooks;
 
 pub use hooks::ClusterHooks;

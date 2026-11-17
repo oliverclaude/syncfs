@@ -12,7 +12,7 @@ use std::net::TcpStream;
 use thiserror::Error;
 
 use super::wire::{
-    self, Hello, Message, Reject, RejectReason, Welcome, WireError, HANDSHAKE_MAX_FRAME_LEN,
+    self, Hello, Message, Reject, RejectReason, Role, Welcome, WireError, HANDSHAKE_MAX_FRAME_LEN,
     PREAMBLE_LEN, PROTOCOL_VERSION,
 };
 use crate::config::{Config, NodeId};
@@ -25,6 +25,7 @@ pub struct Identity {
     /// Sorted ids of all members, this node included.
     pub members: Vec<NodeId>,
     pub incarnation: u64,
+    pub role: Role,
 }
 
 impl Identity {
@@ -40,6 +41,10 @@ impl Identity {
             cluster_name: cfg.cluster_name.clone(),
             members,
             incarnation,
+            role: Role {
+                data: cfg.mode == crate::config::Mode::Mount,
+                disk: 0,
+            },
         }
     }
 
@@ -50,6 +55,7 @@ impl Identity {
             members: self.members.clone(),
             incarnation: self.incarnation,
             software: env!("CARGO_PKG_VERSION").into(),
+            role: self.role,
         }
     }
 
@@ -59,6 +65,7 @@ impl Identity {
             incarnation: self.incarnation,
             software: env!("CARGO_PKG_VERSION").into(),
             members: self.members.clone(),
+            role: self.role,
         }
     }
 
@@ -204,6 +211,7 @@ mod tests {
             cluster_name: "c".into(),
             members: vec![1, 2, 3],
             incarnation: 1,
+            role: Role::default(),
         }
     }
 
@@ -214,6 +222,7 @@ mod tests {
             members: vec![3, 1, 2],
             incarnation: 9,
             software: "x".into(),
+            role: Role::default(),
         }
     }
 
