@@ -46,6 +46,44 @@ use serde_json::Value;
 
 use common::{is_mounted, BIN};
 
+// ---------------------------------------------------------------- processes
+
+/// Spawns `cmd` so that it gets SIGTERM if this test process dies (a
+/// killed or timed-out harness must not leave nodes behind). The parent
+/// death signal fires when the spawning *thread* exits, so every node is
+/// spawned by one thread that lives as long as the process.
+fn spawn_tied(cmd: Command) -> std::io::Result<Child> {
+    type Req = (Command, std::sync::mpsc::Sender<std::io::Result<Child>>);
+    static SPAWNER: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Req>>> =
+        std::sync::OnceLock::new();
+    let tx = SPAWNER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Req>();
+        std::thread::spawn(move || {
+            for (mut cmd, reply) in rx {
+                use std::os::unix::process::CommandExt;
+                // SAFETY: prctl is async-signal-safe.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let _ = reply.send(cmd.spawn());
+            }
+        });
+        Mutex::new(tx)
+    });
+    let (reply, rx) = std::sync::mpsc::channel();
+    tx.lock()
+        .unwrap()
+        .send((cmd, reply))
+        .map_err(|_| std::io::Error::other("spawner gone"))?;
+    rx.recv()
+        .map_err(|_| std::io::Error::other("spawner gone"))?
+}
+
 // ---------------------------------------------------------------- random
 
 #[derive(Clone)]
@@ -327,14 +365,12 @@ impl Node {
             Kind::Mount => cmd.arg(self.backing()).arg(self.mnt()),
             Kind::Daemon => cmd.args(["--mode", "daemon"]),
         };
-        let child = cmd
-            .args(&self.args)
+        cmd.args(&self.args)
             .arg("--foreground")
             .env("SYNCFS_TEST_LOCK_LOG", self.dir.join("locks.log"))
             .stdin(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+            .stderr(log);
+        let child = spawn_tied(cmd).unwrap();
         self.child = Some(child);
         let t = Instant::now();
         loop {
