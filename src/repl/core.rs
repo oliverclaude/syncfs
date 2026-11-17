@@ -702,6 +702,17 @@ impl Repl {
             "journal_durable": st.journal.durable(),
             "journal_queue": st.journal.queued(),
             "open_sessions": st.sessions.len(),
+            "sessions": st
+                .sessions
+                .iter()
+                .take(20)
+                .map(|(id, s)| serde_json::json!({
+                    "file": id.to_string(),
+                    "path": st.index.path_of(id).map(|p| String::from_utf8_lossy(p).into_owned()),
+                    "version": s.version.seq,
+                    "since_sent_ms": s.last_sent.elapsed().as_millis() as u64,
+                }))
+                .collect::<Vec<_>>(),
             "window": st.window.len(),
             "suspects": st.suspects.len(),
             "unclean_start": self.unclean_start,

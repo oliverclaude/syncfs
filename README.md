@@ -562,7 +562,10 @@ Before a new lock session on a file takes writes (at open for writing, or
 for the single operation), the node brings its copy up to the newest
 version the granting voters report:
 
-1. If its copy is at least that version, nothing happens.
+1. If its copy is at least that version, nothing happens. Neither does a
+   version that only this node announced, on this disk, and never wrote
+   (it records the version durably before the first write; e.g. it
+   stopped between the lock and the write).
 2. Otherwise it compares block hashes with a node that has the version
    (the writer while pending, else the holders) and pulls the blocks that
    differ, then takes the size, attributes and version (xattrs are not
@@ -644,7 +647,8 @@ the disk-loss rebuild; for now a missing marker just gets a new disk id.
 `.syncfs/replication` on a cluster mount shows: `disk`, `block_size`,
 `files_indexed`, `dirty_files`, `dirty_blocks` (most behind peer),
 `dirty_bytes_max`, `blocks_in_flight`, `journal_last`, `journal_durable`,
-`journal_queue`, `open_sessions`, `window`, `suspects`, `unclean_start`,
+`journal_queue`, `open_sessions`, `sessions` (up to 20: file id, path,
+version, ms since the last interim entry), `window`, `suspects`, `unclean_start`,
 `in_sync` (nothing dirty, unacknowledged or open), `freshness_timeout`,
 `store_commits`, `store_failures`, `versions` (this node's voter table:
 `files`, `pending`, `latest_committed`), per peer `stores_data`, `disk`,
@@ -664,6 +668,8 @@ the disk-loss rebuild; for now a missing marker just gets a new disk id.
 - Attribute and data caches are dropped after a peer's change; directory
   entries (a peer's create, rename or remove) show after the 1 s entry TTL.
 - If an origin is down, entries of other origins that depend on it wait.
+- Paths longer than `PATH_MAX` (4096 bytes) cannot be named and are not
+  replicated (a warning is logged); their locks fall back to the root lock.
 
 ## Internals
 
