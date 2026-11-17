@@ -179,6 +179,7 @@ impl Index {
             return;
         }
         let moving = self.subtree(from);
+        let versions = self.versions_of(&moving);
         for (p, _) in self.subtree(to) {
             self.remove_path(&p);
         }
@@ -188,12 +189,30 @@ impl Index {
         for (p, id) in moving {
             self.insert(&rebase(&p, from, to), id);
         }
+        self.restore_versions(versions);
+    }
+
+    /// The versions of the files at `paths` (which are about to be
+    /// removed and inserted again).
+    fn versions_of(&self, paths: &[(Vec<u8>, FileId)]) -> Vec<(FileId, Version)> {
+        paths
+            .iter()
+            .filter_map(|(_, id)| Some((*id, self.version(id)?)))
+            .collect()
+    }
+
+    fn restore_versions(&mut self, versions: Vec<(FileId, Version)>) {
+        for (id, v) in versions {
+            self.set_version(id, v);
+        }
     }
 
     /// `a` and `b` swapped places (`RENAME_EXCHANGE`).
     pub fn exchange(&mut self, a: &[u8], b: &[u8]) {
         let sa = self.subtree(a);
         let sb = self.subtree(b);
+        let mut versions = self.versions_of(&sa);
+        versions.extend(self.versions_of(&sb));
         for (p, _) in sa.iter().chain(&sb) {
             self.remove_path(p);
         }
@@ -203,6 +222,7 @@ impl Index {
         for (p, id) in sb {
             self.insert(&rebase(&p, b, a), id);
         }
+        self.restore_versions(versions);
     }
 
     /// Store operations for everything changed since the last call.
@@ -247,6 +267,26 @@ mod tests {
         ix.exchange(b"e/f", b"dd");
         assert_eq!(ix.get(b"dd"), Some(id(2)));
         assert_eq!(ix.get(b"e/f"), Some(id(4)));
+    }
+
+    #[test]
+    fn versions_survive_renames() {
+        let v = |seq| Version {
+            seq,
+            node: 1,
+            disk: 9,
+        };
+        let mut ix = Index::default();
+        ix.insert(b"d/f", id(1));
+        ix.insert(b"g", id(2));
+        ix.set_version(id(1), v(3));
+        ix.set_version(id(2), v(4));
+        ix.rename(b"d", b"e");
+        assert_eq!(ix.version(&id(1)), Some(v(3)));
+        ix.exchange(b"e/f", b"g");
+        assert_eq!(ix.version(&id(1)), Some(v(3)));
+        assert_eq!(ix.version(&id(2)), Some(v(4)));
+        assert_eq!(ix.get(b"g"), Some(id(1)));
     }
 
     #[test]
