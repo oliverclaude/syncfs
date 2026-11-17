@@ -12,9 +12,15 @@
 //! * After a local rename, write locks on paths that moved are re-taken
 //!   under the new path.
 //!
-//! * Every change that went through is then marked dirty
-//!   (`crate::dirty`), while the lock is still held: lock, quorum, local
-//!   write, mark dirty.
+//! * Locks on regular files take part in versioning: a new lock session
+//!   first brings the local copy up to the newest version
+//!   ([`Repl::ensure_fresh`], which may wait up to `freshness_timeout`),
+//!   and its first change enters the file into the durable window and
+//!   marks the session's version written.
+//! * Every change that went through is then recorded for replication
+//!   ([`Repl::record`]) while the lock is still held: lock, quorum, local
+//!   write, mark dirty. When the session's last reference goes, its
+//!   changes become a journal entry ([`Repl::end_session`]).
 //!
 //! No quorum: `EROFS`. Locked by another node for longer than `lock_wait`:
 //! `EBUSY`.
@@ -26,15 +32,15 @@ use std::sync::{Arc, Mutex};
 
 use fuser::Errno;
 
-use crate::dirty::DirtyTracker;
 use crate::fs::{Mutation, NodeRef, OpGuard, WriteHooks};
+use crate::repl::core::Repl;
 
 use super::key::Key;
-use super::manager::LockManager;
+use super::manager::{FileCtx, LockManager};
 
 pub struct ClusterHooks {
     locks: LockManager,
-    dirty: Arc<DirtyTracker>,
+    repl: Arc<Repl>,
     /// Write locks per inode: one key per open writable handle.
     by_ino: Mutex<HashMap<u64, Vec<Key>>>,
 }
@@ -67,10 +73,10 @@ fn child(parent: NodeRef<'_>, name: &OsStr) -> Result<Option<Key>, Errno> {
 }
 
 impl ClusterHooks {
-    pub fn new(locks: LockManager, dirty: Arc<DirtyTracker>) -> ClusterHooks {
+    pub fn new(locks: LockManager, repl: Arc<Repl>) -> ClusterHooks {
         ClusterHooks {
             locks,
-            dirty,
+            repl,
             by_ino: Mutex::new(HashMap::new()),
         }
     }
@@ -94,44 +100,100 @@ impl ClusterHooks {
         keys.dedup();
         let mut taken: Vec<Key> = Vec::new();
         for key in keys {
-            let res = if fail_on_held {
-                self.locks.acquire_unless_held(&key)
-            } else {
-                self.locks.acquire(&key)
-            };
+            let res = self
+                .locks
+                .acquire_file(&key, None, fail_on_held)
+                .map(|_| ());
             if let Err(e) = res {
                 for k in &taken {
-                    self.locks.release(k);
+                    release(&self.locks, &self.repl, k);
                 }
                 log::debug!("locks: {key}: {e}");
                 return Err(e.errno());
             }
             taken.push(key);
         }
+        Ok(self.guard(taken))
+    }
+
+    fn guard(&self, taken: Vec<Key>) -> OpGuard {
         if taken.is_empty() {
-            return Ok(OpGuard::none());
+            return OpGuard::none();
         }
-        let locks = self.locks.clone();
-        Ok(OpGuard::new(move || {
+        let (locks, repl) = (self.locks.clone(), Arc::clone(&self.repl));
+        OpGuard::new(move || {
             for k in &taken {
-                locks.release(k);
+                release(&locks, &repl, k);
             }
-        }))
+        })
+    }
+
+    /// The replication id of `node` if it is a regular file.
+    fn file_of(&self, node: NodeRef<'_>) -> Option<crate::net::wire::FileId> {
+        let st = node.stat().ok()?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+            return None;
+        }
+        let path = node.path().ok()?;
+        Some(self.repl.id_for(&crate::repl::core::path_bytes(&path)))
+    }
+
+    /// Takes a reference to the lock on `key` for `node`'s content; a new
+    /// session first makes the local copy fresh.
+    fn acquire_content(&self, key: &Key, node: NodeRef<'_>) -> Result<(), Errno> {
+        let file = self.file_of(node);
+        let ctx = file.map(|f| FileCtx {
+            file: f,
+            local: self.repl.local_version(&f),
+        });
+        let acquired = self.locks.acquire_file(key, ctx, false).map_err(|e| {
+            log::debug!("locks: {key}: {e}");
+            e.errno()
+        })?;
+        if let (true, Some(f)) = (acquired.new_session, file) {
+            if self.repl.ensure_fresh(f, &acquired.known).is_err() {
+                release(&self.locks, &self.repl, key);
+                return Err(Errno::EBUSY);
+            }
+        }
+        Ok(())
+    }
+
+    /// The lock on `key` covers a change to its file: the session's
+    /// version is written.
+    fn begin(&self, key: &Key) -> Result<(), Errno> {
+        if let Some((file, version)) = self.locks.session(key) {
+            self.repl.begin_change(file, version).map_err(|e| {
+                log::error!("replication: cannot record {file} as changing: {e}");
+                Errno::EIO
+            })?;
+            self.locks.mark_written(key);
+        }
+        Ok(())
     }
 
     fn content_change(&self, node: NodeRef<'_>) -> Result<OpGuard, Errno> {
         let held = self.by_ino().get(&node.ino()).cloned();
         match held {
             Some(keys) if !keys.is_empty() => {
-                for key in keys {
-                    self.locks.ensure(&key).map_err(|e| {
+                for key in &keys {
+                    self.locks.ensure(key).map_err(|e| {
                         log::debug!("locks: {key}: {e}");
                         e.errno()
                     })?;
                 }
+                self.begin(&keys[0])?;
                 Ok(OpGuard::none())
             }
-            _ => self.op_lock(vec![key_of(node)?]),
+            _ => {
+                let Some(key) = key_of(node)? else {
+                    return Ok(OpGuard::none());
+                };
+                self.acquire_content(&key, node)?;
+                let guard = self.guard(vec![key.clone()]);
+                self.begin(&key)?;
+                Ok(guard)
+            }
         }
     }
 
@@ -145,7 +207,9 @@ impl ClusterHooks {
                 };
                 match self.locks.acquire(&new) {
                     Ok(()) => {
-                        self.locks.release(key);
+                        // The session continues under the new key.
+                        self.locks.move_session(key, &new);
+                        release(&self.locks, &self.repl, key);
                         *key = new;
                     }
                     Err(e) => log::warn!(
@@ -187,11 +251,17 @@ impl WriteHooks for ClusterHooks {
     }
 
     fn failed(&self, op: &Mutation<'_>) {
-        self.dirty.record_failed(op);
+        // A data change may have been partly applied: record it anyway.
+        if matches!(
+            op,
+            Mutation::Write { .. } | Mutation::Allocate { .. } | Mutation::SetAttr { .. }
+        ) {
+            self.repl.record(op);
+        }
     }
 
     fn after(&self, op: &Mutation<'_>) {
-        self.dirty.record(op);
+        self.repl.record(op);
         if let Mutation::Rename {
             parent,
             name,
@@ -213,10 +283,7 @@ impl WriteHooks for ClusterHooks {
         let Some(key) = key_of(node)? else {
             return Ok(());
         };
-        self.locks.acquire(&key).map_err(|e| {
-            log::debug!("locks: open {key} for writing: {e}");
-            e.errno()
-        })?;
+        self.acquire_content(&key, node)?;
         self.by_ino().entry(node.ino()).or_default().push(key);
         Ok(())
     }
@@ -234,7 +301,16 @@ impl WriteHooks for ClusterHooks {
             key
         };
         if let Some(key) = key {
-            self.locks.release(&key);
+            release(&self.locks, &self.repl, &key);
         }
     }
+}
+
+/// Drops a reference to `key`; the last one ends the session (its
+/// changes go into the journal) before the lock is released.
+fn release(locks: &LockManager, repl: &Repl, key: &Key) {
+    if let Some(file) = locks.last_reference(key) {
+        repl.end_session(file);
+    }
+    locks.release(key);
 }

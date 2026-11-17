@@ -3,7 +3,6 @@
 //! See the README for the overall design and build plan.
 pub mod cli;
 pub mod config;
-pub mod dirty;
 pub mod fs;
 pub mod helper;
 pub mod lock;

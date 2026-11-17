@@ -10,11 +10,13 @@ use fuser::{MountOption, Session, SessionACL};
 use signal_hook::iterator::Signals;
 
 use crate::config::Config;
-use crate::dirty::DirtyTracker;
 use crate::fs::{LocalOnly, SyncFs, WriteHooks};
 use crate::lock::{ClusterHooks, LockManager, Settings};
 use crate::net::Network;
 use crate::process;
+use crate::repl::core::Repl;
+use crate::repl::store::{Flusher, Store};
+use crate::repl::{marker, version};
 use crate::status::{providers, Registry};
 
 /// FUSE session settings for `cfg`. `kernel_flags` are the generic mount
@@ -118,7 +120,7 @@ fn register_status(
     fs: &SyncFs<Hooks>,
     net: &Network,
     locks: Option<&LockManager>,
-    dirty: Option<&Arc<DirtyTracker>>,
+    repl: Option<&Arc<Repl>>,
     cfg: &Config,
     fc: &fuser::Config,
 ) {
@@ -139,7 +141,7 @@ fn register_status(
         Some(fs.stats_provider()),
         net.provider(),
         locks.map(LockManager::provider),
-        dirty.map(DirtyTracker::provider),
+        repl.map(Repl::provider),
     );
 }
 
@@ -190,37 +192,42 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
     // Runs after daemonizing: threads do not survive fork.
     let start = || -> anyhow::Result<Served> {
         let status = Registry::new();
-        let net = Network::start(cfg).with_context(|| format!("listening on {}", cfg.listen))?;
-        // A standalone node has nobody to agree with: no locks.
-        let locks = (!cfg.peers.is_empty())
-            .then(|| LockManager::start(Settings::from_config(cfg), net.clone()));
-        let dirty = locks
-            .as_ref()
-            .map(|_| Arc::new(DirtyTracker::new(cfg.block_size.0)));
-        let hooks: Hooks = match (&locks, &dirty) {
-            (Some(l), Some(d)) => Arc::new(ClusterHooks::new(l.clone(), Arc::clone(d))),
-            _ => Arc::new(LocalOnly),
+        // A standalone node has nobody to agree with: no locks and no
+        // replication.
+        let cluster = if cfg.peers.is_empty() {
+            None
+        } else {
+            Some(start_cluster(cfg, backing)?)
         };
-        let stop = |net: &Network, locks: &Option<LockManager>| {
-            if let Some(l) = locks {
-                l.shutdown();
-            }
-            net.shutdown();
+        let net = match &cluster {
+            Some(c) => c.net.clone(),
+            None => Network::start(cfg).with_context(|| format!("listening on {}", cfg.listen))?,
+        };
+        let locks = cluster.as_ref().map(|c| c.locks.clone());
+        let repl = cluster.as_ref().map(|c| Arc::clone(&c.repl));
+        let hooks: Hooks = match &cluster {
+            Some(c) => Arc::new(ClusterHooks::new(c.locks.clone(), Arc::clone(&c.repl))),
+            None => Arc::new(LocalOnly),
+        };
+        let stop = |net: &Network, cluster: Option<Cluster>| match cluster {
+            Some(c) => c.stop(),
+            None => net.shutdown(),
         };
         let fs = match SyncFs::new(backing, hooks, Arc::clone(&status)) {
             Ok(fs) => fs,
             Err(e) => {
-                stop(&net, &locks);
+                stop(&net, cluster);
                 return Err(anyhow::Error::from(e))
                     .with_context(|| format!("opening backing_dir {}", backing.display()));
             }
         };
+        let inodes = fs.inode_table();
         register_status(
             &status,
             &fs,
             &net,
             locks.as_ref(),
-            dirty.as_ref(),
+            repl.as_ref(),
             cfg,
             &fuse_cfg,
         );
@@ -232,20 +239,32 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
                     session,
                     direct: None,
                     net: None,
-                    locks: None,
+                    cluster: None,
                 })
                 .map_err(Into::into)
         };
+        let mounted = mounted.inspect(|s| {
+            if let Some(repl) = &repl {
+                let notifier = s.session.notifier();
+                repl.set_invalidator(Box::new(move |st| {
+                    if let Some(ino) = inodes.live_number(st) {
+                        if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, 0) {
+                            log::debug!("invalidating inode {ino}: {e}");
+                        }
+                    }
+                }));
+            }
+        });
         let mut served = match mounted.with_context(|| format!("mounting {}", mountpoint.display()))
         {
             Ok(s) => s,
             Err(e) => {
-                stop(&net, &locks);
+                stop(&net, cluster);
                 return Err(e);
             }
         };
         served.net = Some(net);
-        served.locks = locks;
+        served.cluster = cluster;
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
         Ok(served)
     };
@@ -258,7 +277,67 @@ struct Served {
     session: Session<SyncFs<Hooks>>,
     direct: Option<PathBuf>,
     net: Option<Network>,
-    locks: Option<LockManager>,
+    cluster: Option<Cluster>,
+}
+
+/// The cluster services of a mount node.
+struct Cluster {
+    net: Network,
+    locks: LockManager,
+    repl: Arc<Repl>,
+    flusher: Arc<Flusher>,
+    flush_thread: std::thread::JoinHandle<()>,
+}
+
+impl Cluster {
+    /// Stops replication (recording a clean stop), locks, the network and
+    /// the flusher, in that order.
+    fn stop(self) {
+        self.repl.shutdown();
+        self.locks.shutdown();
+        self.net.shutdown();
+        self.flusher.stop();
+        let _ = self.flush_thread.join();
+        if let Err(e) = self.flusher.flush_now() {
+            log::error!("final flush of the replication store failed: {e}");
+        }
+    }
+}
+
+fn start_cluster(cfg: &Config, backing: &Path) -> anyhow::Result<Cluster> {
+    let disk = marker::load_or_create(cfg, backing)?;
+    let store = Store::open(&cfg.state_dir)
+        .with_context(|| format!("opening the store in {}", cfg.state_dir.display()))?;
+    let flusher = Flusher::new(Arc::new(store));
+    let mut settings = Settings::from_config(cfg);
+    settings.disk = disk;
+    let versions = version::persisted(settings.quorum(), &flusher)?;
+    let net = Network::start_with_disk(cfg, disk)
+        .with_context(|| format!("listening on {}", cfg.listen))?;
+    let locks = LockManager::start_with_versions(settings, net.clone(), versions);
+    let repl = match Repl::start(
+        cfg,
+        backing,
+        disk,
+        Arc::clone(&flusher),
+        net.clone(),
+        locks.clone(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            locks.shutdown();
+            net.shutdown();
+            return Err(anyhow::Error::from(e).context("starting replication"));
+        }
+    };
+    let flush_thread = flusher.start();
+    Ok(Cluster {
+        net,
+        locks,
+        repl,
+        flusher,
+        flush_thread,
+    })
 }
 
 type Hooks = Arc<dyn WriteHooks>;
@@ -336,7 +415,7 @@ fn mount_direct(
             session,
             direct: Some(mountpoint.to_path_buf()),
             net: None,
-            locks: None,
+            cluster: None,
         }),
         Err(e) => {
             // SAFETY: valid path string.
@@ -352,7 +431,7 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         mut session,
         direct,
         net,
-        locks,
+        cluster,
     } = served;
     let mut unmounter = session.unmount_callable();
     std::thread::spawn(move || {
@@ -377,11 +456,13 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         }
     });
     let res = session.run().context("serving filesystem");
-    if let Some(locks) = locks {
-        locks.shutdown();
-    }
-    if let Some(net) = net {
-        net.shutdown();
+    match cluster {
+        Some(c) => c.stop(),
+        None => {
+            if let Some(net) = net {
+                net.shutdown();
+            }
+        }
     }
     res?;
     log::info!("unmounted");

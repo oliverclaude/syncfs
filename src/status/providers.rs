@@ -79,12 +79,13 @@ pub fn locks(config: Config) -> Arc<dyn Provider> {
     }))
 }
 
-/// `replication` where nothing is tracked (standalone nodes and voter-only
-/// daemons); cluster mounts use `DirtyTracker::provider`.
+/// `replication` of a standalone node (nothing to replicate to); cluster
+/// mounts use `Repl::provider`, daemons their own.
 pub fn replication(config: Config) -> Arc<dyn Provider> {
     Arc::new(FnProvider::new("replication", move || {
         json!({
-            "implemented": false,
+            "implemented": true,
+            "role": "standalone (no peers)",
             "block_size": config.block_size.to_string(),
             "dirty_files": 0,
             "dirty_blocks": 0,

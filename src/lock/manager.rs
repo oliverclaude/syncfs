@@ -327,6 +327,40 @@ impl LockManager {
         Some((h.file?, h.version?))
     }
 
+    /// The file of the session on `key` if only one reference is left
+    /// (the next [`release`](Self::release) ends the session).
+    pub fn last_reference(&self, key: &Key) -> Option<FileId> {
+        let st = lock(&self.inner.st);
+        let h = st.held.get(key)?;
+        (h.refs <= 1).then_some(h.file).flatten()
+    }
+
+    /// After a rename, the session held under `from` continues under `to`
+    /// (both held).
+    pub fn move_session(&self, from: &Key, to: &Key) {
+        let mut st = lock(&self.inner.st);
+        let Some(old) = st.held.get_mut(from) else {
+            return;
+        };
+        let (file, version, written) = (old.file, old.version, old.written);
+        if file.is_none() {
+            return;
+        }
+        let Some(new) = st.held.get_mut(to) else {
+            return;
+        };
+        if new.file.is_some() {
+            return;
+        }
+        new.file = file;
+        new.version = version;
+        new.written = written;
+        let old = st.held.get_mut(from).expect("checked");
+        old.file = None;
+        old.version = None;
+        old.written = false;
+    }
+
     /// This node's voter table of file versions.
     pub fn versions(&self) -> Arc<Mutex<VersionTable>> {
         Arc::clone(&self.inner.versions)

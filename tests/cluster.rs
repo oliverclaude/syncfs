@@ -442,7 +442,14 @@ const LEASE: Duration = Duration::from_secs(1);
 fn lock_cluster(kinds: &[Kind], lock_wait: &str, files: &[&str]) -> Cluster {
     let mut c = Cluster::build(
         kinds,
-        &["--lock-lease-timeout", "1s", "--lock-wait", lock_wait],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            lock_wait,
+            "--freshness-timeout",
+            "2s",
+        ],
     );
     for n in &c.nodes {
         for f in files {
@@ -699,6 +706,8 @@ fn locks_killed_holder_expires() {
     use Kind::{Daemon, Mount};
     let mut c = lock_cluster(&[Mount, Mount, Daemon], "10s", &["f"]);
     let f2 = c.node(2).mnt().join("f");
+    // Node 1's session never wrote, but the voters cannot know: node 2
+    // also waits freshness_timeout (2 s) for node 1's copy.
     let _w = open_rw(&c.node(1).mnt().join("f")).unwrap();
     // Renewals keep it held well past one lease.
     std::thread::sleep(LEASE * 2);
@@ -710,7 +719,7 @@ fn locks_killed_holder_expires() {
     let waited = t.elapsed();
     eprintln!("lock moved {waited:?} after the holder was killed");
     assert!(waited >= LEASE / 3, "{waited:?}: lease ignored?");
-    assert!(waited < LEASE * 3, "{waited:?}");
+    assert!(waited < LEASE * 3 + Duration::from_secs(2), "{waited:?}");
     drop(w2);
 }
 
@@ -783,68 +792,273 @@ fn locks_quorum_loss_is_erofs_while_reads_work() {
     eprintln!("writable {:?} after the voters came back", t.elapsed());
 }
 
+/// Every entry of a backing tree (but the hidden `.syncfs`): type, mode,
+/// size, content or target, and `user.*` xattrs.
+fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(root).unwrap().display().to_string();
+            if rel == ".syncfs" {
+                continue;
+            }
+            let md = std::fs::symlink_metadata(&p).unwrap();
+            let mut xattrs = Vec::new();
+            let mut buf = vec![0u8; 65536];
+            if let Ok(n) = rustix::fs::llistxattr(&p, &mut buf[..]) {
+                for name in buf[..n]
+                    .split(|b| *b == 0)
+                    .filter(|n| n.starts_with(b"user."))
+                {
+                    let name = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name);
+                    let mut v = vec![0u8; 65536];
+                    let len = rustix::fs::lgetxattr(&p, name, &mut v[..]).unwrap_or(0);
+                    xattrs.push(format!("{name:?}={:?}", &v[..len]));
+                }
+            }
+            let what = if md.is_dir() {
+                stack.push(p.clone());
+                "dir".to_string()
+            } else if md.file_type().is_symlink() {
+                format!("link->{}", std::fs::read_link(&p).unwrap().display())
+            } else if md.is_file() {
+                let data = std::fs::read(&p).unwrap();
+                format!("file {} {:x}", data.len(), md5ish(&data))
+            } else {
+                format!("special {:o}", md.mode() & libc::S_IFMT)
+            };
+            out.insert(
+                rel,
+                format!(
+                    "{what} mode {:o} nlink {} {}",
+                    md.permissions().mode() & 0o7777,
+                    if md.is_dir() { 0 } else { md.nlink() },
+                    xattrs.join(",")
+                ),
+            );
+        }
+    }
+    out
+}
+
+fn md5ish(data: &[u8]) -> u64 {
+    // FNV-1a: enough to tell contents apart in a test.
+    data.iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Waits until the backing trees of mount nodes `a` and `b` match.
+fn wait_same_tree(c: &Cluster, a: u16, b: u16) {
+    let (ra, rb) = (
+        c.nodes[a as usize - 1].backing(),
+        c.nodes[b as usize - 1].backing(),
+    );
+    let t = Instant::now();
+    loop {
+        let (ta, tb) = (tree(&ra), tree(&rb));
+        if ta == tb {
+            return;
+        }
+        if t.elapsed() > Duration::from_secs(20) {
+            let diff: Vec<_> = ta
+                .iter()
+                .filter(|(k, v)| tb.get(*k) != Some(v))
+                .map(|(k, v)| format!("{k}: {v} vs {:?}", tb.get(k)))
+                .chain(
+                    tb.keys()
+                        .filter(|k| !ta.contains_key(*k))
+                        .map(|k| format!("{k}: only on {b}")),
+                )
+                .collect();
+            panic!("nodes {a} and {b} differ:\n{}", diff.join("\n"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn in_sync(c: &Cluster, n: u16) -> Value {
+    let node = &c.nodes[n as usize - 1];
+    let t = Instant::now();
+    loop {
+        let r = node.status("replication").unwrap();
+        if r["in_sync"] == true {
+            return r;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "node {n} not in sync: {r:#}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
-fn write_path_marks_dirty_blocks_after_the_lock() {
+fn replicates_changes_between_mounts() {
     require_fuse!();
     use std::os::unix::fs::{FileExt, PermissionsExt};
     use Kind::{Daemon, Mount};
-    const B: u64 = 64 * 1024;
-    let mut c = lock_cluster(&[Mount, Mount, Daemon], "0s", &["f"]);
-    let mnt = c.node(1).mnt();
-    let mnt2 = c.node(2).mnt();
-    let c = c;
-    let rep = |n: usize| c.nodes[n - 1].status("replication").unwrap();
-    let r = rep(1);
-    assert_eq!(r["dirty_files"], 0, "{r:#}");
-    assert_eq!(r["in_sync"], true);
-    assert_eq!(r["block_size"], B);
+    const B: usize = 64 * 1024;
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m1 = c.node(1).mnt();
+    let m2 = c.node(2).mnt();
+    // The tree starts equal (pre-existing files are adopted by path).
+    wait_same_tree(&c, 1, 2);
 
-    let f = open_rw(&mnt.join("f")).unwrap();
-    f.write_all_at(b"0123456789", 0).unwrap();
-    // Two bytes straddling the end of block 2: blocks 2 and 3.
-    f.write_all_at(b"ab", 3 * B - 1).unwrap();
-    f.sync_all().unwrap();
-    let r = rep(1);
-    assert_eq!(r["dirty_files"], 1, "{r:#}");
-    assert_eq!(r["dirty_blocks"], 3, "{r:#}");
-    assert_eq!(r["in_sync"], false);
-    // Truncating to one block forgets the marks past it.
-    f.set_len(B).unwrap();
-    let r = rep(1);
-    assert_eq!(r["dirty_blocks"], 1, "{r:#}");
-    assert_eq!(r["truncated_files"], 1, "{r:#}");
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .unwrap();
-    assert_eq!(rep(1)["meta_dirty_files"], 1);
+    std::fs::create_dir(m1.join("d")).unwrap();
+    let big: Vec<u8> = (0..3 * B + 100).map(|i| (i % 251) as u8).collect();
+    std::fs::write(m1.join("d/big"), &big).unwrap();
+    std::os::unix::fs::symlink("big", m1.join("d/sym")).unwrap();
+    std::fs::hard_link(m1.join("d/big"), m1.join("hard")).unwrap();
+    std::fs::set_permissions(m1.join("d/big"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    let xattrs = rustix::fs::setxattr(
+        m1.join("d/big"),
+        "user.k",
+        b"v",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .is_ok();
+    let f = open_rw(&m1.join("f")).unwrap();
+    f.write_all_at(b"changed", 2).unwrap();
+    drop(f);
+    std::fs::write(m1.join("gone"), b"x").unwrap();
+    std::fs::remove_file(m1.join("gone")).unwrap();
+    std::fs::rename(m1.join("d/sym"), m1.join("sym2")).unwrap();
+    wait_same_tree(&c, 1, 2);
+    assert_eq!(std::fs::read(m2.join("d/big")).unwrap(), big);
+    assert_eq!(std::fs::read(m2.join("f")).unwrap(), b"inchanged");
+    if xattrs {
+        let mut v = [0u8; 16];
+        let n = rustix::fs::getxattr(m2.join("d/big"), "user.k", &mut v[..]).unwrap();
+        assert_eq!(&v[..n], b"v");
+    }
+    let r = in_sync(&c, 1);
+    assert!(
+        r["counters"]["entries_made"].as_u64().unwrap() >= 8,
+        "{r:#}"
+    );
+    let r2 = c.node(2).status("replication").unwrap();
+    assert!(
+        r2["counters"]["blocks_received"].as_u64().unwrap() >= 4,
+        "{r2:#}"
+    );
+
+    // Only changed blocks travel: one byte in the middle of block 1.
+    let before = r2["counters"]["blocks_received"].as_u64().unwrap();
+    let f = open_rw(&m2.join("d/big")).unwrap();
+    f.write_all_at(b"Z", B as u64 + 5).unwrap();
+    f.set_len((2 * B) as u64).unwrap();
+    drop(f);
+    wait_same_tree(&c, 1, 2);
+    let r1 = in_sync(&c, 1);
+    assert_eq!(
+        r1["counters"]["blocks_received"].as_u64().unwrap(),
+        1,
+        "{r1:#}"
+    );
+    let r2 = in_sync(&c, 2);
+    assert_eq!(r2["counters"]["blocks_received"].as_u64().unwrap(), before);
+
+    // The daemon keeps the version table across a restart (its status
+    // file is rewritten every 5 heartbeats).
+    let files =
+        |c: &mut Cluster| c.node(3).status("replication").unwrap()["versions"]["files"].clone();
+    let want = c.node(1).status("replication").unwrap()["versions"]["files"].clone();
+    assert!(want.as_u64().unwrap() >= 2, "{want}");
+    wait_until("daemon has every version", || files(&mut c) == want);
+    c.node(3).stop();
+    c.node(3).start();
+    assert_eq!(files(&mut c), want);
+}
+
+#[test]
+fn stale_copy_is_brought_up_to_date_when_locked() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "5s",
+            "--freshness-timeout",
+            "2s",
+        ],
+    );
+    for n in &c.nodes {
+        std::fs::write(n.backing().join("f"), b"initial\n").unwrap();
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+
+    // Node 2 misses a write; when it locks the file again, it first
+    // fetches the newest version (by journal or by the freshness check).
+    c.node(2).stop();
+    std::fs::write(c.node(1).mnt().join("f"), b"version two\n").unwrap();
+    c.node(2).start();
+    c.converge("node 2 back");
+    let m2 = c.node(2).mnt();
+    let f = eventually("lock on node 2", || open_rw(&m2.join("f")));
+    assert_eq!(std::fs::read(m2.join("f")).unwrap(), b"version two\n");
     drop(f);
 
-    // Namespace changes are counted; a renamed file keeps its marks.
-    std::fs::write(mnt.join("g"), b"x").unwrap();
-    std::fs::rename(mnt.join("g"), mnt.join("h")).unwrap();
-    let r = rep(1);
-    assert_eq!(r["namespace_changes"], 2, "{r:#}");
-    assert_eq!(r["dirty_files"], 2, "{r:#}");
-    assert_eq!(r["dirty_blocks"], 2, "{r:#}");
+    // Now node 1 writes and goes away before node 2 can pull: node 2
+    // waits freshness_timeout for it, then continues from its own copy
+    // (the newest copy a majority has).
+    c.node(2).signal(libc::SIGSTOP);
+    std::fs::write(c.node(1).mnt().join("f"), b"version three\n").unwrap();
+    c.node(1).kill();
+    c.node(2).signal(libc::SIGCONT);
+    let t = Instant::now();
+    let f = eventually("lock on node 2 without node 1", || open_rw(&m2.join("f")));
+    let waited = t.elapsed();
+    drop(f);
+    let r = c.node(2).status("replication").unwrap();
+    let pulled = std::fs::read(m2.join("f")).unwrap();
+    if pulled == b"version three\n" {
+        // The journal entry got through before the kill.
+        eprintln!("node 2 had the write already: {r:#}");
+    } else {
+        assert_eq!(pulled, b"version two\n");
+        assert!(waited >= Duration::from_secs(2), "{waited:?}");
+        assert!(
+            r["counters"]["fresh_fallbacks"].as_u64().unwrap() >= 1,
+            "{r:#}"
+        );
+    }
+}
 
-    // A write refused by the lock marks nothing, and each node only
-    // tracks its own changes.
-    let held = open_rw(&mnt2.join("f")).unwrap();
-    let before = rep(1);
-    assert_eq!(errno(open_rw(&mnt.join("f"))), Some(libc::EBUSY));
-    assert_eq!(
-        errno(std::fs::write(mnt.join("f"), b"no")),
-        Some(libc::EBUSY)
-    );
-    assert_eq!(rep(1), before);
-    held.write_all_at(b"z", 0).unwrap();
-    drop(held);
-    let r = rep(2);
-    assert_eq!(r["dirty_files"], 1, "{r:#}");
-    assert_eq!(r["dirty_blocks"], 1, "{r:#}");
-    assert_eq!(r["namespace_changes"], 0, "{r:#}");
-    // Voter-only daemons have nothing to track.
-    let r = rep(3);
-    assert_eq!(r["dirty_files"], 0, "{r:#}");
+#[test]
+fn crash_while_writing_resends_after_restart() {
+    require_fuse!();
+    use std::os::unix::fs::FileExt;
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m1 = c.node(1).mnt();
+    let f = open_rw(&m1.join("f")).unwrap();
+    let data = vec![7u8; 200_000];
+    f.write_all_at(&data, 0).unwrap();
+    // Killed with the file open: its changes may not be journaled.
+    c.node(1).kill();
+    drop(f);
+    c.node(1).start();
+    c.converge("node 1 back");
+    let r = c.node(1).status("replication").unwrap();
+    assert_eq!(r["unclean_start"], true, "{r:#}");
+    wait_same_tree(&c, 1, 2);
+    assert_eq!(std::fs::read(c.node(2).backing().join("f")).unwrap(), data);
+    let r = in_sync(&c, 1);
+    assert_eq!(r["suspects"], 0, "{r:#}");
+    // A clean stop after that is recorded as clean.
+    c.node(1).stop();
+    c.node(1).start();
+    let r = c.node(1).status("replication").unwrap();
+    assert_eq!(r["unclean_start"], false, "{r:#}");
 }
 
 /// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a
