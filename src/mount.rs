@@ -512,11 +512,14 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         cluster,
     } = served;
     let mut unmounter = session.unmount_callable();
+    let unmounting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&unmounting);
     std::thread::spawn(move || {
         // The first signal unmounts; if the mount is busy, it keeps serving
         // and a later signal detaches it lazily (it then goes away when the
         // last open file is closed, like `umount -l`).
         for (i, sig) in signals.forever().enumerate() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
             let res = if i == 0 {
                 log::info!("signal {sig}: unmounting");
                 match &direct {
@@ -539,7 +542,17 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
             }
         }
     });
-    let res = session.run().context("serving filesystem");
+    let res = match session.run() {
+        // After a lazy detach some kernels abort the connection when the
+        // last file is closed instead of ending it: that is the unmount.
+        Err(e)
+            if e.raw_os_error() == Some(libc::ECONNABORTED)
+                && unmounting.load(std::sync::atomic::Ordering::SeqCst) =>
+        {
+            Ok(())
+        }
+        r => r.context("serving filesystem"),
+    };
     match cluster {
         Some(c) => c.stop(),
         None => {
