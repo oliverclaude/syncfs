@@ -1211,6 +1211,48 @@ fn diverged_change_is_kept_as_a_conflict_copy() {
     in_sync(&c, 2);
 }
 
+/// Removing a file leaves a versioned tombstone: a node with a stale copy
+/// cannot write it back to life unless the remover is unreachable; a write
+/// made after the fallback wins over the remove when the remover returns.
+#[test]
+fn removes_leave_tombstones() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f", "g"]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    // Node 2 has a stale copy when it opens f: ENOENT, never a write.
+    c.node(2).signal(libc::SIGSTOP);
+    std::fs::remove_file(m1.join("f")).unwrap();
+    c.node(2).signal(libc::SIGCONT);
+    let r = open_rw(&m2.join("f"));
+    assert_eq!(errno(r), Some(libc::ENOENT));
+    wait_same_tree(&c, 1, 2);
+    assert!(!c.node(2).backing().join("f").exists());
+
+    // Node 1 removes g and dies before node 2 hears of it; node 2 falls
+    // back and writes g: when node 1 returns, the write wins.
+    c.node(2).signal(libc::SIGSTOP);
+    std::fs::remove_file(m1.join("g")).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    c.node(1).kill();
+    c.node(2).signal(libc::SIGCONT);
+    eventually("write on node 2", || {
+        std::fs::write(m2.join("g"), b"written after\n")
+    });
+    c.node(1).start();
+    c.converge("node 1 back");
+    wait_same_tree(&c, 1, 2);
+    assert_eq!(
+        std::fs::read(c.node(1).backing().join("g")).ok(),
+        Some(b"written after\n".to_vec()),
+        "{}\n{}",
+        std::fs::read_to_string(c.node(1).dir.join("log")).unwrap_or_default(),
+        std::fs::read_to_string(c.node(2).dir.join("log")).unwrap_or_default()
+    );
+    in_sync(&c, 1);
+    in_sync(&c, 2);
+}
+
 /// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a
 /// mount has an empty backing directory with no marker: it must rebuild
 /// from its peers like a node that lost its disk (mount at once, fetch on

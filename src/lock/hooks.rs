@@ -151,9 +151,13 @@ impl ClusterHooks {
             e.errno()
         })?;
         if let (true, Some(f)) = (acquired.new_session, file) {
-            if self.repl.ensure_fresh(f, &acquired.known).is_err() {
+            self.repl.session_opened(f);
+            if let Err(e) = self.repl.ensure_fresh(f, &acquired.known) {
                 release(&self.locks, &self.repl, key);
-                return Err(Errno::EBUSY);
+                return Err(match e {
+                    crate::repl::fresh::NotFresh::Stale => Errno::EBUSY,
+                    crate::repl::fresh::NotFresh::Removed => Errno::ENOENT,
+                });
             }
         }
         Ok(())
@@ -197,6 +201,45 @@ impl ClusterHooks {
         }
     }
 
+    /// Removing the last link of a regular file is a versioned change (it
+    /// leaves a tombstone): its lock is a session like a write's.
+    fn remove_session(&self, parent: NodeRef<'_>, name: &OsStr) -> Result<Option<OpGuard>, Errno> {
+        let Some(key) = child(parent, name)? else {
+            return Ok(None);
+        };
+        let Ok(st) = parent.stat_child(name) else {
+            return Ok(None);
+        };
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile
+            || st.st_nlink != 1
+        {
+            return Ok(None);
+        }
+        let Ok(dir) = parent.path() else {
+            return Ok(None);
+        };
+        let file = self
+            .repl
+            .id_for(&crate::repl::core::path_bytes(&dir.join(name)));
+        let ctx = FileCtx {
+            file,
+            local: self.repl.local_version(&file),
+        };
+        let acquired = self
+            .locks
+            .acquire_file(&key, Some(ctx), false)
+            .map_err(|e| {
+                log::debug!("locks: {key}: {e}");
+                e.errno()
+            })?;
+        if acquired.new_session {
+            self.repl.session_opened(file);
+        }
+        let guard = self.guard(vec![key.clone()]);
+        self.begin(&key)?;
+        Ok(Some(guard))
+    }
+
     /// Moves write locks under `from` to the same place under `to`.
     fn rekey(&self, from: &Key, to: &Key) {
         let mut by_ino = self.by_ino();
@@ -229,6 +272,14 @@ impl WriteHooks for ClusterHooks {
             | Mutation::Allocate { node, .. }
             | Mutation::SetAttr { node, .. }
             | Mutation::Xattr { node, .. } => self.content_change(node),
+            Mutation::Remove {
+                parent,
+                name,
+                is_dir: false,
+            } => match self.remove_session(parent, name)? {
+                Some(guard) => Ok(guard),
+                None => self.op_lock(vec![child(parent, name)?]),
+            },
             Mutation::Create { parent, name, .. } | Mutation::Remove { parent, name, .. } => {
                 self.op_lock(vec![child(parent, name)?])
             }
@@ -309,8 +360,12 @@ impl WriteHooks for ClusterHooks {
 /// Drops a reference to `key`; the last one ends the session (its
 /// changes go into the journal) before the lock is released.
 fn release(locks: &LockManager, repl: &Repl, key: &Key) {
-    if let Some(file) = locks.last_reference(key) {
+    let file = locks.last_reference(key);
+    if let Some(file) = file {
         repl.end_session(file);
     }
     locks.release(key);
+    if let Some(file) = file {
+        repl.session_closed(file);
+    }
 }

@@ -78,6 +78,12 @@ pub(crate) struct State {
     pub awaiting: BTreeMap<u64, (FileId, Version)>,
     pub holders: HashMap<(FileId, Version), BTreeSet<NodeId>>,
     pub counters: Counters,
+    /// When expired tombstones were last dropped.
+    pub tombstones_expired: Option<Instant>,
+    /// Files this node holds the write lock of in a session (counted per
+    /// session). A peer's entry for one of them is older than the session
+    /// and waits until it ends.
+    pub locked_here: HashMap<FileId, usize>,
 }
 
 const CLEAN_KEY: &[u8] = b"clean";
@@ -111,12 +117,18 @@ pub(crate) fn on_journal_ack(
     done
 }
 
-/// The file and version a `Data` or `Attr` entry carries.
+/// The file and version a `Data`, `Attr` or tombstone `Remove` entry
+/// carries.
 pub(crate) fn versioned(e: &Entry) -> Option<(FileId, Version)> {
     match e {
         Entry::Data { id, version, .. } | Entry::Attr { id, version, .. } if version.seq > 0 => {
             Some((*id, *version))
         }
+        Entry::Remove {
+            id: Some(id),
+            version: Some(version),
+            ..
+        } if version.seq > 0 => Some((*id, *version)),
         _ => None,
     }
 }
@@ -159,11 +171,15 @@ pub struct Repl {
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
     invalidator: std::sync::OnceLock<Invalidator>,
+    entry_invalidator: std::sync::OnceLock<EntryInvalidator>,
     /// The mount's counters (`.syncfs/stats`).
     pub(crate) stats: std::sync::OnceLock<Arc<crate::status::Stats>>,
 }
 
 pub type Invalidator = Box<dyn Fn(&rustix::fs::Stat) + Send + Sync>;
+/// Drops the kernel's cached directory entry `name` of the directory with
+/// that stat.
+pub type EntryInvalidator = Box<dyn Fn(&rustix::fs::Stat, &std::ffi::OsStr) + Send + Sync>;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -291,6 +307,8 @@ impl Repl {
                 awaiting,
                 holders: HashMap::new(),
                 counters: Counters::default(),
+                tombstones_expired: None,
+                locked_here: HashMap::new(),
             }),
             cv: Condvar::new(),
             flusher: Arc::clone(&flusher),
@@ -307,6 +325,7 @@ impl Repl {
             this: std::sync::OnceLock::new(),
             invalidator: std::sync::OnceLock::new(),
             stats: std::sync::OnceLock::new(),
+            entry_invalidator: std::sync::OnceLock::new(),
         });
         let _ = repl.this.set(Arc::downgrade(&repl));
         let weak = Arc::downgrade(&repl);
@@ -321,6 +340,26 @@ impl Repl {
     /// Sets how to drop the kernel's caches of a file (once mounted).
     pub fn set_invalidator(&self, f: Invalidator) {
         let _ = self.invalidator.set(f);
+    }
+
+    /// Sets how to drop the kernel's cached directory entries.
+    pub fn set_entry_invalidator(&self, f: EntryInvalidator) {
+        let _ = self.entry_invalidator.set(f);
+    }
+
+    /// Replication removed or renamed `path`: the kernel must look it up
+    /// again.
+    pub(crate) fn invalidate_entry(&self, path: &[u8]) {
+        let Some(f) = self.entry_invalidator.get() else {
+            return;
+        };
+        let (parent, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => (&b""[..], path),
+        };
+        if let Ok(st) = self.backing.stat(parent) {
+            f(&st, std::ffi::OsStr::from_bytes(name));
+        }
     }
 
     /// Sets the mount's counters, where conflict copies are counted too.
@@ -368,6 +407,24 @@ impl Repl {
         (offset / self.block_size, end.div_ceil(self.block_size))
     }
 
+    /// A lock session on `id` starts here (before its freshness check).
+    pub fn session_opened(&self, id: FileId) {
+        *self.state().locked_here.entry(id).or_default() += 1;
+    }
+
+    /// The lock session on `id` ended.
+    pub fn session_closed(&self, id: FileId) {
+        let mut st = self.state();
+        if let Some(n) = st.locked_here.get_mut(&id) {
+            *n -= 1;
+            if *n == 0 {
+                st.locked_here.remove(&id);
+            }
+        }
+        drop(st);
+        self.cv.notify_all();
+    }
+
     /// A session with `version` is about to change `id`. The first time,
     /// the file enters the durable window before anything is written.
     pub fn begin_change(&self, id: FileId, version: Version) -> std::io::Result<()> {
@@ -382,7 +439,9 @@ impl Repl {
             Session {
                 version,
                 data: false,
-                meta: false,
+                // Whatever the change turns out to be, the version goes
+                // out (peers' later versions must descend from it).
+                meta: true,
                 last_sent: Instant::now(),
             },
         );
@@ -498,6 +557,35 @@ impl Repl {
             } => {
                 let path = join(&path_bytes(&parent.path()?), name);
                 let mut s = self.state();
+                // The last link of a regular file, removed in a session:
+                // a tombstone at the session's version.
+                let buried = s.index.get(&path).and_then(|id| {
+                    let last = s.index.rec(&id).is_some_and(|r| r.paths.len() == 1);
+                    let v = s.sessions.get(&id).map(|x| x.version)?;
+                    (last && !is_dir).then_some((id, v))
+                });
+                if let Some((id, version)) = buried {
+                    s.index.bury(id, version);
+                    s.dirty.forget(id);
+                    s.sessions.remove(&id);
+                    s.window_drop.insert(id);
+                    let lineage = s.index.lineage(&id);
+                    let seq = self.append(
+                        &mut s,
+                        Entry::Remove {
+                            id: Some(id),
+                            path,
+                            dir: false,
+                            version: Some(version),
+                            lineage,
+                        },
+                    );
+                    s.awaiting.insert(seq, (id, version));
+                    s.holders.entry((id, version)).or_default().insert(self.me);
+                    drop(s);
+                    self.cv.notify_all();
+                    return Ok(());
+                }
                 let id = s.index.remove_path(&path);
                 if let Some(id) = id {
                     if s.index.rec(&id).is_none() {
@@ -702,6 +790,16 @@ impl Repl {
                 s.last_sent = now;
                 s.data = false;
                 s.meta = false;
+            }
+        }
+        if st
+            .tombstones_expired
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(3600))
+        {
+            st.tombstones_expired = Some(now);
+            let n = st.index.expire_tombstones();
+            if n > 0 {
+                log::debug!("replication: dropped {n} expired tombstone(s)");
             }
         }
         let mut ops: Vec<Op> = st.index.take_changed();

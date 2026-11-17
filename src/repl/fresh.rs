@@ -11,7 +11,7 @@ use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use crate::config::NodeId;
-use crate::net::wire::{Entry, FileId, PullMode, Version, VersionInfo};
+use crate::net::wire::{Entry, FileId, NodeKind, PullMode, Version, VersionInfo};
 
 use super::backing::{hash_block, Backing};
 use super::core::Repl;
@@ -30,10 +30,34 @@ pub(crate) enum Copy {
     Relayed,
 }
 
-/// The local copy is older than a committed version that no reachable
-/// node has.
+/// Why a session must not write.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotFresh {
+    /// The local copy is older than a committed version that no reachable
+    /// node has.
+    Stale,
+    /// The file was removed at a newer version (the removal is applied
+    /// here now).
+    Removed,
+}
+
+/// The payload of the `NotFound` error a copy returns for a file the
+/// source removed at a newer version (after applying the removal).
 #[derive(Debug)]
-pub struct Stale;
+pub struct Removed;
+
+impl std::fmt::Display for Removed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("removed at a newer version")
+    }
+}
+
+impl std::error::Error for Removed {}
+
+/// Whether `e` says the file was removed (see [`Removed`]).
+pub fn is_removed(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.is::<Removed>())
+}
 
 impl Repl {
     /// Connected peers that store data.
@@ -71,9 +95,14 @@ impl Repl {
     /// that has it, then falls back to the newest committed version a
     /// reachable node has. Without that either (the local copy is older
     /// than a committed version and no holder of it answers), the session
-    /// must not write: `Err(Stale)`.
-    pub fn ensure_fresh(&self, id: FileId, known: &[VersionInfo]) -> Result<(), Stale> {
+    /// must not write: `Err(Stale)`. A node that removed the file at a
+    /// newer version: the removal is applied here, `Err(Removed)`.
+    pub fn ensure_fresh(&self, id: FileId, known: &[VersionInfo]) -> Result<(), NotFresh> {
         self.resolve_suspect(id, true);
+        if self.state().index.tombstone(&id).is_some() {
+            // Removed by a peer's entry since the file was looked up.
+            return Err(NotFresh::Removed);
+        }
         let t = version::target(known);
         if t.satisfied_by(self.local_version(&id)) {
             return Ok(());
@@ -101,6 +130,7 @@ impl Repl {
                 match self.catch_up(id, s) {
                     Ok(v) if v.is_some_and(|v| v >= newest) => return Ok(()),
                     Ok(v) => log::debug!("freshness: node {s} has {v:?} of {id}, not {newest:?}"),
+                    Err(e) if is_removed(&e) => return Err(NotFresh::Removed),
                     Err(e) => log::debug!("freshness: {id} from node {s}: {e}"),
                 }
             }
@@ -128,8 +158,10 @@ impl Repl {
             if p == self.me || !tried.insert(p) || self.net.session_of(p) == 0 {
                 continue;
             }
-            if let Err(e) = self.catch_up(id, p) {
-                log::debug!("freshness: {id} from node {p}: {e}");
+            match self.catch_up(id, p) {
+                Err(e) if is_removed(&e) => return Err(NotFresh::Removed),
+                Err(e) => log::debug!("freshness: {id} from node {p}: {e}"),
+                Ok(_) => {}
             }
         }
         let local = self.local_version(&id);
@@ -149,7 +181,7 @@ impl Repl {
                  node holding it is reachable; refusing to write",
                 cv.seq
             );
-            return Err(Stale);
+            return Err(NotFresh::Stale);
         }
         log::warn!(
             "freshness: no node with version {} of {id} is reachable and none is committed; \
@@ -181,13 +213,17 @@ impl Repl {
             .map(<[u8]>::to_vec)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         let remote = self.remote_hashes(source, id)?;
+        let local = self.local_version(&id);
         if remote.removed {
+            if let Some(v) = remote.version.filter(|v| local.is_none_or(|l| *v > l)) {
+                self.remove_local(id, v, &remote.lineage)?;
+                return Err(io::Error::new(io::ErrorKind::NotFound, Removed));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{id} was removed at node {source}"),
+                format!("node {source} removed {id} at an older version"),
             ));
         }
-        let local = self.local_version(&id);
         let older = match how {
             Copy::Fresh => remote.version <= local,
             // A relay's copy of the same version may have more of the
@@ -200,6 +236,11 @@ impl Repl {
         }
         if let Some(v) = remote.version {
             self.keep_if_diverged(id, v, &remote.lineage)?;
+        }
+        if !self.backing.exists(&path) {
+            // Removed here (a tombstone) and written again elsewhere.
+            self.backing
+                .create(&path, NodeKind::File, &remote.attrs, 0, &[])?;
         }
         let (mut diff, _) = self.differing(&path, &remote)?;
         // Blocks past the remote end go with the truncation.
@@ -236,6 +277,37 @@ impl Repl {
             self.announce_holders(id, v, vec![self.me, source]);
         }
         Ok(remote.version)
+    }
+
+    /// `id` was removed at `version` (by a peer): removes the local copy
+    /// and keeps a tombstone. The caller holds `id`.
+    pub(crate) fn remove_local(
+        &self,
+        id: FileId,
+        version: Version,
+        lineage: &[Version],
+    ) -> io::Result<()> {
+        self.keep_if_diverged(id, version, lineage)?;
+        let paths = self
+            .state()
+            .index
+            .rec(&id)
+            .map(|r| r.paths.clone())
+            .unwrap_or_default();
+        for p in &paths {
+            match self.backing.remove(p, false) {
+                Ok(()) => self.invalidate_entry(p),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut st = self.state();
+        st.index.bury(id, version);
+        st.dirty.forget(id);
+        drop(st);
+        self.flusher.flush_now()?;
+        log::debug!("replication: {id} removed at version {}", version.seq);
+        Ok(())
     }
 
     /// If `id` is a suspect, compares it with every connected data peer

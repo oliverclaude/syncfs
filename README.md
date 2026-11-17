@@ -573,6 +573,24 @@ checks that every written version is newer than every committed one and
 that no session writes on top of a copy older than a committed version. A
 variant whose fallback only asks the holders the voters know of fails it.
 
+### Tombstones
+
+Removing the last link of a regular file is a lock session like a write:
+it gets a version, the `Remove` entry carries it (and the lineage), and
+the file's record stays in the index as a *tombstone* for 7 days.
+
+- A peer applies the remove only if its copy is not newer (a write made
+  after a freshness fallback wins: the file comes back everywhere). A
+  local change the remove's lineage lacks is kept as a conflict copy
+  first.
+- Freshness knows removes: a node with a stale copy that opens the file
+  for writing learns from the remover that it is gone, removes its copy
+  and gets `ENOENT`.
+- An entry for a file this node holds the lock of waits until its session
+  ends.
+- Applying a peer's remove or rename drops the kernel's cached directory
+  entries, so the next open looks the path up again.
+
 ### Lineage and conflict copies
 
 Every copy remembers the last 16 versions it went through (its
@@ -720,8 +738,8 @@ for forwarding). Daemons show their version table in `status.json`.
 
 - Namespace changes made in the crash window may be lost; the
   directory-tree reconciliation is part of step 8.
-- Removes leave no tombstone in the version table, so a remove can race a
-  stale write that a node makes after the fallback.
+- Renaming over an existing file and removing one of several hard links
+  are not versioned (no tombstone).
 - Attribute and data caches are dropped after a peer's change; directory
   entries (a peer's create, rename or remove) show after the 1 s entry TTL.
 - With two data nodes there is nobody to forward through: a node waits

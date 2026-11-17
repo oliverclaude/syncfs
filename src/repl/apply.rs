@@ -88,6 +88,15 @@ impl Repl {
     /// Applies `origin`'s `entry`, which came from `via` (the origin, or a
     /// node forwarding it: then data comes from `via` too).
     pub(crate) fn apply(&self, origin: NodeId, via: NodeId, entry: &Entry) -> Applied {
+        if let Some((id, _)) = super::core::versioned(entry) {
+            if self.state().locked_here.contains_key(&id) {
+                // This node's session on the file started after the entry's
+                // ended (the lock is exclusive): apply it after.
+                return Err(ApplyError::Retry(io::Error::other(
+                    "the file is locked here; waiting for the session to end",
+                )));
+            }
+        }
         match entry {
             Entry::Create {
                 id,
@@ -129,6 +138,26 @@ impl Repl {
                 self.state().index.insert(path, *id);
                 Ok(true)
             }
+            Entry::Remove {
+                id: Some(id),
+                path,
+                dir: false,
+                version: Some(version),
+                lineage,
+            } => {
+                let _g = self.hold(*id);
+                if self.superseded(id, *version) || self.state().index.tombstone(id).is_some() {
+                    // Written again here since (or removed already).
+                    return Ok(false);
+                }
+                let here = self.state().index.get(path);
+                match here {
+                    Some(k) if k != *id => {}
+                    _ => self.bind(*id, path),
+                }
+                self.remove_local(*id, *version, lineage).map_err(skip)?;
+                Ok(true)
+            }
             Entry::Remove { id, path, dir, .. } => {
                 let known = self.state().index.get(path);
                 if let (Some(id), Some(k)) = (id, known) {
@@ -138,6 +167,7 @@ impl Repl {
                     }
                 }
                 let res = self.backing.remove(path, *dir);
+                self.invalidate_entry(path);
                 let mut st = self.state();
                 match res {
                     Ok(()) => {}
@@ -164,6 +194,8 @@ impl Repl {
                     }
                 }
                 self.backing.rename(from, to, *flags).map_err(skip)?;
+                self.invalidate_entry(from);
+                self.invalidate_entry(to);
                 let mut st = self.state();
                 let replaced = st.index.get(to);
                 if *flags & libc::RENAME_EXCHANGE != 0 {
@@ -274,6 +306,13 @@ impl Repl {
             // changes): compare the whole file.
             self.bind(id, &path);
             return self.copy_whole(origin, id, version);
+        }
+        if !self.backing.exists(&path) && self.state().index.tombstone(&id).is_some() {
+            // Removed here and written again at the origin.
+            self.bind(id, &path);
+            self.backing
+                .create(&path, crate::net::wire::NodeKind::File, attrs, 0, &[])
+                .map_err(skip)?;
         }
         let out = match self.backing.open_write(&path) {
             Ok(f) => f,

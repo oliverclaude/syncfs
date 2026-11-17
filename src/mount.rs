@@ -249,6 +249,14 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         let mounted = mounted.inspect(|s| {
             if let Some(repl) = &repl {
                 let notifier = s.session.notifier();
+                let (entries, dirs) = (s.session.notifier(), Arc::clone(&inodes));
+                repl.set_entry_invalidator(Box::new(move |st, name| {
+                    if let Some(ino) = dirs.live_number(st) {
+                        if let Err(e) = entries.inval_entry(fuser::INodeNo(ino), name) {
+                            log::debug!("invalidating entry {name:?} of inode {ino}: {e}");
+                        }
+                    }
+                }));
                 repl.set_invalidator(Box::new(move |st| {
                     if let Some(ino) = inodes.live_number(st) {
                         if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, 0) {
