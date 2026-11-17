@@ -14,8 +14,6 @@
 //! Files are keyed by inode number, so renaming a dirty file keeps its
 //! marks.
 
-mod ranges;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +22,7 @@ use serde_json::json;
 use crate::fs::{AttrChange, Mutation};
 use crate::status::{FnProvider, Provider};
 
-pub use ranges::Ranges;
+pub use crate::repl::ranges::Ranges;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FileDirty {

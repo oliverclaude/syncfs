@@ -2,6 +2,8 @@
 //! It takes part in membership and in lock votes (it counts towards every
 //! quorum), but never takes a lock itself.
 //!
+//! It keeps the voter table of file versions in `<state_dir>/store.redb`.
+//!
 //! Having no `.syncfs` directory, it writes the same status as JSON to
 //! `<state_dir>/status.json`, replaced atomically on every membership change
 //! and at least every 5 heartbeat intervals, and removed on exit.
@@ -17,7 +19,9 @@ use crate::config::Config;
 use crate::lock::{LockManager, Settings};
 use crate::net::Network;
 use crate::process;
-use crate::status::{providers, Registry};
+use crate::repl::store::{Flusher, Store};
+use crate::repl::version;
+use crate::status::{providers, FnProvider, Registry};
 
 /// Where daemon mode publishes its status.
 pub fn status_path(cfg: &Config) -> PathBuf {
@@ -30,9 +34,22 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
     if cfg.peers.is_empty() {
         log::warn!("daemon mode without peers: a standalone voter has nothing to vote on");
     }
-    let start = || -> anyhow::Result<(Network, Arc<Registry>, LockManager)> {
+    type Running = (
+        Network,
+        Arc<Registry>,
+        LockManager,
+        Arc<Flusher>,
+        std::thread::JoinHandle<()>,
+    );
+    let start = || -> anyhow::Result<Running> {
+        let store = Store::open(&cfg.state_dir)
+            .with_context(|| format!("opening the store in {}", cfg.state_dir.display()))?;
+        let flusher = Flusher::new(Arc::new(store));
+        let settings = Settings::from_config(cfg);
+        let versions = version::persisted(settings.quorum(), &flusher)?;
+        let flush_thread = flusher.start();
         let net = Network::start(cfg).with_context(|| format!("listening on {}", cfg.listen))?;
-        let locks = LockManager::start(Settings::from_config(cfg), net.clone());
+        let locks = LockManager::start_with_versions(settings, net.clone(), Arc::clone(&versions));
         let status = Registry::new();
         let info = providers::NodeInfo {
             config: cfg.clone(),
@@ -45,19 +62,28 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
             None,
             net.provider(),
             Some(locks.provider()),
-            None,
+            Some(Arc::new(FnProvider::new("replication", move || {
+                serde_json::json!({
+                    "implemented": true,
+                    "role": "voter-only (stores no data)",
+                    "versions": versions.lock().unwrap_or_else(|e| e.into_inner()).summary(),
+                })
+            }))),
         );
         log::info!("voter node {} running", cfg.node_id);
-        Ok((net, status, locks))
+        Ok((net, status, locks, flusher, flush_thread))
     };
     let path = status_path(cfg);
     let every = cfg.heartbeat_interval.get() * 5;
     process::run(
         cfg.foreground,
         start,
-        move |(net, status, locks), signals| {
+        move |(net, status, locks, flusher, flush_thread), signals| {
             let res = serve(&net, &status, &path, every, signals);
             locks.shutdown();
+            flusher.stop();
+            let _ = flush_thread.join();
+            let _ = flusher.flush_now();
             res
         },
     )

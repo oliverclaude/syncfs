@@ -242,6 +242,35 @@ impl VersionTable {
     }
 }
 
+/// A version table loaded from the store and saved by `flusher`.
+pub fn persisted(
+    quorum: usize,
+    flusher: &crate::repl::store::Flusher,
+) -> std::io::Result<std::sync::Arc<std::sync::Mutex<VersionTable>>> {
+    use crate::repl::store::{decode, encode, Table};
+    let mut t = VersionTable::new(quorum);
+    for (k, v) in flusher.store().load(Table::Versions)? {
+        let Ok(id) = <[u8; 16]>::try_from(k.as_slice()) else {
+            continue;
+        };
+        t.load(FileId(id), decode(&v)?);
+    }
+    let t = std::sync::Arc::new(std::sync::Mutex::new(t));
+    let weak = std::sync::Arc::downgrade(&t);
+    flusher.add_source(Box::new(move || {
+        let Some(t) = weak.upgrade() else {
+            return Default::default();
+        };
+        let changed = t.lock().unwrap_or_else(|e| e.into_inner()).take_changed();
+        changed
+            .into_iter()
+            .map(|(f, r)| (Table::Versions, f.0.to_vec(), r.map(|r| encode(&r))))
+            .collect::<Vec<_>>()
+            .into()
+    }));
+    Ok(t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

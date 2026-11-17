@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Ranges(BTreeMap<u64, u64>);
 
 impl Ranges {
@@ -50,6 +50,42 @@ impl Ranges {
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.0.iter().map(|(&s, &e)| (s, e))
     }
+
+    /// Adds every range of `other`.
+    pub fn extend(&mut self, other: &Ranges) {
+        for (a, b) in other.iter() {
+            self.insert(a, b);
+        }
+    }
+
+    /// Removes and returns up to `max` elements, lowest first.
+    pub fn take_front(&mut self, max: u64) -> Ranges {
+        let mut out = Ranges::default();
+        let mut left = max;
+        while left > 0 {
+            let Some((&s, &e)) = self.0.iter().next() else {
+                break;
+            };
+            self.0.remove(&s);
+            let cut = s + (e - s).min(left);
+            out.insert(s, cut);
+            if cut < e {
+                self.0.insert(cut, e);
+            }
+            left -= cut - s;
+        }
+        out
+    }
+}
+
+impl FromIterator<(u64, u64)> for Ranges {
+    fn from_iter<I: IntoIterator<Item = (u64, u64)>>(it: I) -> Ranges {
+        let mut r = Ranges::default();
+        for (a, b) in it {
+            r.insert(a, b);
+        }
+        r
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +110,15 @@ mod tests {
         assert_eq!(v(&r), [(0, 10)]);
         r.insert(4, 4);
         assert_eq!(r.len(), 10);
+    }
+
+    #[test]
+    fn take_front_splits() {
+        let mut r = Ranges::from_iter([(0, 3), (5, 9)]);
+        assert_eq!(v(&r.take_front(4)), [(0, 3), (5, 6)]);
+        assert_eq!(v(&r), [(6, 9)]);
+        assert_eq!(v(&r.take_front(10)), [(6, 9)]);
+        assert!(r.is_empty());
     }
 
     #[test]

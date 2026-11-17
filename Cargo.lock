@@ -620,6 +620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "096b1dd5ec053c9c2a5a26a93aafeadf73ebcb710ea54dc3151f17a8e20535ef"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -852,6 +861,7 @@ dependencies = [
  "postcard",
  "proptest",
  "proptest-derive",
+ "redb",
  "rustix",
  "serde",
  "serde_json",

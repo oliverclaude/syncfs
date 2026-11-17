@@ -225,6 +225,16 @@ impl LockManager {
     /// Starts voting (and, in mount mode, serving local acquisitions) on
     /// `net`.
     pub fn start(s: Settings, net: Network) -> LockManager {
+        let versions = Arc::new(Mutex::new(VersionTable::new(s.quorum())));
+        Self::start_with_versions(s, net, versions)
+    }
+
+    /// [`start`](Self::start) with a (persisted) version table.
+    pub fn start_with_versions(
+        s: Settings,
+        net: Network,
+        versions: Arc<Mutex<VersionTable>>,
+    ) -> LockManager {
         let epoch = Instant::now();
         let lease_ms = s.lease.as_millis() as u64;
         let voter = Voter::new(
@@ -232,7 +242,6 @@ impl LockManager {
             lease_ms,
             s.provisional_ttl().as_millis() as u64,
         );
-        let versions = Arc::new(Mutex::new(VersionTable::new(s.quorum())));
         let inner = Arc::new(Inner {
             s,
             net: net.clone(),
