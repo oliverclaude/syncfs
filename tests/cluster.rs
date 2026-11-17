@@ -440,6 +440,15 @@ fn daemons_99_nodes() {
 const LEASE: Duration = Duration::from_secs(1);
 
 fn lock_cluster(kinds: &[Kind], lock_wait: &str, files: &[&str]) -> Cluster {
+    lock_cluster_with(kinds, lock_wait, |backing| {
+        for f in files {
+            std::fs::write(backing.join(f), b"initial\n").unwrap();
+        }
+    })
+}
+
+/// A started lock cluster whose backing directories `setup` filled first.
+fn lock_cluster_with(kinds: &[Kind], lock_wait: &str, setup: impl Fn(&std::path::Path)) -> Cluster {
     let mut c = Cluster::build(
         kinds,
         &[
@@ -452,8 +461,8 @@ fn lock_cluster(kinds: &[Kind], lock_wait: &str, files: &[&str]) -> Cluster {
         ],
     );
     for n in &c.nodes {
-        for f in files {
-            std::fs::write(n.backing().join(f), b"initial\n").unwrap();
+        if n.kind == Kind::Mount {
+            setup(&n.backing());
         }
     }
     c.start_all();
@@ -991,6 +1000,29 @@ fn replicates_changes_between_mounts() {
     c.node(3).stop();
     c.node(3).start();
     assert_eq!(files(&mut c), want);
+}
+
+#[test]
+fn pre_existing_hard_links_stay_one_file() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster_with(&[Mount, Mount, Daemon], "5s", |b| {
+        std::fs::create_dir(b.join("d")).unwrap();
+        std::fs::write(b.join("d/x"), b"initial\n").unwrap();
+        std::fs::hard_link(b.join("d/x"), b.join("y")).unwrap();
+    });
+    wait_same_tree(&c, 1, 2);
+    std::fs::write(c.node(1).mnt().join("y"), b"through one link\n").unwrap();
+    wait_same_tree(&c, 1, 2);
+    let b2 = c.node(2).backing();
+    assert_eq!(
+        std::fs::read(b2.join("d/x")).unwrap(),
+        b"through one link\n"
+    );
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(b2.join("y")).unwrap().nlink(), 2);
+    let r = in_sync(&c, 1);
+    assert_eq!(r["counters"]["apply_errors"], 0, "{r:#}");
 }
 
 #[test]

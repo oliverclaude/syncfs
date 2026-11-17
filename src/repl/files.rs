@@ -46,6 +46,54 @@ impl FileId {
     }
 }
 
+/// Regular files with more than one link already in the backing
+/// directory `root`, as `(paths, sorted)` per inode. Nodes that start with
+/// the same tree give such a file the id of its first path, so its links
+/// stay one file everywhere. Does not cross into other filesystems.
+pub fn scan_hard_links(root: &std::path::Path) -> std::io::Result<Vec<Vec<Vec<u8>>>> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::symlink_metadata(root)?.dev();
+    let mut by_inode: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
+    let mut stack: Vec<Vec<u8>> = vec![Vec::new()];
+    while let Some(rel) = stack.pop() {
+        let dir = root.join(std::ffi::OsStr::from_bytes(&rel));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if rel.is_empty() && name == crate::fs::virt::NAME {
+                continue;
+            }
+            let mut p = rel.clone();
+            if !p.is_empty() {
+                p.push(b'/');
+            }
+            p.extend_from_slice(name.as_bytes());
+            let Ok(md) = e.metadata() else { continue };
+            if md.dev() != dev {
+                continue;
+            }
+            if md.is_dir() {
+                stack.push(p);
+            } else if md.is_file() && md.nlink() > 1 {
+                by_inode.entry(md.ino()).or_default().push(p);
+            }
+        }
+    }
+    let mut out: Vec<Vec<Vec<u8>>> = by_inode
+        .into_values()
+        .filter(|v| v.len() > 1)
+        .map(|mut v| {
+            v.sort();
+            v
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
 /// Is `p` equal to `prefix` or below it?
 pub fn under(p: &[u8], prefix: &[u8]) -> bool {
     prefix.is_empty()
@@ -225,6 +273,32 @@ impl Index {
         self.restore_versions(versions);
     }
 
+    /// Gives every path in `links` (one file's hard links, sorted) the id
+    /// adopted from the first, unless a path already has an id other than
+    /// its own adopted one (it was created or renamed through syncfs).
+    pub fn adopt_links(&mut self, links: &[Vec<u8>]) -> bool {
+        let Some(first) = links.first() else {
+            return false;
+        };
+        let id = FileId::adopted(first);
+        let mut changed = false;
+        for p in links {
+            match self.get(p) {
+                Some(known) if known == id => {}
+                Some(known) if known != FileId::adopted(p) => {}
+                _ => {
+                    let v = self.get(p).and_then(|k| self.version(&k));
+                    self.insert(p, id);
+                    if let Some(v) = v {
+                        self.set_version(id, v);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Store operations for everything changed since the last call.
     pub fn take_changed(&mut self) -> Vec<Op> {
         std::mem::take(&mut self.changed)
@@ -317,6 +391,34 @@ mod tests {
         assert_eq!(back.get(b"b"), Some(id(1)));
         assert_eq!(back.version(&id(1)).unwrap().seq, 3);
         assert_eq!(back.get(b"a"), None);
+    }
+
+    #[test]
+    fn pre_existing_hard_links_share_the_first_paths_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        std::fs::create_dir_all(r.join("d/e")).unwrap();
+        std::fs::create_dir_all(r.join(".syncfs")).unwrap();
+        std::fs::write(r.join("d/e/x"), b"1").unwrap();
+        std::fs::hard_link(r.join("d/e/x"), r.join("a")).unwrap();
+        std::fs::hard_link(r.join("d/e/x"), r.join(".syncfs/hidden")).unwrap();
+        std::fs::write(r.join("single"), b"2").unwrap();
+        let links = scan_hard_links(r).unwrap();
+        assert_eq!(links, vec![vec![b"a".to_vec(), b"d/e/x".to_vec()]]);
+        let mut ix = Index::default();
+        // Seen before by path (step 7 adopted each link on its own).
+        ix.id_at(b"d/e/x");
+        ix.insert(b"other", id(9));
+        assert!(ix.adopt_links(&links[0]));
+        let want = FileId::adopted(b"a");
+        assert_eq!(ix.get(b"a"), Some(want));
+        assert_eq!(ix.get(b"d/e/x"), Some(want));
+        assert_eq!(ix.rec(&want).unwrap().paths.len(), 2);
+        assert!(!ix.adopt_links(&links[0]), "idempotent");
+        // A path with a syncfs-made id keeps it.
+        ix.insert(b"b", id(7));
+        assert!(!ix.adopt_links(&[b"b".to_vec()]));
+        assert_eq!(ix.get(b"b"), Some(id(7)));
     }
 
     #[test]

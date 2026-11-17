@@ -70,6 +70,7 @@ pub(crate) struct State {
 }
 
 const CLEAN_KEY: &[u8] = b"clean";
+const LINKS_SCANNED_KEY: &[u8] = b"links_scanned";
 
 fn applied_key(origin: NodeId) -> Vec<u8> {
     format!("applied.{origin}").into_bytes()
@@ -152,7 +153,21 @@ impl Repl {
             .map(|p| p.id)
             .filter(|&id| id != cfg.node_id)
             .collect();
-        let index = Index::load(store.load(Table::Files)?)?;
+        let mut index = Index::load(store.load(Table::Files)?)?;
+        if store.get(Table::Meta, LINKS_SCANNED_KEY)?.is_none() {
+            // Once per store: files that were hard-linked before syncfs saw
+            // them become one file with one id (see `scan_hard_links`).
+            let links = super::files::scan_hard_links(backing_dir)?;
+            let n = links.iter().filter(|l| index.adopt_links(l)).count();
+            if n > 0 {
+                log::info!(
+                    "replication: {n} pre-existing hard-linked file(s) adopted as one file each"
+                );
+            }
+            let mut ops = index.take_changed();
+            ops.push((Table::Meta, LINKS_SCANNED_KEY.to_vec(), Some(encode(&true))));
+            store.commit(&ops)?;
+        }
         let mut dirty = Dirty::new(peers.iter().copied());
         dirty.load(store.load(Table::Dirty)?)?;
         let positions = store.load(Table::Positions)?;

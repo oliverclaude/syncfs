@@ -527,7 +527,9 @@ renames (the backing inode number is not used: it can be reused). Files
 created through syncfs get a random id that travels in the `Create` entry;
 files that were already in the backing directory get an id derived from
 their path, so identical pre-existing trees on two nodes agree without
-talking. The store maps ids to paths (all of a hard-linked file's names)
+talking. Files that were already hard-linked are found by a scan of the
+backing directory on the first start with a new store and get the id of
+their first path (sorted bytewise), so all their links stay one file. The store maps ids to paths (all of a hard-linked file's names)
 and to the file's version; the map is in memory too, which costs memory
 per file.
 
