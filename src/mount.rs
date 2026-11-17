@@ -249,20 +249,39 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         };
         let mounted = mounted.inspect(|s| {
             if let Some(repl) = &repl {
+                // The kernel takes the directory's or file's lock to
+                // invalidate, so the calls go through a thread of their
+                // own: an operation holding that lock may be waiting for
+                // replication to apply the entry that invalidates (e.g. a
+                // rename waiting for the lock handoff).
                 let notifier = s.session.notifier();
-                let (entries, dirs) = (s.session.notifier(), Arc::clone(&inodes));
+                let (tx, rx) = std::sync::mpsc::channel::<(u64, Option<std::ffi::OsString>)>();
+                let spawned = std::thread::Builder::new()
+                    .name("syncfs-inval".into())
+                    .spawn(move || {
+                        for (ino, name) in rx {
+                            let res = match &name {
+                                Some(n) => notifier.inval_entry(fuser::INodeNo(ino), n),
+                                None => notifier.inval_inode(fuser::INodeNo(ino), 0, 0),
+                            };
+                            if let Err(e) = res {
+                                log::debug!("invalidating {name:?} of inode {ino}: {e}");
+                            }
+                        }
+                    });
+                if let Err(e) = spawned {
+                    log::error!("cannot start the cache invalidation thread: {e}");
+                    return;
+                }
+                let (entries, dirs) = (tx.clone(), Arc::clone(&inodes));
                 repl.set_entry_invalidator(Box::new(move |st, name| {
                     if let Some(ino) = dirs.live_number(st) {
-                        if let Err(e) = entries.inval_entry(fuser::INodeNo(ino), name) {
-                            log::debug!("invalidating entry {name:?} of inode {ino}: {e}");
-                        }
+                        let _ = entries.send((ino, Some(name.to_os_string())));
                     }
                 }));
                 repl.set_invalidator(Box::new(move |st| {
                     if let Some(ino) = inodes.live_number(st) {
-                        if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, 0) {
-                            log::debug!("invalidating inode {ino}: {e}");
-                        }
+                        let _ = tx.send((ino, None));
                     }
                 }));
             }
