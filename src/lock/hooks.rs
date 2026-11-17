@@ -340,7 +340,10 @@ impl WriteHooks for ClusterHooks {
         }
         self.repl.rejoin_gate();
         let Some(key) = key_of(node)? else {
-            return Ok(());
+            // The inode has no name any more: removed (by a peer's entry,
+            // after the kernel looked it up). Opening it would write to a
+            // file nobody else sees.
+            return Err(Errno::ENOENT);
         };
         self.acquire_content(&key, node)?;
         self.by_ino().entry(node.ino()).or_default().push(key);

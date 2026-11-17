@@ -108,7 +108,7 @@ pub fn cause(
         Some(_)
             if ran_as_mount
                 && marker::backing_empty(backing)
-                && !store.load(Table::Files)?.is_empty() =>
+                && !super::files::Index::load(store.load(Table::Files)?)?.is_empty() =>
         {
             Some(Cause::Emptied)
         }
@@ -688,10 +688,25 @@ mod tests {
         );
         // Marker there, nothing indexed: an empty share, not a loss.
         assert_eq!(cause(Some(&m), true, &store, b, true).unwrap(), None);
+        use super::super::files::FileRec;
+        use super::super::store::encode;
+        let tomb = FileRec {
+            removed_at: Some(1),
+            ..FileRec::default()
+        };
         store
-            .commit(&[(Table::Files, vec![1; 16], Some(vec![0]))])
+            .commit(&[(Table::Files, vec![1; 16], Some(encode(&tomb)))])
             .unwrap();
         marker::store(b, &m).unwrap();
+        // Only tombstones: everything was removed, nothing lost.
+        assert_eq!(cause(Some(&m), true, &store, b, true).unwrap(), None);
+        let live = FileRec {
+            paths: vec![b"f".to_vec()],
+            ..FileRec::default()
+        };
+        store
+            .commit(&[(Table::Files, vec![2; 16], Some(encode(&live)))])
+            .unwrap();
         assert_eq!(
             cause(Some(&m), true, &store, b, true).unwrap(),
             Some(Cause::Emptied)
