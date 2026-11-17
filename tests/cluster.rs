@@ -546,6 +546,32 @@ fn locks_conflicting_open_is_busy_and_reads_stay_local() {
     c.converge("end");
 }
 
+/// A file replaced by a peer's rename while this node waited for its lock
+/// is gone: the open fails with `ENOENT` instead of writing to a file
+/// nobody else will see (found by the soak test).
+#[test]
+fn locks_open_of_a_file_replaced_while_waiting_is_enoent() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f", "g"]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    let w = open_rw(&m1.join("f")).unwrap();
+    let f2 = m2.join("f");
+    let waiter = std::thread::spawn(move || open_rw(&f2).map(drop));
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(m1.join("g"), b"renamed\n").unwrap();
+    std::fs::rename(m1.join("g"), m1.join("f")).unwrap();
+    drop(w);
+    assert_eq!(errno(waiter.join().unwrap()), Some(libc::ENOENT));
+    // Opened again, it is the renamed file.
+    let mut w2 = eventually("node 2 opens", || open_rw(&m2.join("f")));
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut w2, &mut s).unwrap();
+    assert_eq!(s, "renamed\n");
+    drop(w2);
+    c.converge("end");
+}
+
 /// Writers on every mount contend for one file; their critical sections
 /// (open for writing .. close) never overlap.
 fn contend(kinds: &[Kind]) {

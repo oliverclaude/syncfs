@@ -119,9 +119,14 @@ impl Repl {
     /// newer version: the removal is applied here, `Err(Removed)`.
     pub fn ensure_fresh(&self, id: FileId, known: &[VersionInfo]) -> Result<(), NotFresh> {
         self.resolve_suspect(id, true);
-        if self.state().index.tombstone(&id).is_some() {
-            // Removed by a peer's entry since the file was looked up.
-            return Err(NotFresh::Removed);
+        {
+            let st = self.state();
+            if st.index.tombstone(&id).is_some() || st.index.path_of(&id).is_none() {
+                // Removed (or replaced by a rename onto its path) by a
+                // peer's entry since the file was looked up, e.g. while
+                // the lock was waited for.
+                return Err(NotFresh::Removed);
+            }
         }
         let t = version::target(known);
         if t.satisfied_by(self.local_version(&id)) {
