@@ -846,3 +846,58 @@ fn write_path_marks_dirty_blocks_after_the_lock() {
     let r = rep(3);
     assert_eq!(r["dirty_files"], 0, "{r:#}");
 }
+
+/// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a
+/// mount has an empty backing directory with no marker: it must rebuild
+/// from its peers like a node that lost its disk (mount at once, fetch on
+/// demand, fill in the background, `EROFS` until caught up), with no lost
+/// writes to wait for. The status field names here are provisional.
+#[test]
+#[ignore = "needs the step 8 rebuild path"]
+fn daemon_upgraded_to_mount_rebuilds_from_peers() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "2s", &[]);
+    let m1 = c.node(1).mnt();
+    std::fs::create_dir(m1.join("d")).unwrap();
+    std::fs::write(m1.join("d/f"), vec![5u8; 300_000]).unwrap();
+    std::fs::write(m1.join("g"), b"small").unwrap();
+    eventually("replicated to node 2", || {
+        std::fs::read(c.node(2).mnt().join("g"))
+    });
+
+    // Upgrade node 3: same id and peers, now with a backing directory.
+    c.node(3).stop();
+    c.node(3).kind = Mount;
+    c.node(3).start();
+    c.converge("node 3 back as a mount");
+    let m3 = c.node(3).mnt();
+    let rep = c.node(3).status("replication").unwrap();
+    assert_eq!(rep["rebuild"]["active"], true, "{rep:#}");
+    // The tree is there at once; contents come on demand, checksummed.
+    assert!(m3.join("d").is_dir());
+    assert_eq!(std::fs::read(m3.join("g")).unwrap(), b"small");
+    // No writes until caught up.
+    assert_eq!(
+        errno(std::fs::write(m3.join("new"), b"x")),
+        Some(libc::EROFS)
+    );
+    eventually("rebuild finishes", || {
+        let r = c.node(3).status("replication").unwrap();
+        (r["rebuild"]["active"] == false)
+            .then_some(r)
+            .ok_or_else(|| std::io::Error::other("still rebuilding"))
+    });
+    let r = c.node(3).status("replication").unwrap();
+    assert_eq!(r["rebuild"]["files_done"], r["rebuild"]["files_total"]);
+    assert_eq!(
+        std::fs::read(c.node(3).backing().join("d/f")).unwrap(),
+        vec![5u8; 300_000]
+    );
+    // A daemon had no unreplicated writes: nothing to keep as a conflict.
+    assert_eq!(c.node(1).status("stats").unwrap()["conflict_copies"], 0);
+    // Caught up: a normal writer with a new disk id.
+    eventually("write after rebuild", || {
+        std::fs::write(m3.join("new"), b"x")
+    });
+}

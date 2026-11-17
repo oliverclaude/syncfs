@@ -604,6 +604,13 @@ Each step ends with passing tests and a commit.
      (`EROFS`) until it has caught up, then takes a new disk id and
      becomes a normal writer. Progress (files and bytes done, ETA) shows
      in `.syncfs/replication` and `status.json`.
+   - **Upgrading a voter-only daemon to a mount** (restarting it with a
+     `backing_dir`) takes the same rebuild path: mount at once, fetch on
+     demand, fill in the background, `EROFS` until caught up. The only
+     difference is that a daemon never had unreplicated writes, so there
+     is nothing to wait for or keep as a conflict copy. Covered by the
+     cluster test `daemon_upgraded_to_mount_rebuilds_from_peers` (ignored
+     until step 8 lands).
 9. **Packaging**: `.deb` for bookworm and trixie on amd64 and arm64, static
    musl portable binaries, systemd unit for daemon mode.
 10. **Soak test**: randomized multi-node run with restarts and partitions.

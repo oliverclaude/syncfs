@@ -208,7 +208,9 @@ fn counters_follow_operations() {
     assert!(delta("requests_total") >= 7);
     assert!(delta("status_requests") >= 1);
     // The kernel sends release after close returns, asynchronously.
-    wait_until("open_files back to 0", || status(&m)["stats"]["open_files"] == 0);
+    wait_until("open_files back to 0", || {
+        status(&m)["stats"]["open_files"] == 0
+    });
     // Reading .syncfs is not counted as backing I/O.
     let a = status(&m);
     let b = status(&m);
