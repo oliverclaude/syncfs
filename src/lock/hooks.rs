@@ -152,13 +152,16 @@ impl ClusterHooks {
         })?;
         if let (true, Some(f)) = (acquired.new_session, file) {
             self.repl.session_opened(f);
-            if let Err(e) = self.repl.ensure_fresh(f, &acquired.known) {
+            let fresh = self.repl.ensure_fresh(f, &acquired.known);
+            if let Err(e) = fresh {
                 release(&self.locks, &self.repl, key);
+                self.locks.ready(key);
                 return Err(match e {
                     crate::repl::fresh::NotFresh::Stale => Errno::EBUSY,
                     crate::repl::fresh::NotFresh::Removed => Errno::ENOENT,
                 });
             }
+            self.locks.ready(key);
         }
         Ok(())
     }
@@ -233,7 +236,9 @@ impl ClusterHooks {
                 e.errno()
             })?;
         if acquired.new_session {
+            // A new file: nothing to catch up on.
             self.repl.session_opened(file);
+            self.locks.ready(&key);
         }
         let guard = self.guard(vec![key.clone()]);
         self.begin(&key)?;

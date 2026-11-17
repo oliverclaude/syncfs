@@ -119,7 +119,8 @@ pub struct Acquired {
     /// the lock was already held without a file).
     pub version: Option<Version>,
     /// A new lock session (as opposed to another reference to a held
-    /// lock): the caller must check freshness.
+    /// lock): the caller must check freshness, then call
+    /// [`LockManager::ready`] (other references wait until then).
     pub new_session: bool,
 }
 
@@ -137,6 +138,11 @@ struct Held {
     since: Instant,
     renewal: Option<Renewal>,
     lapsed_logged: bool,
+    /// The session is set up (the journal handoff applied and, for a new
+    /// file session, the caller's freshness check done; see
+    /// [`LockManager::ready`]). Other references wait for it, so that
+    /// nothing on this node writes to a copy that is not caught up yet.
+    ready: bool,
 }
 
 struct Pending {
@@ -335,6 +341,17 @@ impl LockManager {
         fail_on_held: bool,
     ) -> Result<Acquired, LockError> {
         self.inner.acquire(key, true, fail_on_held, file)
+    }
+
+    /// The new session on `key` is set up (its freshness check is done):
+    /// other references to it no longer wait.
+    pub fn ready(&self, key: &Key) {
+        let mut st = lock(&self.inner.st);
+        if let Some(h) = st.held.get_mut(key) {
+            h.ready = true;
+        }
+        drop(st);
+        self.inner.cv.notify_all();
     }
 
     /// The session on `key` changed its file: its version is written.
@@ -827,20 +844,29 @@ impl Inner {
             }
             let (me, disk) = (self.s.me, self.s.disk);
             if let Some(h) = st.held.get_mut(key) {
+                if !h.ready {
+                    // Another reference is still setting the session up.
+                    st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
                 if h.valid_until > Instant::now() {
                     if add_ref {
                         h.refs += 1;
                     }
+                    let mut new_session = false;
                     if let (None, Some(ctx)) = (h.file, file) {
                         // Held without a file so far (e.g. it was just
-                        // created): the session's version goes unannounced.
+                        // created): a session starts, its version
+                        // unannounced. The caller checks freshness.
                         h.file = Some(ctx.file);
                         h.version = Some(version::next(ctx.local, &h.known, me, disk));
+                        h.ready = false;
+                        new_session = true;
                     }
                     return Ok(Acquired {
                         known: h.known.clone(),
                         version: h.version,
-                        new_session: false,
+                        new_session,
                     });
                 }
                 if let (Some(f), v) = (h.file, h.version) {
@@ -886,6 +912,7 @@ impl Inner {
                     since: Instant::now(),
                     renewal: None,
                     lapsed_logged: false,
+                    ready: false,
                 });
                 // Replaces a lapsed lock's ballot (its voters dropped it
                 // when we asked again).
@@ -917,6 +944,15 @@ impl Inner {
             if !handoff.is_empty() {
                 (c.wait)(&handoff);
             }
+        }
+        if res.is_ok() && !(acquired.new_session && file.is_some()) {
+            // Nothing for the caller to check: the session is set up.
+            let mut st = lock(&self.st);
+            if let Some(h) = st.held.get_mut(key) {
+                h.ready = true;
+            }
+            drop(st);
+            self.cv.notify_all();
         }
         res.map(|_| acquired)
     }

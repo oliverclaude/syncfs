@@ -404,11 +404,20 @@ fn grants_carry_versions_and_sessions_announce_theirs() {
     assert!(a.new_session);
     let v1 = a.version.unwrap();
     assert_eq!((v1.seq, v1.node), (1, 1));
-    // A second reference continues the session.
-    let again = nodes[0]
-        .locks
-        .acquire_file(&k("f"), ctx(None), false)
-        .unwrap();
+    // A second reference continues the session, once the first one has
+    // set it up (checked freshness).
+    let again = std::thread::scope(|s| {
+        let second = s.spawn(|| {
+            nodes[0]
+                .locks
+                .acquire_file(&k("f"), ctx(None), false)
+                .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!second.is_finished(), "joined a session not set up yet");
+        nodes[0].locks.ready(&k("f"));
+        second.join().unwrap()
+    });
     assert!(!again.new_session);
     assert_eq!(again.version, Some(v1));
     nodes[0].locks.release(&k("f"));
