@@ -160,7 +160,11 @@ fusermount3 -u /mnt/data                   # unmount (or: umount /mnt/data as ro
 
 - Without `-f`/`debug`, the command returns once the mount is up (or fails
   with the reason) and a detached daemon keeps serving, logging to syslog.
-  SIGINT, SIGTERM or SIGHUP unmount cleanly.
+  SIGINT, SIGTERM or SIGHUP unmount cleanly. A root mount that is busy
+  (a file open, a process inside it) keeps serving after the first signal
+  (logged); a second signal detaches it lazily, like `umount -l`, and the
+  daemon exits when the last open file is closed. A user mount is
+  detached lazily by `fusermount3` on the first signal.
 - **Normal users** mount through `fusermount3` (package `fuse3`).
   `allow_other` additionally needs `user_allow_other` in `/etc/fuse.conf`.
 - **Root** mounts with mount(2) directly; the mount shows up as type

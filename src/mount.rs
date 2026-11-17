@@ -240,6 +240,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
             Session::new(fs, mountpoint, &fuse_cfg)
                 .map(|session| Served {
                     session,
+                    mountpoint: mountpoint.to_path_buf(),
                     direct: None,
                     net: None,
                     cluster: None,
@@ -286,6 +287,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
 /// and must unmount ourselves too.
 struct Served {
     session: Session<SyncFs<Hooks>>,
+    mountpoint: PathBuf,
     direct: Option<PathBuf>,
     net: Option<Network>,
     cluster: Option<Cluster>,
@@ -456,6 +458,7 @@ fn mount_direct(
     match Session::from_fd(fs, OwnedFd::from(dev), fuse_cfg.acl, fuse_cfg.clone()) {
         Ok(session) => Ok(Served {
             session,
+            mountpoint: mountpoint.to_path_buf(),
             direct: Some(mountpoint.to_path_buf()),
             net: None,
             cluster: None,
@@ -468,33 +471,71 @@ fn mount_direct(
     }
 }
 
+fn umount(p: &Path, flags: libc::c_int) -> std::io::Result<()> {
+    let c =
+        std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: valid path string.
+    if unsafe { libc::umount2(c.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// A lazy unmount for a non-root mount, through fusermount3.
+fn fusermount_lazy(p: &Path) -> std::io::Result<()> {
+    // fuser's unmount may have detached it already.
+    let mounted = std::fs::read_to_string("/proc/self/mountinfo")?
+        .lines()
+        .any(|l| l.split(' ').nth(4).map(Path::new) == Some(p));
+    if !mounted {
+        return Ok(());
+    }
+    let st = std::process::Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(p)
+        .status()?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("fusermount3 -u -z: {st}")))
+    }
+}
+
 /// Runs the session until unmounted; `signals` unmount cleanly.
 fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
     let Served {
         mut session,
+        mountpoint,
         direct,
         net,
         cluster,
     } = served;
     let mut unmounter = session.unmount_callable();
     std::thread::spawn(move || {
-        if let Some(sig) = signals.forever().next() {
-            log::info!("signal {sig}: unmounting");
-            let res = match &direct {
-                Some(p) => std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
-                    .map_err(std::io::Error::other)
-                    .and_then(|c| {
-                        // SAFETY: valid path string.
-                        if unsafe { libc::umount2(c.as_ptr(), 0) } == 0 {
-                            Ok(())
-                        } else {
-                            Err(std::io::Error::last_os_error())
-                        }
-                    }),
-                None => unmounter.unmount(),
+        // The first signal unmounts; if the mount is busy, it keeps serving
+        // and a later signal detaches it lazily (it then goes away when the
+        // last open file is closed, like `umount -l`).
+        for (i, sig) in signals.forever().enumerate() {
+            let res = if i == 0 {
+                log::info!("signal {sig}: unmounting");
+                match &direct {
+                    Some(p) => umount(p, 0),
+                    None => unmounter.unmount(),
+                }
+            } else {
+                log::warn!("signal {sig} again: detaching the mount lazily");
+                match &direct {
+                    Some(p) => umount(p, libc::MNT_DETACH),
+                    None => fusermount_lazy(&mountpoint),
+                }
             };
-            if let Err(e) = res {
-                log::error!("unmount failed: {e}");
+            match res {
+                Ok(()) => {}
+                Err(e) if i == 0 => log::warn!(
+                    "unmount failed: {e}; send the signal again to detach the mount lazily"
+                ),
+                Err(e) => log::error!("lazy unmount failed: {e}"),
             }
         }
     });

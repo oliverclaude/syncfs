@@ -436,6 +436,31 @@ fn sigterm_unmounts_cleanly() {
     assert!(!is_mounted(&m.mnt));
 }
 
+/// A busy mount survives the first SIGTERM (as root; a user mount is
+/// detached lazily at once by fusermount3); a second one detaches it, and
+/// the daemon exits once the last open file is closed.
+#[test]
+fn sigterm_on_a_busy_mount_detaches_on_the_second_signal() {
+    require_fuse!();
+    let mut m = Mounted::new(&[]);
+    std::fs::write(m.m("f"), b"x").unwrap();
+    let held = std::fs::File::open(m.m("f")).unwrap();
+    let pid = m.child.as_ref().unwrap().id() as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(m.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    common::wait_until("detached", || !is_mounted(&m.mnt));
+    // The open file still works until it is closed.
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut &held, &mut s).unwrap();
+    assert_eq!(s, "x");
+    assert!(m.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    drop(held);
+    let status = m.child.take().unwrap().wait().unwrap();
+    assert!(status.success(), "{status}");
+}
+
 #[test]
 fn mount_helper_invocation() {
     require_fuse!();
