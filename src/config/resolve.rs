@@ -25,6 +25,7 @@ pub const DEFAULT_CLUSTER_NAME: &str = "syncfs";
 pub const MAX_CLUSTER_NAME_LEN: usize = 64;
 pub const DEFAULT_LOCK_LEASE_TIMEOUT: HumanDuration = HumanDuration::from_secs(30);
 pub const DEFAULT_LOCK_WAIT: HumanDuration = HumanDuration::from_secs(10);
+pub const DEFAULT_FRESHNESS_TIMEOUT: HumanDuration = HumanDuration::from_secs(30);
 pub const DEFAULT_HEARTBEAT_INTERVAL: HumanDuration = HumanDuration::from_secs(1);
 pub const DEFAULT_BLOCK_SIZE: ByteSize = ByteSize(64 * ByteSize::KIB);
 pub const MIN_BLOCK_SIZE: ByteSize = ByteSize(4 * ByteSize::KIB);
@@ -90,6 +91,9 @@ pub struct Config {
     pub lock_lease_timeout: HumanDuration,
     /// How long acquiring a lock held by another node may wait.
     pub lock_wait: HumanDuration,
+    /// How long a new lock holder waits for the newest version of the file
+    /// held only by an unreachable node.
+    pub freshness_timeout: HumanDuration,
     pub heartbeat_interval: HumanDuration,
     pub block_size: ByteSize,
     pub debug: bool,
@@ -213,6 +217,7 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
     });
     let lock_lease_timeout = p.lock_lease_timeout.unwrap_or(DEFAULT_LOCK_LEASE_TIMEOUT);
     let lock_wait = p.lock_wait.unwrap_or(DEFAULT_LOCK_WAIT);
+    let freshness_timeout = p.freshness_timeout.unwrap_or(DEFAULT_FRESHNESS_TIMEOUT);
     let heartbeat_interval = p.heartbeat_interval.unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
     let block_size = p.block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
     let allow_other = p.allow_other.unwrap_or(false);
@@ -304,6 +309,7 @@ pub fn resolve(p: PartialConfig, env: &Environment) -> Result<Resolved, Validati
             state_dir: state_dir.expect("checked above"),
             lock_lease_timeout,
             lock_wait,
+            freshness_timeout,
             heartbeat_interval,
             block_size,
             debug,
@@ -475,6 +481,7 @@ mod tests {
         assert_eq!(c.state_dir, PathBuf::from("/home/u/.local/state/syncfs"));
         assert_eq!(c.lock_lease_timeout, HumanDuration::from_secs(30));
         assert_eq!(c.lock_wait, HumanDuration::from_secs(10));
+        assert_eq!(c.freshness_timeout, HumanDuration::from_secs(30));
         assert_eq!(c.heartbeat_interval, HumanDuration::from_secs(1));
         assert_eq!(c.block_size, ByteSize(65536));
         assert!(!c.debug && !c.allow_other && !c.allow_root);

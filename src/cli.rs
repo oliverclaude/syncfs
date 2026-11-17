@@ -77,6 +77,12 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub lock_wait: Option<HumanDuration>,
 
+    /// After taking a lock, how long to wait for the newest version of the
+    /// file when only an unreachable node has it, before continuing from
+    /// the newest version a majority has [default: 30s]
+    #[arg(long, value_name = "DURATION")]
+    pub freshness_timeout: Option<HumanDuration>,
+
     /// Peer heartbeat interval [default: 1s]
     #[arg(long, value_name = "DURATION")]
     pub heartbeat_interval: Option<HumanDuration>,
@@ -128,6 +134,7 @@ impl Cli {
                 state_dir: abs(&self.state_dir),
                 lock_lease_timeout: self.lock_lease_timeout,
                 lock_wait: self.lock_wait,
+                freshness_timeout: self.freshness_timeout,
                 heartbeat_interval: self.heartbeat_interval,
                 block_size: self.block_size,
                 debug: flag(self.debug),

@@ -57,6 +57,11 @@ lock_lease_timeout: 30s
 # fails with EBUSY. 0 fails at once.                      Default: 10s
 lock_wait: 10s
 
+# After taking a lock: if the newest version of the file is only on a node
+# that is down, wait this long for it, then continue from the newest
+# version a majority has.                                  Default: 30s
+freshness_timeout: 30s
+
 # How often nodes ping each other.                        Default: 1s
 heartbeat_interval: 1s
 
