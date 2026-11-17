@@ -31,7 +31,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::handshake::{self, HandshakeError, Identity};
-use super::wire::{self, Heartbeat, Message, MAX_FRAME_LEN};
+use super::wire::{self, Heartbeat, Message, Welcome, MAX_FRAME_LEN};
 use crate::config::{Config, NodeId};
 use crate::status::{FnProvider, Provider};
 
@@ -78,6 +78,9 @@ pub struct PeerStatus {
     pub last_error: Option<String>,
     /// Nodes the peer reported up in its last heartbeat.
     pub sees: Vec<NodeId>,
+    /// The peer's member ids, when they differ from ours (accepted, with a
+    /// warning).
+    pub members_mismatch: Option<Vec<NodeId>>,
 }
 
 /// Membership at one instant.
@@ -90,6 +93,8 @@ pub struct Snapshot {
     pub reachable: usize,
     pub have_quorum: bool,
     pub peers: Vec<PeerStatus>,
+    /// Configuration problems worth an operator's attention.
+    pub warnings: Vec<String>,
 }
 
 impl Snapshot {
@@ -119,6 +124,8 @@ struct PeerInfo {
     connects: u64,
     last_error: Option<String>,
     sees: Vec<NodeId>,
+    members_mismatch: Option<Vec<NodeId>>,
+    warning: Option<String>,
     session: u64,
     conn: Option<Conn>,
 }
@@ -192,6 +199,8 @@ impl Network {
                     connects: 0,
                     last_error: None,
                     sees: Vec::new(),
+                    members_mismatch: None,
+                    warning: None,
                     session: 0,
                     conn: None,
                 }),
@@ -383,6 +392,7 @@ impl Network {
                 "reachable": snap.reachable,
                 "have_quorum": snap.have_quorum,
                 "up": snap.up_ids(),
+                "warnings": snap.warnings,
                 "peers": snap.peers,
             })
         }))
@@ -423,8 +433,14 @@ impl Shared {
                     incarnation: i.incarnation,
                     last_error: i.last_error.clone(),
                     sees: i.sees.clone(),
+                    members_mismatch: i.members_mismatch.clone(),
                 }
             })
+            .collect();
+        let warnings: Vec<String> = self
+            .slots
+            .iter()
+            .filter_map(|s| lock(&s.info).warning.clone())
             .collect();
         let up = peers.iter().filter(|p| p.state == PeerState::Up).count();
         let mut sees: Vec<NodeId> = peers
@@ -446,6 +462,7 @@ impl Shared {
             incarnation: Some(self.me.incarnation),
             last_error: None,
             sees,
+            members_mismatch: None,
         });
         peers.sort_by_key(|p| p.id);
         let reachable = up + 1;
@@ -456,6 +473,7 @@ impl Shared {
             reachable,
             have_quorum: reachable >= self.quorum,
             peers,
+            warnings,
         }
     }
 
@@ -530,7 +548,7 @@ fn accept_one(sh: Arc<Shared>, mut stream: TcpStream) {
             let Some(slot) = sh.slots.iter().find(|s| s.id == hello.node_id) else {
                 return; // check_hello guarantees membership
             };
-            run_session(&sh, slot, stream, hello.incarnation);
+            run_session(&sh, slot, stream, hello.incarnation, &hello.members);
         }
         Err(HandshakeError::Refused(r)) => {
             sh.warn_limited(format!(
@@ -549,7 +567,7 @@ fn backoff_bounds(heartbeat: Duration) -> (Duration, Duration) {
     (initial, cap)
 }
 
-fn connect(sh: &Shared, slot: &Slot) -> Result<(TcpStream, u64), HandshakeError> {
+fn connect(sh: &Shared, slot: &Slot) -> Result<(TcpStream, Welcome), HandshakeError> {
     let addrs: Vec<SocketAddr> = slot.address.to_socket_addrs()?.collect();
     let mut last = io::Error::new(io::ErrorKind::NotFound, "address resolved to nothing");
     for addr in addrs {
@@ -559,7 +577,7 @@ fn connect(sh: &Shared, slot: &Slot) -> Result<(TcpStream, u64), HandshakeError>
                 s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
                 s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
                 let w = handshake::dial(&mut s, &sh.me, slot.id)?;
-                return Ok((s, w.incarnation));
+                return Ok((s, w));
             }
             Err(e) => last = e,
         }
@@ -579,9 +597,9 @@ fn dial_loop(sh: Arc<Shared>, index: usize) {
             sh.set_state(slot, PeerState::Connecting, None);
         }
         match connect(&sh, slot) {
-            Ok((stream, incarnation)) => {
+            Ok((stream, w)) => {
                 backoff = initial;
-                run_session(&sh, slot, stream, incarnation);
+                run_session(&sh, slot, stream, w.incarnation, &w.members);
             }
             Err(e) => {
                 let state = match e {
@@ -625,7 +643,17 @@ fn dial_loop(sh: Arc<Shared>, index: usize) {
 }
 
 /// Runs an established connection until it fails or the peer leaves.
-fn run_session(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, incarnation: u64) {
+fn run_session(
+    sh: &Arc<Shared>,
+    slot: &Slot,
+    stream: TcpStream,
+    incarnation: u64,
+    members: &[NodeId],
+) {
+    let warning = sh.me.membership_warning(slot.id, members);
+    if let Some(w) = &warning {
+        sh.warn_limited(w.clone());
+    }
     let session = sh.next_session.fetch_add(1, Ordering::Relaxed);
     let (Ok(writer), Ok(handle)) = (stream.try_clone(), stream.try_clone()) else {
         return;
@@ -647,6 +675,13 @@ fn run_session(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, incarnation: u6
         i.incarnation = Some(incarnation);
         i.connects += 1;
         i.last_error = None;
+        i.members_mismatch = warning.as_ref().map(|_| {
+            let mut m = members.to_vec();
+            m.sort_unstable();
+            m.dedup();
+            m
+        });
+        i.warning = warning;
         i.session = session;
         i.conn = Some(Conn { stream: handle, tx });
     }

@@ -58,7 +58,24 @@ impl Identity {
             node_id: self.node_id,
             incarnation: self.incarnation,
             software: env!("CARGO_PKG_VERSION").into(),
+            members: self.members.clone(),
         }
+    }
+
+    /// A warning if `theirs` (a peer's member ids) differs from ours. A
+    /// different set is accepted (cluster_name is the identity), but the
+    /// two nodes then disagree about the quorum size.
+    pub fn membership_warning(&self, peer: NodeId, theirs: &[NodeId]) -> Option<String> {
+        let mut theirs = theirs.to_vec();
+        theirs.sort_unstable();
+        theirs.dedup();
+        (theirs != self.members).then(|| {
+            format!(
+                "node {peer} has peers {theirs:?}, node {} has {:?}: accepted, but the nodes \
+                 disagree about cluster size and quorum; fix the peer lists",
+                self.node_id, self.members
+            )
+        })
     }
 
     /// Whether this node dials `peer` (lower id dials higher).
@@ -90,18 +107,6 @@ impl Identity {
                 format!(
                     "node {} is not in node {}'s peers {:?}",
                     h.node_id, self.node_id, self.members
-                ),
-            );
-        }
-        let mut theirs = h.members.clone();
-        theirs.sort_unstable();
-        theirs.dedup();
-        if theirs != self.members {
-            return reject(
-                RejectReason::Membership,
-                format!(
-                    "node {} has peers {:?}, node {} has {:?}",
-                    h.node_id, theirs, self.node_id, self.members
                 ),
             );
         }
@@ -224,9 +229,13 @@ mod tests {
         assert_eq!(reason(h), Some(RejectReason::ClusterName));
         assert_eq!(reason(hello(2)), Some(RejectReason::SameNodeId));
         assert_eq!(reason(hello(7)), Some(RejectReason::UnknownNode));
+        // A different member set is accepted, with a warning.
         let mut h = hello(1);
         h.members = vec![1, 2, 3, 4];
-        assert_eq!(reason(h), Some(RejectReason::Membership));
+        assert_eq!(reason(h.clone()), None);
+        let w = me().membership_warning(1, &h.members).unwrap();
+        assert!(w.contains("[1, 2, 3, 4]") && w.contains("[1, 2, 3]"), "{w}");
+        assert_eq!(me().membership_warning(1, &[3, 2, 1]), None);
         assert_eq!(reason(hello(3)), Some(RejectReason::WrongDirection));
     }
 }

@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::config::NodeId;
 
 pub const MAGIC: [u8; 6] = *b"SYNCFS";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const PREAMBLE_LEN: usize = 8;
 /// Largest payload: a 16 MiB block (the largest `block_size`) plus headroom.
 pub const MAX_FRAME_LEN: u32 = 32 << 20;
@@ -312,6 +312,8 @@ pub struct Welcome {
     pub node_id: NodeId,
     pub incarnation: u64,
     pub software: String,
+    /// Sorted ids of the acceptor's members, so the dialer can compare too.
+    pub members: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,7 +328,9 @@ pub struct Reject {
 pub enum RejectReason {
     /// Different `cluster_name`.
     ClusterName,
-    /// Different set of node ids in `peers`.
+    /// Different set of node ids in `peers`. No longer sent (protocol 3
+    /// accepts such peers with a warning); kept so variants keep their
+    /// positions.
     Membership,
     /// The dialer's node id is not a member.
     UnknownNode,

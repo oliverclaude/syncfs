@@ -133,17 +133,30 @@ fn mismatched_cluster_name_is_rejected() {
 }
 
 #[test]
-fn mismatched_membership_is_rejected() {
+fn mismatched_membership_is_accepted_with_a_warning() {
     let ports = free_ports(3);
     let three = [(1, ports[0]), (2, ports[1]), (3, ports[2])];
     let a = Network::start(&config(1, &three[..2], ports[0], "c")).unwrap();
     let b = Network::start(&config(2, &three, ports[1], "c")).unwrap();
-    assert!(a.wait_until(WAIT, |s| s.state_of(2) == Some(PeerState::Rejected)));
-    let err = a.snapshot().peers[1].last_error.clone().unwrap();
-    assert!(
-        err.contains("Membership") && err.contains("[1, 2, 3]"),
-        "{err}"
-    );
+    assert!(a.wait_until(WAIT, |s| s.state_of(2) == Some(PeerState::Up)));
+    assert!(b.wait_until(WAIT, |s| s.state_of(1) == Some(PeerState::Up)));
+    // Both sides see the difference: the dialer from Welcome, the
+    // acceptor from Hello.
+    for (net, peer, theirs) in [(&a, 2, vec![1, 2, 3]), (&b, 1, vec![1, 2])] {
+        let s = net.snapshot();
+        let p = s.peers.iter().find(|p| p.id == peer).unwrap();
+        assert_eq!(p.members_mismatch.as_ref(), Some(&theirs));
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("disagree"), "{}", s.warnings[0]);
+        let rendered = net.provider().render();
+        assert_eq!(rendered["warnings"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            rendered["peers"][peer as usize - 1]["members_mismatch"],
+            serde_json::json!(theirs)
+        );
+    }
+    // Each still counts quorum from its own configuration.
+    assert_eq!((a.snapshot().quorum, b.snapshot().quorum), (2, 2));
     a.shutdown();
     b.shutdown();
 }
@@ -231,9 +244,6 @@ fn handshake_rejection_cases() {
     let mut h = hello(1);
     h.cluster_name = "other".into();
     assert_eq!(reject(h), RejectReason::ClusterName);
-    let mut h = hello(1);
-    h.members = vec![1, 2];
-    assert_eq!(reject(h), RejectReason::Membership);
     assert_eq!(reject(hello(9)), RejectReason::UnknownNode);
     assert_eq!(reject(hello(2)), RejectReason::SameNodeId);
     assert_eq!(reject(hello(3)), RejectReason::WrongDirection);
@@ -286,6 +296,14 @@ fn handshake_rejection_cases() {
     );
     let err = node2.snapshot().peers[0].last_error.clone().unwrap();
     assert_eq!(err, "heartbeat timeout");
+    // Different member ids: welcomed, and told node 2's members.
+    let mut h = hello(1);
+    h.members = vec![1, 2];
+    match Raw::connect(port).hello(h) {
+        Message::Welcome(w) => assert_eq!(w.members, [1, 2, 3]),
+        other => panic!("expected a welcome, got {other:?}"),
+    }
+    assert!(node2.wait_until(WAIT, |s| s.warnings.len() == 1));
     node2.shutdown();
 }
 

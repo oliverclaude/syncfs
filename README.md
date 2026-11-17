@@ -203,7 +203,7 @@ threads. That is fine at this size, so there is no gossip or relaying.
 ### Wire format
 
 Every connection starts with an 8-byte preamble in each direction:
-`SYNCFS` and the protocol version as a big-endian u16 (currently 2). The
+`SYNCFS` and the protocol version as a big-endian u16 (currently 3). The
 preamble never changes, so nodes on different protocol versions recognise
 the mismatch, log it and close. After the preamble come frames:
 
@@ -239,17 +239,24 @@ steps are logged and ignored.
 2. The acceptor refuses with `Reject {reason, detail}` and closes when:
    - `cluster_name` differs (`ClusterName`)
    - the dialer uses the acceptor's own id (`SameNodeId`)
-   - the dialer's id is not in the acceptor's peers (`UnknownNode`)
-   - the two sets of node ids differ (`Membership`)
+   - the dialer's id is not in the acceptor's peers (`UnknownNode`): the
+     acceptor has no address or slot for it
    - the dialer has the higher id (`WrongDirection`)
-3. Otherwise the acceptor answers `Welcome`, with its id and incarnation.
+3. Otherwise the acceptor answers `Welcome`, with its id, incarnation and
+   sorted node ids.
 4. The dialer checks that the node that answered is the one it meant to
    reach at that address (otherwise `expected node N ..., node M answered`).
 
-Membership is compared by node ids only, not addresses, because nodes may
-legitimately reach the same peer by different names or addresses. Refused
-peers show as `rejected` with the reason; the refusal is logged at warn
-level at most once a minute.
+`cluster_name` is the cluster's identity. If the two nodes' sets of node ids
+differ, the connection is still accepted, and both sides log a warning (at
+most once a minute) and report it: the peer's ids appear as
+`members_mismatch` on that peer and a sentence in the top-level `warnings`
+list of `.syncfs/peers` and `status.json` (and the daemon's status file).
+Each node keeps computing cluster size and quorum from its own peer list,
+so mismatched lists should be fixed. Node ids are compared, not addresses,
+because nodes may legitimately reach the same peer by different names or
+addresses. Refused peers show as `rejected` with the reason; the refusal is
+logged at warn level at most once a minute.
 
 ### Liveness and peer states
 

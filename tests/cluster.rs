@@ -374,6 +374,43 @@ fn mixed_five_nodes() {
     report("restart 2, 3, 4", c.converge("restart"));
 }
 
+/// Different peer lists (same cluster_name) are accepted; both sides warn
+/// in `.syncfs/peers`, `status.json` and the daemon's status file.
+#[test]
+fn mismatched_peer_lists_warn() {
+    require_fuse!();
+    let mut c = Cluster::build(&[Kind::Mount, Kind::Daemon], &[]);
+    // Node 2 also lists a node 3 that node 1 does not know.
+    c.node(2)
+        .args
+        .extend(["--peer".into(), "3@127.0.0.1:1".into()]);
+    c.start_all();
+    let warned = |n: &Node| {
+        n.peers()
+            .and_then(|p| p["warnings"].as_array().map(|w| w.len()))
+            == Some(1)
+    };
+    wait_until("both nodes warn", || {
+        warned(&c.nodes[0]) && warned(&c.nodes[1])
+    });
+    let p = c.node(1).peers().unwrap();
+    assert_eq!(p["peers"][1]["state"], "up");
+    assert_eq!(
+        p["peers"][1]["members_mismatch"],
+        serde_json::json!([1, 2, 3])
+    );
+    let yaml = std::fs::read_to_string(c.node(1).mnt().join(".syncfs/peers")).unwrap();
+    assert!(
+        yaml.contains("warnings:") && yaml.contains("disagree"),
+        "{yaml}"
+    );
+    let p2 = c.node(2).peers().unwrap();
+    assert_eq!(
+        p2["peers"][0]["members_mismatch"],
+        serde_json::json!([1, 2])
+    );
+}
+
 /// The maximum cluster size: 99 voter processes (each with ~250 network
 /// threads), full mesh. Heavy, so opt-in:
 /// `cargo test --release --test cluster -- --ignored --nocapture`.
