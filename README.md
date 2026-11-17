@@ -954,6 +954,17 @@ for forwarding). Daemons show their version table in `status.json`.
   entry, a dependent entry, link loss, a restart and the origin's death;
   it also shows that clearing marks on an interim acknowledgement, or a
   relay that keeps nothing, breaks it).
+- Soak (`tests/soak.rs`): 3 mounts, and 5 nodes of which 2 are daemons
+  (one upgraded to a mount mid-run), each running random creates, writes,
+  read-modify-writes under the lock, reads, unlinks, renames and directory
+  changes, while a fault-injecting TCP proxy on every link cuts or stalls
+  links and partitions minorities, and nodes are killed, stopped, paused,
+  restarted with a lost disk or a new store. After healing it checks that
+  no two nodes held conflicting locks at once (from the lock audit log,
+  `SYNCFS_TEST_LOCK_LOG`), that no committed write was lost or torn, that
+  conflict copies only appear for a node that was cut off or restarted, and
+  that all trees converge. The schedule comes from `SYNCFS_SOAK_SEED`;
+  `SYNCFS_SOAK_SECS` sets the length (see the file for the other knobs).
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
 - Packages: `scripts/deb-test.sh` installs a `.deb` in a clean container

@@ -2,6 +2,7 @@
 //! the algorithm and its safety argument.
 
 pub mod attempt;
+pub mod audit;
 pub mod key;
 #[cfg(test)]
 mod model;

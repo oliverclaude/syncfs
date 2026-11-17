@@ -17,6 +17,7 @@ use crate::repl::version::{self, VersionTable};
 use crate::status::{FnProvider, Provider};
 
 use super::attempt::{Attempt, Phase, Step};
+use super::audit::{self, Event};
 use super::key::Key;
 use super::voter::{Reply, Voter};
 
@@ -420,6 +421,7 @@ impl LockManager {
         st.held.clear();
         let mut q = Queue::new();
         for (k, b, outcome) in keys {
+            audit::record(Event::End, inner.s.me, &k, b, None);
             inner.broadcast(&mut q, |_| Message::LockRelease {
                 key: k.as_bytes().to_vec(),
                 ballot: b,
@@ -680,13 +682,14 @@ impl Inner {
             Message::LockRenewed { req, .. } => {
                 let quorum = self.s.quorum();
                 let extend = self.s.lease.saturating_sub(self.s.margin());
-                for h in st.held.values_mut() {
+                for (key, h) in st.held.iter_mut() {
                     let Some(r) = h.renewal.as_mut().filter(|r| r.req == req) else {
                         continue;
                     };
                     r.acks.insert(from);
                     if r.acks.len() >= quorum {
                         h.valid_until = h.valid_until.max(r.sent + extend);
+                        audit::record(Event::Renew, self.s.me, key, h.ballot, Some(h.valid_until));
                         h.renewal = None;
                         h.lapsed_logged = false;
                         st.counters.renewed += 1;
@@ -840,6 +843,7 @@ impl Inner {
                 h.ballot = ballot;
                 h.req = req;
                 h.valid_until = valid_until;
+                audit::record(Event::Hold, self.s.me, key, ballot, Some(valid_until));
                 h.renewal = None;
                 h.lapsed_logged = false;
                 if add_ref {
@@ -992,6 +996,7 @@ impl Inner {
         let Some(h) = st.held.remove(key) else {
             return Vec::new();
         };
+        audit::record(Event::End, self.s.me, key, h.ballot, None);
         let mut q = Queue::new();
         let outcome = h.outcome();
         self.broadcast(&mut q, |_| Message::LockRelease {
