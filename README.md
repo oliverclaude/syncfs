@@ -22,7 +22,7 @@ form a cluster and keep a full copy of the same filesystem on every node.
 - **Async replication.** After the local write completes, changes are shipped
   to the other nodes in the background, driven by a persisted per-file
   dirty-block bitmap and an ordered metadata journal (create, rename, delete,
-  chmod, ...).
+  chmod, ...). Peers pull the changed blocks. See [Replication](#replication).
 - **No quorum: read-only.** Without quorum writes fail with `EROFS`
   ("read-only file system") and reads keep working from the local copy.
 - **Rejoin.** A node that was offline catches up from its peers before it
@@ -155,7 +155,7 @@ jq .peers /mnt/data/.syncfs/status.json
 | `stats`       | per-operation call and error counts, bytes read/written, open files/dirs, inodes |
 | `peers`       | cluster size, quorum, reachable nodes, quorum verdict, every peer's live state  |
 | `locks`       | locks this node holds, the votes it has given, lease settings, counters          |
-| `replication` | what this node changed and has not replicated: dirty files and blocks, namespace changes |
+| `replication` | disk id, dirty files and blocks per peer, journal position and lag, open sessions, crash window and suspects, freshness counters, the voter version table, `in_sync` |
 | `status.json` | all of the above as one JSON object, keyed by file name, plus `format_version`   |
 
 Sections whose subsystem does not exist yet say `implemented: false`.
@@ -172,11 +172,13 @@ for incompatible changes.
   the backing directory, so for users other than root the kernel's
   permission check usually refuses first with `EACCES`. Removing or
   renaming `.syncfs` itself fails with `EROFS`.
-- **Nothing is stored in the backing directory.** If the backing directory
-  already contains a real `.syncfs`, it is shadowed: hidden from the mount
-  and untouchable through it (but left intact on disk). syncfs logs a warning
-  at mount and `node` reports `shadowed_backing_entry: true`. Rename it in
-  the backing directory to reach it through the mount.
+- **Only the disk marker is stored in the backing directory.** Cluster
+  mounts keep `<backing_dir>/.syncfs/disk` (see [Disk id](#disk-id)), hidden
+  by the virtual directory. Any other real `.syncfs` entry in the backing
+  directory is shadowed: hidden from the mount and untouchable through it
+  (but left intact on disk). syncfs logs a warning at mount and `node`
+  reports `shadowed_backing_entry: true`. Rename it in the backing directory
+  to reach it through the mount.
 - **Counters** are relaxed atomics (one uncontended add per request).
   Requests for `.syncfs` itself are counted only in `status_requests`, not
   in the per-operation or byte counters. Errors are counted per operation,
@@ -204,7 +206,7 @@ threads. That is fine at this size, so there is no gossip or relaying.
 ### Wire format
 
 Every connection starts with an 8-byte preamble in each direction:
-`SYNCFS` and the protocol version as a big-endian u16 (currently 3). The
+`SYNCFS` and the protocol version as a big-endian u16 (currently 4). The
 preamble never changes, so nodes on different protocol versions recognise
 the mismatch, log it and close. After the preamble come frames:
 
@@ -229,8 +231,12 @@ steps are logged and ignored.
 | `Hello`, `Welcome`, `Reject` | handshake (step 4) |
 | `Heartbeat {seq, up}`, `Goodbye {reason}` | liveness (step 4) |
 | `LockRequest`, `LockGrant`, `LockDeny`, `LockConfirm`, `LockConfirmed`, `LockRenew`, `LockRenewed`, `LockRelease` | write locks (step 5) |
-| `JournalEntry`, `JournalAck`, `BlockPull`, `BlockData`, `BlockPush` | replication (step 7) |
-| `CatchUpRequest`, `CatchUpDone` | rejoin (step 8) |
+| `VersionHolders` | file versions (step 7): nodes that hold a version |
+| `JournalEntry`, `JournalAck`, `BlockPull`, `BlockData`, `BlockDone`, `HashRequest`, `HashReply` | replication (step 7) |
+| `CatchUpRequest`, `CatchUpDone`, `LockFreshQuery`, `LockFreshReply` | rejoin (step 8), start-up grace probe (step 5) |
+
+`Hello` and `Welcome` carry the node's role: whether it stores data (a
+mount) and its disk id (0 for daemons).
 
 ### Handshake
 
@@ -495,34 +501,169 @@ On a cluster node every change goes through, in this order:
 2. **Quorum**: the lock is a quorum lease; without one the change fails
    with `EROFS` before anything is touched.
 3. **Local write** to the backing directory.
-4. **Mark dirty**, while the lock is still held:
-   - writes and `fallocate`: the blocks (`block_size`) they touch;
-   - truncate: the new size, dropping marks past it;
-   - chmod, chown, utimens, xattrs: the file's metadata;
-   - create, link, unlink, rmdir, rename: counted as namespace changes
-     (the metadata journal, step 7, will carry them).
+4. **Record for replication**, while the lock is still held (see
+   [Replication](#replication)):
+   - writes and `fallocate`: the blocks (`block_size`) they touch are
+     marked dirty for every data peer;
+   - truncate: marks past the new size are dropped;
+   - chmod, chown, utimens on a file: sent with the session's entry;
+     on directories, symlinks and special files: a journal entry at once;
+   - xattrs, create, link, unlink, rmdir, rename: a journal entry each.
 
-   Marks are per inode, so a dirty file keeps them when renamed. A write
-   that failed half way is still marked (some bytes may have changed); a
-   change refused by the lock or quorum marks nothing.
+   A write that failed half way is still recorded (some bytes may have
+   changed); a change refused by the lock or quorum records nothing.
 
-`.syncfs/replication` shows the marks (`dirty_files`, `dirty_blocks`,
-`truncated_files`, `meta_dirty_files`, `namespace_changes`, `in_sync`).
-For now they live in memory only (`persisted: false`), and nothing drains
-them until replication (step 7) does. Standalone nodes and voter-only
-daemons track nothing.
+## Replication
 
-### Freshness (planned)
+Mount nodes replicate to every other mount node; voter-only daemons store
+no data and only keep the version table. Standalone nodes replicate
+nothing. All state lives in a [redb](https://github.com/cberner/redb) store,
+`<state_dir>/store.redb`.
 
-A node that takes a lock must first bring its copy up to the newest
-version the granting quorum knows of, pulling missing blocks from a node
-that has it. If only an unreachable node has the newest version, it waits
-up to `freshness_timeout` (default 30 s) and then continues from the
-newest version a majority has; when that node rejoins, its diverged
-version is kept as `name.syncfs-conflict-<node>-<timestamp>` (step 8).
-The option is parsed and shown in `.syncfs/config` but has no effect yet:
-how versions are stored and compared is still open, and pulling blocks
-needs the replication transfer of step 7.
+### File identity
+
+Every file and directory has a 128-bit id that stays with it across
+renames (the backing inode number is not used: it can be reused). Files
+created through syncfs get a random id that travels in the `Create` entry;
+files that were already in the backing directory get an id derived from
+their path, so identical pre-existing trees on two nodes agree without
+talking. The store maps ids to paths (all of a hard-linked file's names)
+and to the file's version; the map is in memory too, which costs memory
+per file.
+
+### Versions
+
+A version is `(seq, node, disk)`, ordered by `seq` and then node and disk.
+
+- **One bump per lock session.** A new lock session on a regular file
+  writes version `max(local, every granting voter's latest and committed) +
+  1`. The holder announces it in `LockConfirm`; voters record it as
+  *pending*. Re-acquiring a lapsed lock continues the session and keeps
+  its version.
+- **Release.** `LockRelease` carries the outcome: written (the writer now
+  holds the version) or not (voters go back to the previous entry).
+- **Committed.** When a peer acknowledges the session's final journal
+  entry, it holds the version; the writer broadcasts `VersionHolders` and a
+  voter marks the version committed once its holders are a majority of
+  all nodes (daemons count in the denominator but never hold data).
+- **Persisted on every voter** (daemons included), and grants carry the
+  voter's entry for the file and the writer's disk id.
+
+The model check `src/repl/model.rs` explores every interleaving of
+sessions (with any majority granting, any set of nodes reachable, releases
+and holder announcements reaching any subset of voters, and crashes) and
+checks that every written version is newer than every committed one and
+that no session writes on top of a copy older than a committed version. A
+variant whose fallback only asks the holders the voters know of fails it.
+
+### Freshness
+
+Before a new lock session on a file takes writes (at open for writing, or
+for the single operation), the node brings its copy up to the newest
+version the granting voters report:
+
+1. If its copy is at least that version, nothing happens.
+2. Otherwise it compares block hashes with a node that has the version
+   (the writer while pending, else the holders) and pulls the blocks that
+   differ, then takes the size, attributes and version (xattrs are not
+   compared).
+3. If no such node answers, `open()` (or the operation) blocks for up to
+   `freshness_timeout` (default 30 s), retrying.
+4. Then it falls back: it catches up from the newest copy any reachable
+   node has (the holders of the newest committed version first). If its
+   copy is still older than the newest committed version the voters
+   report, the session refuses to write (`EBUSY`): a committed version is
+   never overwritten from an older copy. Otherwise it continues; the
+   writes of the unreachable node are kept as conflict copies when it
+   rejoins (step 8).
+
+Reads take no lock and are served from the local copy, which may lag by
+the replication delay.
+
+### Journal and dirty blocks
+
+Each node keeps an ordered journal of its own changes:
+
+| Entry | Carries |
+|-------|---------|
+| `Create` | id, path, kind, mode/owner/times, device number, symlink target |
+| `Link`, `Remove`, `Rename` | id, paths, rename flags |
+| `Attr` | id, path, version, mode/owner/times |
+| `Xattr` | id, path, name, value (or removal) |
+| `Data` | id, path, version, size, mode/owner/times |
+
+A lock session's data changes become one `Data` entry when the session
+ends (last close or the end of the operation); a session open for longer
+sends an interim `Data` entry every second. Dirty blocks are tracked per
+peer, per file and per version: a peer pulls the blocks it is missing
+(`BlockPull`), each block with its BLAKE3 hash, checked on arrival.
+Blocks in flight are cleared when the peer acknowledges an entry and
+marked again if the connection drops or the peer starts over.
+
+- **Order.** Entries go out only once durable in the store, in order, at
+  most 256 unacknowledged per peer, resent from the last acknowledgement
+  after a reconnect or 10 s of silence. Each entry lists the entries of
+  other origins its node had applied when it was made; a receiver applies
+  each origin's entries in order and waits for those dependencies (so a
+  write to a file created elsewhere never arrives before the create).
+- **Apply.** The receiver applies the entry to its backing directory
+  (paths from peers are checked and resolved beneath the backing directory
+  without following symlinks), flushes the store and only then
+  acknowledges. A `Data` entry pulls the dirty blocks, sets the size,
+  attributes and version, and drops the kernel's cached attributes and
+  pages of the file. An entry older than the local copy is skipped and the
+  origin told to drop its marks. A path that now names another file (by
+  id) is left alone.
+- **Trim.** An entry is dropped once every data peer has acknowledged it.
+- **Bulk lane.** Journal entries, blocks and hash replies share the peer
+  connection with locks and heartbeats; the writer sends control messages
+  first and one bulk message at a time between them.
+
+### Crash window
+
+The store is flushed in batches every 100 ms (each flush is one durable
+redb commit). Before a session's first change to a file, the file enters a
+persisted *window* (one synchronous flush); it leaves after its session
+ended and the entry was flushed. A clean stop records `clean`. After an
+unclean stop, every file still in the window is a *suspect*: before it
+takes writes (and in the background once a data peer is connected), its
+block hashes are compared with every connected data peer, the blocks that
+differ are marked dirty and a `Data` entry is sent. With no peer within
+`freshness_timeout`, every block is marked.
+
+### Disk id
+
+A cluster mount keeps `<backing_dir>/.syncfs/disk` with the cluster name,
+node id and a random 64-bit disk id, created on first start. A marker for
+another node or cluster stops the mount. The disk id goes into versions and
+the handshake. Step 8 turns a missing marker on a node that has state into
+the disk-loss rebuild; for now a missing marker just gets a new disk id.
+
+### Status
+
+`.syncfs/replication` on a cluster mount shows: `disk`, `block_size`,
+`files_indexed`, `dirty_files`, `dirty_blocks` (most behind peer),
+`dirty_bytes_max`, `blocks_in_flight`, `journal_last`, `journal_durable`,
+`journal_queue`, `open_sessions`, `window`, `suspects`, `unclean_start`,
+`in_sync` (nothing dirty, unacknowledged or open), `freshness_timeout`,
+`store_commits`, `store_failures`, `versions` (this node's voter table:
+`files`, `pending`, `latest_committed`), per peer `stores_data`, `disk`,
+`journal_unacked`, `dirty_blocks`, `applied_from`, and `counters`
+(`entries_made`, `entries_applied`, `entries_skipped`, `apply_errors`,
+`blocks_sent`, `blocks_received`, `bytes_sent`, `bytes_received`,
+`fresh_checks`, `fresh_pulls`, `fresh_waits`, `fresh_fallbacks`,
+`suspects_resolved`). Daemons show their version table in `status.json`.
+
+### Limits
+
+- Namespace changes made in the crash window may be lost; the
+  directory-tree reconciliation is part of step 8.
+- Removes leave no tombstone in the version table, so a remove can race a
+  stale write that a node makes after the fallback.
+- Freshness covers content and attributes, not xattrs.
+- Attribute and data caches are dropped after a peer's change; directory
+  entries (a peer's create, rename or remove) show after the 1 s entry TTL.
+- If an origin is down, entries of other origins that depend on it wait.
 
 ## Internals
 
@@ -538,8 +679,8 @@ needs the replication transfer of step 7.
   `Mutation` and passed through the `WriteHooks` trait before and after it
   is applied, and open-for-write / release go through
   `open_write`/`release_write`. A standalone node uses `LocalOnly`; a
-  cluster node uses `lock::ClusterHooks`, which also marks changes dirty
-  (`src/dirty`). See `src/fs/hooks.rs`.
+  cluster node uses `lock::ClusterHooks`, which also records changes for
+  replication (`src/repl`). See `src/fs/hooks.rs`.
 - **`.syncfs` inodes.** The directory is inode `2^63` and its files
   `2^63 + 1 + n`, far from the backing counter. See `src/fs/virt.rs`.
 
@@ -563,6 +704,14 @@ needs the replication transfer of step 7.
   (conflicting opens, 3 and 5 nodes taking turns, a killed holder, a
   partition giving `EROFS` while reads work, voter daemons forming the
   quorum).
+- Replication: unit tests of the store, journal, dirty bitmaps, file index
+  and backing access; the version model check (`src/repl/model.rs`, run
+  optimized in CI); `tests/cluster.rs` checks that two mounts' backing trees
+  converge after creates, writes, links, symlinks, chmod, xattrs, renames
+  and removes, that only changed blocks travel, that a daemon keeps its
+  version table across a restart, that a node that missed a write catches
+  up when it locks the file (and falls back after `freshness_timeout`), and
+  that a node killed while writing resends after restart.
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with
@@ -583,9 +732,12 @@ Each step ends with passing tests and a commit.
    heartbeats, peer states, reconnect, voter daemon mode.
 5. **Quorum and lock table** (done): whole-file locks with quorum leases,
    voter-only daemons voting, `EROFS` without quorum, `.syncfs/locks`.
-6. **Write path** (done, freshness pending): lock, quorum check, local
-   write, mark dirty (in memory); `freshness_timeout` option.
-7. **Async replication**: dirty-block bitmap and metadata journal.
+6. **Write path** (done): lock, quorum check, local write, mark dirty;
+   `freshness_timeout` option.
+7. **Async replication** (done): persisted dirty-block bitmaps and ordered
+   metadata journal, peers pulling blocks, file versions, hash-based
+   freshness check on lock acquisition with the timeout fallback, crash
+   window.
 8. **Rejoin and recovery**. Planned:
    - A node that rejoins with diverged, unreplicated changes keeps them as
      `name.syncfs-conflict-<node>-<timestamp>` instead of being
