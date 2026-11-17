@@ -232,7 +232,9 @@ impl Repl {
                 self.cv.notify_all();
             }
             Message::Positions { applied } => {
+                let session = self.net.session_of(from);
                 self.state().relay.learn(from, &applied);
+                self.positions_heard(from, session);
                 self.cv.notify_all();
             }
             Message::CatchUpRequest { req, .. } if self.is_rebuilding() => {

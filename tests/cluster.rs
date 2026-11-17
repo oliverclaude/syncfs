@@ -1327,6 +1327,73 @@ fn crash_window_namespace_changes_are_reconciled() {
     assert_eq!(r["counters"]["reconcile_restored"], 1, "{r:#}");
 }
 
+/// After a reconnect, local changes wait (briefly) until the node has
+/// caught up with the peer: a node that was cut off gets EEXIST for a
+/// directory made meanwhile instead of racing the peer's entry.
+#[test]
+fn reconnected_node_catches_up_before_changes() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &[]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    for round in 0..3 {
+        c.node(2).signal(libc::SIGSTOP);
+        eventually("node 2 seen down", || {
+            (c.peer_field(1, 2, "state") == "down")
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other("still up"))
+        });
+        let d = format!("d{round}");
+        std::fs::create_dir(m1.join(&d)).unwrap();
+        // Durable on node 1 (one store flush) before node 2 is back.
+        std::thread::sleep(Duration::from_millis(300));
+        c.node(2).signal(libc::SIGCONT);
+        let t = Instant::now();
+        // EROFS while the quorum comes back; never a second mkdir.
+        let r = loop {
+            match errno(std::fs::create_dir(m2.join(&d))) {
+                Some(libc::EROFS) if t.elapsed() < Duration::from_secs(4) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                r => break r,
+            }
+        };
+        assert_eq!(r, Some(libc::EEXIST), "round {round}");
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    }
+    let r = c.node(2).status("replication").unwrap();
+    assert_eq!(r["rejoining"], false, "{r:#}");
+    wait_same_tree(&c, 1, 2);
+}
+
+/// The reconnect wait stays short: a peer leaving costs nothing, a peer
+/// coming back delays the next change by at most a moment.
+#[test]
+fn reconnect_waits_are_short() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m2 = c.node(2).mnt();
+    let timed = |what: &str| {
+        let t = Instant::now();
+        std::fs::write(m2.join("f"), what).unwrap();
+        t.elapsed()
+    };
+    timed("warm");
+    let steady = timed("steady");
+    assert!(steady < Duration::from_millis(500), "steady {steady:?}");
+    c.node(1).stop();
+    let left = timed("node 1 left");
+    assert!(left < Duration::from_millis(500), "left {left:?}");
+    c.node(1).start();
+    c.converge("node 1 back");
+    let back = timed("node 1 back");
+    assert!(back < Duration::from_millis(2500), "back {back:?}");
+    let again = timed("again");
+    assert!(again < Duration::from_millis(500), "again {again:?}");
+    wait_same_tree(&c, 1, 2);
+}
+
 /// A new member (new store, empty backing directory) rebuilds from a peer
 /// instead of starting empty.
 #[test]

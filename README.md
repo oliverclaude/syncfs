@@ -698,14 +698,21 @@ marked again if the connection drops or the peer starts over.
 
 ### Rejoin
 
-After a start, local changes (writes, opens for writing, namespace
-changes) wait until the node has applied every origin's entries as far as
-each connected data peer reports applied (`Positions`), so a node that was
-away does not change a namespace it has not caught up with. If that takes
-longer than `freshness_timeout` from the start (or no data peer connects),
-changes go ahead; per-file freshness still applies. A cluster whose other
-nodes are all voter daemons does not wait. `rejoining` in
-`.syncfs/replication` shows the state.
+Local changes (writes, opens for writing, namespace changes) wait until
+the node has applied every origin's entries as far as each connected data
+peer reports applied (`Positions`, sent on every new connection), so a
+node that was away does not change a namespace it has not caught up with:
+
+- after a start, for at most `freshness_timeout` (or until a node whose
+  other nodes are all voter daemons sees them connected);
+- after a new connection to a peer, for at most 2 s (or
+  `freshness_timeout` if shorter);
+- after this process did not run for longer than the peers' down timeout
+  (3 heartbeats: stopped, or the machine suspended), for at most 2 s,
+  until positions newer than the pause arrive.
+
+A peer leaving costs nothing. Per-file freshness still applies after the
+wait. `rejoining` in `.syncfs/replication` is true while changes wait.
 
 ### Crash window
 
@@ -809,7 +816,8 @@ for forwarding). Daemons show their version table in `status.json`.
   peers are connected (writes fail with `EROFS` until then).
 - Entries for a file this node has open for writing wait until that
   session ends, and so do that origin's later entries.
-- The rejoin gate runs after a start only, not after a reconnect.
+- A change made on a peer less than one store flush (100 ms) before a
+  reconnect may still race the reconnected node's own change.
 - Serving each 1024-node tree page lists the whole source tree again, so
   listing a very large tree costs time quadratic in its size.
 - Renaming over an existing file and removing one of several hard links
@@ -870,8 +878,9 @@ for forwarding). Daemons show their version table in `status.json`.
   that a node killed while writing resends after restart, and that a
   change reaches a node through a third mount when its origin died, that a
   diverged change is kept as a conflict copy, that removes leave
-  tombstones, that a restarted node catches up before it changes the
-  namespace, that namespace changes lost with an unflushed store are
+  tombstones, that a restarted, reconnected or paused node catches up
+  before it changes the namespace (and that those waits stay short), that
+  a new member rebuilds from peers, that namespace changes lost with an unflushed store are
   reconciled (`SYNCFS_TEST_FLUSH_INTERVAL_MS` widens the crash window),
   and that a lost disk and a daemon upgraded to a mount are
   rebuilt from peers (`SYNCFS_TEST_REBUILD_DELAY_MS` slows the background

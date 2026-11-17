@@ -182,6 +182,11 @@ pub struct Repl {
     pub(crate) reconciled: AtomicBool,
     /// Held while comparing; the rejoin gate takes it before opening.
     pub(crate) reconcile_lock: Mutex<()>,
+    /// The connections the rejoin gate last passed with (see `rejoin`).
+    pub(crate) gate: Mutex<super::rejoin::Gate>,
+    /// A pause of this process longer than this (the peers' down timeout)
+    /// makes changes wait (see `rejoin`).
+    pub(crate) pause_limit: Duration,
     pub(crate) rebuild: Mutex<super::rebuild::Rebuild>,
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
@@ -352,6 +357,9 @@ impl Repl {
                 clean || rebuild.is_some() || cfg.peers.iter().all(|p| p.id == cfg.node_id),
             ),
             reconcile_lock: Mutex::new(()),
+            gate: Mutex::new(Default::default()),
+            pause_limit: cfg.heartbeat_interval.get()
+                * crate::net::membership::DOWN_AFTER_HEARTBEATS,
             rebuild: Mutex::new(super::rebuild::Rebuild {
                 cause: rebuild,
                 marker: rebuild.map(|_| super::marker::Marker {
@@ -374,6 +382,13 @@ impl Repl {
             None => Batch::default(),
         }));
         super::net::start(&repl);
+        {
+            let weak = Arc::downgrade(&repl);
+            let h = std::thread::Builder::new()
+                .name("syncfs-ticker".into())
+                .spawn(move || super::rejoin::ticker(weak))?;
+            lock(&repl.threads).push(h);
+        }
         if !repl.reconciled.load(Ordering::Relaxed) {
             let weak = Arc::downgrade(&repl);
             let h = std::thread::Builder::new()
@@ -934,6 +949,7 @@ impl Repl {
 
     fn render(&self) -> serde_json::Value {
         let rebuild = self.rebuild_status();
+        let reconnect_wait = lock(&self.gate).waiting();
         let snap = self.net.snapshot();
         let st = self.state();
         let blocks = st.dirty.blocks_per_peer();
@@ -985,7 +1001,7 @@ impl Repl {
             "window": st.window.len(),
             "suspects": st.suspects.len(),
             "unclean_start": self.unclean_start,
-            "rejoining": !self.rejoined.load(Ordering::Relaxed),
+            "rejoining": !self.rejoined.load(Ordering::Relaxed) || reconnect_wait,
             "rebuild": rebuild,
             "in_sync": st.dirty.files() == 0 && !lagging && st.sessions.is_empty(),
             "freshness_timeout": humantime::format_duration(self.freshness_timeout).to_string(),
