@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use common::{is_mounted, unmount, wait_until, BIN};
+use common::{is_mounted, unmount, wait_for, wait_until, BIN};
 
 /// Heartbeat used by the test clusters; peers are down after 3 of these.
 const HEARTBEAT: &str = "100ms";
@@ -1110,6 +1110,65 @@ fn crash_while_writing_resends_after_restart() {
     c.node(1).start();
     let r = c.node(1).status("replication").unwrap();
     assert_eq!(r["unclean_start"], false, "{r:#}");
+}
+
+/// A change reaches a node whose origin went away before it could send it:
+/// a third mount forwards it, ordered and once.
+#[test]
+fn changes_are_forwarded_when_the_origin_is_down() {
+    require_fuse!();
+    let mut c = lock_cluster(&[Kind::Mount, Kind::Mount, Kind::Mount], "5s", &["f"]);
+    c.node(3).signal(libc::SIGSTOP);
+    let m1 = c.node(1).mnt();
+    std::fs::write(m1.join("f"), b"one\n").unwrap();
+    std::fs::write(m1.join("g"), b"two\n").unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has both changes", || {
+        (std::fs::read(b2.join("f")).ok()? == b"one\n"
+            && std::fs::read(b2.join("g")).ok()? == b"two\n")
+            .then_some(())
+    });
+    c.node(1).kill();
+    c.node(3).signal(libc::SIGCONT);
+    let b3 = c.node(3).backing();
+    let t = Instant::now();
+    while std::fs::read(b3.join("f")).ok().as_deref() != Some(b"one\n")
+        || std::fs::read(b3.join("g")).ok().as_deref() != Some(b"two\n")
+    {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "node 3 lacks the changes: {:?} {:?}\n{:#}\n{:#}\n{}",
+            std::fs::read(b3.join("f")).map(String::from_utf8),
+            std::fs::read(b3.join("g")).map(String::from_utf8),
+            c.node(3).status("replication").unwrap(),
+            c.node(2).status("replication").unwrap(),
+            std::fs::read_to_string(c.node(3).dir.join("log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = c.node(3).status("replication").unwrap();
+    assert!(
+        r["counters"]["entries_relayed"].as_u64().unwrap() >= 1,
+        "{r:#}"
+    );
+    let r2 = c.node(2).status("replication").unwrap();
+    assert!(
+        r2["counters"]["entries_forwarded"].as_u64().unwrap() >= 1,
+        "{r2:#}"
+    );
+    // Node 3 is writable without waiting for node 1.
+    let t = Instant::now();
+    std::fs::write(c.node(3).mnt().join("f"), b"three\n").unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    // Node 1 comes back, takes the newer write, and has nothing left to
+    // send.
+    c.node(1).start();
+    c.converge("node 1 back");
+    wait_same_tree(&c, 1, 3);
+    wait_same_tree(&c, 2, 3);
+    let r = in_sync(&c, 1);
+    assert_eq!(r["suspects"], 0, "{r:#}");
+    in_sync(&c, 3);
 }
 
 /// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a

@@ -27,7 +27,7 @@ type ByVersion = BTreeMap<Version, Ranges>;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Persisted(Vec<(NodeId, Vec<(Version, Ranges)>)>);
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Dirty {
     /// Peers that get marks.
     peers: BTreeSet<NodeId>,
@@ -259,6 +259,25 @@ impl Dirty {
             }
         }
         out
+    }
+
+    /// Everything pending and in flight, in a fixed order (for the model
+    /// check's state digest).
+    #[cfg(test)]
+    pub fn dump(&self) -> String {
+        let mut pending: Vec<String> = self
+            .pending
+            .iter()
+            .flat_map(|(f, per)| per.iter().map(move |(p, vs)| format!("{f}/{p}:{vs:?}")))
+            .collect();
+        pending.sort();
+        let mut inflight: Vec<String> = self
+            .inflight
+            .iter()
+            .map(|((p, f), vs)| format!("{f}/{p}:{vs:?}"))
+            .collect();
+        inflight.sort();
+        format!("{pending:?}{inflight:?}")
     }
 
     pub fn inflight_blocks(&self) -> u64 {

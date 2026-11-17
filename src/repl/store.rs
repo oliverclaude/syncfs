@@ -34,6 +34,9 @@ pub enum Table {
     Journal,
     /// Per origin: last applied journal seq; per peer: last acked.
     Positions,
+    /// Other origins' entries kept for forwarding: origin (BE u16), seq
+    /// (BE) -> entry.
+    Relay,
 }
 
 impl Table {
@@ -46,10 +49,11 @@ impl Table {
             Table::Window => "window",
             Table::Journal => "journal",
             Table::Positions => "positions",
+            Table::Relay => "relay",
         })
     }
 
-    const ALL: [Table; 7] = [
+    const ALL: [Table; 8] = [
         Table::Meta,
         Table::Versions,
         Table::Files,
@@ -57,6 +61,7 @@ impl Table {
         Table::Window,
         Table::Journal,
         Table::Positions,
+        Table::Relay,
     ];
 }
 

@@ -246,7 +246,8 @@ steps are logged and ignored.
 | `LockRequest`, `LockGrant`, `LockDeny`, `LockConfirm`, `LockConfirmed`, `LockRenew`, `LockRenewed`, `LockRelease` | write locks (step 5) |
 | `VersionHolders` | file versions (step 7): nodes that hold a version |
 | `JournalEntry`, `JournalAck`, `BlockPull`, `BlockData`, `BlockDone`, `HashRequest`, `HashReply` | replication (step 7) |
-| `CatchUpRequest`, `CatchUpDone`, `LockFreshQuery`, `LockFreshReply` | rejoin (step 8), start-up grace probe (step 5) |
+| `Positions`, `CatchUpRequest`, `CatchUpDone` | forwarding journal entries of other origins |
+| `LockFreshQuery`, `LockFreshReply` | start-up grace probe (step 5) |
 
 `Hello` and `Welcome` carry the node's role: whether it stores data (a
 mount) and its disk id (0 for daemons). `Hello` also names the lane (main
@@ -634,6 +635,25 @@ marked again if the connection drops or the peer starts over.
   origin told to drop its marks. A path that now names another file (by
   id) is left alone.
 - **Trim.** An entry is dropped once every data peer has acknowledged it.
+- **Forwarding.** Nothing waits on a peer that is down. Every node keeps
+  the entries of other origins that it applied (the `relay` table) until
+  every data node besides the origin has applied them; nodes tell each
+  other what they have applied (`Positions`, on each connection, on a
+  change at most once a second, and every 5 s). A node that cannot reach
+  an origin asks a connected data peer that is further along
+  (`CatchUpRequest`); the peer answers with up to 256 entries per origin,
+  each with its origin's sequence number and dependencies, then
+  `CatchUpDone`. Copies are deduplicated by (origin, sequence): the
+  origin's copy is preferred, a copy whose sender went away is dropped
+  (the origin resends on its next connection; another peer can forward
+  it), and each origin's entries still apply in order and after their
+  dependencies. A forwarded `Data` entry copies the forwarder's content by
+  block hashes (the forwarder applied the entry, so it has at least that
+  version). The origin drops its dirty marks for a peer when the peer
+  acknowledges the session's final entry, however the peer got it; an
+  interim entry's acknowledgement does not clear them, since later writes
+  of the session may still be marked. Requests to a peer fail as soon as
+  its connection drops.
 - **Bulk lane.** Journal entries, blocks and hash replies go over the
   bulk lane to the peer (see [Topology](#topology)).
 
@@ -671,7 +691,9 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
 (`entries_made`, `entries_applied`, `entries_skipped`, `apply_errors`,
 `blocks_sent`, `blocks_received`, `bytes_sent`, `bytes_received`,
 `fresh_checks`, `fresh_pulls`, `fresh_waits`, `fresh_fallbacks`,
-`suspects_resolved`). Daemons show their version table in `status.json`.
+`suspects_resolved`, `entries_relayed` (applied from a forwarder),
+`entries_forwarded` (sent for another origin)), and `relay_entries` (kept
+for forwarding). Daemons show their version table in `status.json`.
 
 ### Limits
 
@@ -681,7 +703,8 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
   stale write that a node makes after the fallback.
 - Attribute and data caches are dropped after a peer's change; directory
   entries (a peer's create, rename or remove) show after the 1 s entry TTL.
-- If an origin is down, entries of other origins that depend on it wait.
+- With two data nodes there is nobody to forward through: a node waits
+  for the origin (reads stay local; locked writes use freshness).
 - Paths longer than `PATH_MAX` (4096 bytes) cannot be named and are not
   replicated (a warning is logged); their locks fall back to the root lock.
 
@@ -731,7 +754,13 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
   and removes, that only changed blocks travel, that a daemon keeps its
   version table across a restart, that a node that missed a write catches
   up when it locks the file (and falls back after `freshness_timeout`), and
-  that a node killed while writing resends after restart.
+  that a node killed while writing resends after restart, and that a
+  change reaches a node through a third mount when its origin died; an
+  exhaustive model check of forwarding and dirty marks
+  (`src/repl/relay_model.rs`: three nodes, a session with an interim
+  entry, a dependent entry, link loss, a restart and the origin's death;
+  it also shows that clearing marks on an interim acknowledgement, or a
+  relay that keeps nothing, breaks it).
 - `scripts/container-test.sh bookworm|trixie [arm64]` builds and tests in a
   clean Debian container, natively or emulated through qemu-user/binfmt.
 - [pjdfstest](https://github.com/pjd/pjdfstest) as root on a mount with

@@ -9,11 +9,13 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::config::NodeId;
-use crate::net::wire::{Attrs, BlockHash, Entry, FileId, Message, PullMode, Version};
+use crate::net::wire::{Attrs, BlockHash, FileId, Message, PullMode, Version};
 
 use super::backing::{hash_block, Backing};
 use super::core::{lock, Repl};
+use super::journal::Record;
 use super::ranges::Ranges;
+use super::relay::Queued;
 
 /// Unacknowledged journal entries in flight per peer.
 const SEND_WINDOW: u64 = 256;
@@ -21,16 +23,18 @@ const SEND_WINDOW: u64 = 256;
 const RESEND_AFTER: Duration = Duration::from_secs(10);
 /// How long to wait for one answer from a peer.
 pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a waiting request checks that its connection is still there.
+const RPC_POLL: Duration = Duration::from_millis(100);
 /// Data per block pull and per hash reply.
 const PULL_BYTES: u64 = 4 << 20;
 const HASH_BYTES: u64 = 256 << 20;
 
-/// Journal entries received from one origin, not applied yet.
-#[derive(Default)]
-pub(crate) struct Inbox {
-    pub queue: BTreeMap<u64, (Vec<(NodeId, u64)>, Entry)>,
-    pub worker: bool,
-}
+/// How often positions go to each data peer, and how often a node asks
+/// a relay for the entries of an origin it cannot reach.
+const POSITIONS_EVERY: Duration = Duration::from_secs(1);
+const RELAY_POLL: Duration = Duration::from_millis(300);
+/// Entries per origin in one answer to `CatchUpRequest`.
+const RELAY_BATCH: usize = 256;
 
 pub(crate) fn start(repl: &Arc<Repl>) {
     let weak = Arc::downgrade(repl);
@@ -55,17 +59,28 @@ pub(crate) fn start(repl: &Arc<Repl>) {
     let weak = Arc::downgrade(repl);
     threads.push(
         std::thread::Builder::new()
+            .name("syncfs-repl-relay".into())
+            .spawn(move || relay_loop(weak))
+            .expect("spawning the relay puller"),
+    );
+    let weak = Arc::downgrade(repl);
+    threads.push(
+        std::thread::Builder::new()
             .name("syncfs-repl-suspects".into())
             .spawn(move || super::fresh::suspect_loop(weak))
             .expect("spawning the suspect checker"),
     );
 }
 
+/// What a send loop last gossiped: the session, when, and the positions.
+type PositionsSent = Option<(u64, Instant, Vec<(NodeId, u64)>)>;
+
 fn send_loop(weak: Weak<Repl>, peer: NodeId) {
     let mut session = 0u64;
     let mut sent = 0u64;
     let mut last_acked = 0u64;
     let mut last_progress = Instant::now();
+    let mut positions_sent: PositionsSent = None;
     loop {
         let Some(r) = weak.upgrade() else { return };
         if r.stopping() {
@@ -82,6 +97,7 @@ fn send_loop(weak: Weak<Repl>, peer: NodeId) {
             let mut st = r.state();
             st.dirty.drop_peer(peer);
             st.journal.drop_peer(peer);
+            st.relay.drop_peer(peer);
             return;
         }
         let s = r.net.session_of(peer);
@@ -92,6 +108,27 @@ fn send_loop(weak: Weak<Repl>, peer: NodeId) {
             let mut st = r.state();
             st.dirty.restore(peer);
             sent = st.journal.acked(peer);
+        }
+        if s != 0 && role.is_some() {
+            // Positions: on a new connection, on a change, and now and then.
+            let pos = r.positions();
+            let due = match &positions_sent {
+                None => true,
+                Some((sess, at, last)) => {
+                    *sess != s
+                        || (*last != pos && at.elapsed() >= POSITIONS_EVERY)
+                        || at.elapsed() >= POSITIONS_EVERY * 5
+                }
+            };
+            if due {
+                r.net.send(
+                    peer,
+                    Message::Positions {
+                        applied: pos.clone(),
+                    },
+                );
+                positions_sent = Some((s, Instant::now(), pos));
+            }
         }
         if s != 0 {
             let st = r.state();
@@ -129,6 +166,14 @@ fn send_loop(weak: Weak<Repl>, peer: NodeId) {
 }
 
 impl Repl {
+    /// What this node tells peers in `Positions`.
+    pub(crate) fn positions(&self) -> Vec<(NodeId, u64)> {
+        let st = self.state();
+        let mut p: Vec<(NodeId, u64)> = st.applied_durable.iter().map(|(o, s)| (*o, *s)).collect();
+        p.push((self.me, st.journal.durable()));
+        p
+    }
+
     pub(crate) fn receive(self: &Arc<Self>, from: NodeId, msg: Message) {
         match msg {
             Message::JournalEntry {
@@ -136,27 +181,68 @@ impl Repl {
                 seq,
                 deps,
                 entry,
-            } if origin == from => {
+            } if origin != self.me && self.peers.contains(&origin) => {
+                // From the origin, or forwarded by `from`.
                 let mut inbox = lock(&self.inbox);
-                let ib = inbox.entry(from).or_default();
-                ib.queue.insert(seq, (deps, entry));
+                let ib = inbox.entry(origin).or_default();
+                ib.insert(
+                    origin,
+                    seq,
+                    Queued {
+                        deps,
+                        entry,
+                        via: from,
+                    },
+                );
                 if !ib.worker {
                     ib.worker = true;
                     let weak = Arc::downgrade(self);
                     let spawned = std::thread::Builder::new()
-                        .name(format!("syncfs-repl-rx-{from}"))
-                        .spawn(move || apply_loop(weak, from));
+                        .name(format!("syncfs-repl-rx-{origin}"))
+                        .spawn(move || apply_loop(weak, origin));
                     match spawned {
                         Ok(h) => lock(&self.threads).push(h),
                         Err(e) => {
                             ib.worker = false;
-                            log::error!("replication: cannot start applier for node {from}: {e}");
+                            log::error!("replication: cannot start applier for node {origin}: {e}");
                         }
                     }
                 }
                 drop(inbox);
                 self.cv.notify_all();
             }
+            Message::Positions { applied } => {
+                self.state().relay.learn(from, &applied);
+                self.cv.notify_all();
+            }
+            Message::CatchUpRequest { req, since } => {
+                let batches: Vec<(NodeId, Vec<(u64, Record)>)> = {
+                    let st = self.state();
+                    since
+                        .iter()
+                        .filter(|(o, _)| *o != self.me && *o != from)
+                        .map(|&(o, after)| (o, st.relay.serve(o, after, RELAY_BATCH)))
+                        .collect()
+                };
+                let mut n = 0;
+                for (origin, entries) in batches {
+                    for (seq, rec) in entries {
+                        n += 1;
+                        self.net.send(
+                            from,
+                            Message::JournalEntry {
+                                origin,
+                                seq,
+                                deps: rec.deps,
+                                entry: rec.entry,
+                            },
+                        );
+                    }
+                }
+                self.state().counters.entries_forwarded += n;
+                self.net.send(from, Message::CatchUpDone { req });
+            }
+            Message::CatchUpDone { .. } => {}
             Message::JournalAck { origin, seq } if origin == self.me => self.on_ack(from, seq),
             Message::BlockPull { req, file, mode } => {
                 let me = Arc::clone(self);
@@ -191,14 +277,15 @@ impl Repl {
         let mut announce = Vec::new();
         {
             let mut st = self.state();
-            st.journal.ack(peer, seq);
-            st.dirty.acked(peer);
+            let st = &mut *st;
+            let done = super::core::on_journal_ack(
+                &mut st.journal,
+                &mut st.dirty,
+                &st.awaiting,
+                peer,
+                seq,
+            );
             let peers: Vec<NodeId> = st.journal.peers().collect();
-            let done: Vec<(u64, FileId, Version)> = st
-                .awaiting
-                .range(..=seq)
-                .map(|(s, (id, v))| (*s, *id, *v))
-                .collect();
             for (s, id, v) in done {
                 let h = st.holders.entry((id, v)).or_default();
                 if h.insert(peer) {
@@ -225,6 +312,8 @@ impl Repl {
             repl: self,
             req,
             rx,
+            peer,
+            session: self.net.session_of(peer),
         };
         if !self.net.send(peer, msg) {
             return Err(io::Error::new(
@@ -507,13 +596,36 @@ pub(crate) struct Rpc<'a> {
     repl: &'a Repl,
     req: u64,
     rx: mpsc::Receiver<Message>,
+    peer: NodeId,
+    /// The connection the request went out on: answers cannot come once
+    /// it is gone.
+    session: u64,
 }
 
 impl Rpc<'_> {
     pub fn recv(&self) -> io::Result<Message> {
-        self.rx
-            .recv_timeout(RPC_TIMEOUT)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no answer from peer"))
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left.min(RPC_POLL)) {
+                Ok(m) => return Ok(m),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if self.repl.net.session_of(self.peer) != self.session {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("node {} went away", self.peer),
+                ));
+            }
+            if left.is_zero() {
+                break;
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no answer from peer",
+        ))
     }
 }
 
@@ -540,30 +652,19 @@ fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
         }
         // The next entry to apply, if it and its dependencies are here.
         let next = {
-            let applied = r.state().applied.get(&origin).copied().unwrap_or(0);
-            let mut inbox = lock(&r.inbox);
-            let ib = inbox.entry(origin).or_default();
-            // Duplicates (resent after a reconnect).
-            while ib
-                .queue
-                .first_key_value()
-                .is_some_and(|(s, _)| *s <= applied)
-            {
-                ib.queue.pop_first();
-            }
-            match ib.queue.first_key_value() {
-                Some((&s, (deps, _))) if s == applied + 1 => {
-                    let st = r.state();
-                    let ready = deps
-                        .iter()
-                        .all(|(n, k)| *n == r.me || st.applied.get(n).copied().unwrap_or(0) >= *k);
-                    drop(st);
-                    ready.then(|| ib.queue.pop_first().expect("checked"))
-                }
-                _ => None,
-            }
+            let (applied, all) = {
+                let st = r.state();
+                (
+                    st.applied.get(&origin).copied().unwrap_or(0),
+                    st.applied.clone(),
+                )
+            };
+            lock(&r.inbox)
+                .entry(origin)
+                .or_default()
+                .next(r.me, applied, &all)
         };
-        let Some((seq, (deps, entry))) = next else {
+        let Some((seq, q)) = next else {
             // Acknowledge again whatever is applied (the ack may be lost).
             let applied = r.state().applied.get(&origin).copied().unwrap_or(0);
             if applied > 0 {
@@ -579,46 +680,107 @@ fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
             let _ = r.cv.wait_timeout(st, Duration::from_millis(200));
             continue;
         };
-        match r.apply(origin, &entry) {
+        let res = r.apply(origin, q.via, &q.entry);
+        let done = |r: &Repl, ok: bool| {
+            let mut st = r.state();
+            if ok {
+                st.counters.entries_applied += 1;
+            }
+            if q.via != origin {
+                st.counters.entries_relayed += 1;
+            }
+            st.applied.insert(origin, seq);
+            st.applied_changed = true;
+            st.relay.keep(
+                origin,
+                seq,
+                Record {
+                    deps: q.deps.clone(),
+                    entry: q.entry.clone(),
+                },
+            );
+            drop(st);
+            // Durable before acknowledging.
+            if r.flusher.flush_now().is_ok() {
+                let mut st = r.state();
+                let d = st.applied_durable.entry(origin).or_default();
+                *d = (*d).max(seq);
+                drop(st);
+                r.net.send(origin, Message::JournalAck { origin, seq });
+            }
+            r.cv.notify_all();
+        };
+        match res {
             Ok(applied) => {
                 backoff = Duration::from_millis(50);
-                let mut st = r.state();
-                if applied {
-                    st.counters.entries_applied += 1;
-                } else {
-                    st.counters.entries_skipped += 1;
+                if !applied {
+                    r.state().counters.entries_skipped += 1;
                 }
-                st.applied.insert(origin, seq);
-                st.applied_changed = true;
-                drop(st);
-                // Durable before acknowledging.
-                if r.flusher.flush_now().is_ok() {
-                    r.net.send(origin, Message::JournalAck { origin, seq });
-                }
-                r.cv.notify_all();
+                done(&r, applied);
             }
             Err(ApplyError::Skip(e)) => {
-                log::warn!("replication: skipping entry {seq} from node {origin} ({entry:?}): {e}");
-                let mut st = r.state();
-                st.counters.apply_errors += 1;
-                st.applied.insert(origin, seq);
-                st.applied_changed = true;
-                drop(st);
-                if r.flusher.flush_now().is_ok() {
-                    r.net.send(origin, Message::JournalAck { origin, seq });
-                }
+                log::warn!(
+                    "replication: skipping entry {seq} from node {origin} ({:?}): {e}",
+                    q.entry
+                );
+                r.state().counters.apply_errors += 1;
+                done(&r, false);
             }
             Err(ApplyError::Retry(e)) => {
                 log::debug!("replication: entry {seq} from node {origin}: {e}; retrying");
-                lock(&r.inbox)
-                    .entry(origin)
-                    .or_default()
-                    .queue
-                    .insert(seq, (deps, entry));
+                // A copy whose sender went away is dropped: the origin
+                // resends on its next connection, and meanwhile the relay
+                // loop asks a peer that has the entry.
+                if r.data_peers_up().contains(&q.via) {
+                    lock(&r.inbox)
+                        .entry(origin)
+                        .or_default()
+                        .insert(origin, seq, q);
+                }
                 drop(r);
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
         }
+    }
+}
+
+/// Asks relays for the entries of origins this node cannot reach.
+fn relay_loop(weak: Weak<Repl>) {
+    loop {
+        let Some(r) = weak.upgrade() else { return };
+        if r.stopping() {
+            return;
+        }
+        let up = r.data_peers_up();
+        let mut ask: BTreeMap<NodeId, Vec<(NodeId, u64)>> = BTreeMap::new();
+        {
+            let st = r.state();
+            let inbox = lock(&r.inbox);
+            for &o in &r.peers {
+                if up.contains(&o) {
+                    continue;
+                }
+                let applied = st.applied.get(&o).copied().unwrap_or(0);
+                if inbox.get(&o).is_some_and(|ib| ib.has(applied + 1)) {
+                    continue;
+                }
+                let best = up
+                    .iter()
+                    .map(|&p| (st.relay.position(p, o), p))
+                    .max()
+                    .filter(|(pos, _)| *pos > applied);
+                if let Some((_, p)) = best {
+                    ask.entry(p).or_default().push((o, applied));
+                }
+            }
+        }
+        for (p, since) in ask {
+            log::debug!("replication: asking node {p} for entries of {since:?}");
+            let req = r.req();
+            r.net.send(p, Message::CatchUpRequest { req, since });
+        }
+        let st = r.state();
+        let _ = r.cv.wait_timeout(st, RELAY_POLL);
     }
 }

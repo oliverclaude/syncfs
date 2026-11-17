@@ -20,6 +20,7 @@ use super::backing::{attrs_of, kind_of, Backing};
 use super::dirty::Dirty;
 use super::files::Index;
 use super::journal::Journal;
+use super::relay::{Inbox, RelayLog};
 use super::store::{decode, encode, Batch, Flusher, Op, Table};
 
 /// How often an open session's changes go out while it is still writing.
@@ -47,6 +48,10 @@ pub(crate) struct Counters {
     pub fresh_waits: u64,
     pub fresh_fallbacks: u64,
     pub suspects_resolved: u64,
+    /// Entries applied that came through another node than their origin.
+    pub entries_relayed: u64,
+    /// Entries of other origins this node forwarded.
+    pub entries_forwarded: u64,
 }
 
 pub(crate) struct State {
@@ -55,7 +60,11 @@ pub(crate) struct State {
     pub journal: Journal,
     /// Per origin: last applied journal entry.
     pub applied: BTreeMap<NodeId, u64>,
+    /// The same, as far as it is durable (what peers are told).
+    pub applied_durable: BTreeMap<NodeId, u64>,
     pub applied_changed: bool,
+    /// Other origins' entries kept for nodes that cannot reach them.
+    pub relay: RelayLog,
     pub sessions: HashMap<FileId, Session>,
     /// Files whose changes may not be recorded durably yet.
     pub window: BTreeSet<FileId>,
@@ -74,6 +83,40 @@ const LINKS_SCANNED_KEY: &[u8] = b"links_scanned";
 
 fn applied_key(origin: NodeId) -> Vec<u8> {
     format!("applied.{origin}").into_bytes()
+}
+
+/// `peer` acknowledged this node's journal up to `seq`: trims the journal,
+/// drops the marks of what it pulled, and, for every session-final entry
+/// up to `seq` (in `awaiting`), the marks of that version and older it did
+/// not pull (it has the final state of the version, from here or from a
+/// relay). Returns those entries.
+pub(crate) fn on_journal_ack(
+    journal: &mut Journal,
+    dirty: &mut Dirty,
+    awaiting: &BTreeMap<u64, (FileId, Version)>,
+    peer: NodeId,
+    seq: u64,
+) -> Vec<(u64, FileId, Version)> {
+    journal.ack(peer, seq);
+    dirty.acked(peer);
+    let done: Vec<(u64, FileId, Version)> = awaiting
+        .range(..=seq)
+        .map(|(s, (id, v))| (*s, *id, *v))
+        .collect();
+    for (_, id, v) in &done {
+        dirty.discard(peer, *id, *v);
+    }
+    done
+}
+
+/// The file and version a `Data` or `Attr` entry carries.
+pub(crate) fn versioned(e: &Entry) -> Option<(FileId, Version)> {
+    match e {
+        Entry::Data { id, version, .. } | Entry::Attr { id, version, .. } if version.seq > 0 => {
+            Some((*id, *version))
+        }
+        _ => None,
+    }
 }
 
 pub fn path_bytes(p: &Path) -> Vec<u8> {
@@ -109,7 +152,7 @@ pub struct Repl {
     pub(crate) next_req: AtomicU64,
     pub(crate) stop: AtomicBool,
     pub(crate) threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    pub(crate) inbox: Mutex<HashMap<NodeId, super::net::Inbox>>,
+    pub(crate) inbox: Mutex<HashMap<NodeId, Inbox>>,
     pub(crate) unclean_start: bool,
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
@@ -183,6 +226,20 @@ impl Repl {
                 applied.insert(p, decode::<u64>(v)?);
             }
         }
+        let relay = RelayLog::load(peers.iter().copied(), store.load(Table::Relay)?)?;
+        // Session-final entries not acknowledged by everyone yet: every
+        // session ended with the last process, so each version's last
+        // entry is final.
+        let mut awaiting = BTreeMap::new();
+        let mut last_of: HashMap<(FileId, Version), u64> = HashMap::new();
+        for (seq, rec) in journal.entries() {
+            if let Some(k) = versioned(&rec.entry) {
+                last_of.insert(k, seq);
+            }
+        }
+        for ((id, v), seq) in last_of {
+            awaiting.insert(seq, (id, v));
+        }
         let window: BTreeSet<FileId> = store
             .load(Table::Window)?
             .into_iter()
@@ -218,14 +275,16 @@ impl Repl {
                 index,
                 dirty,
                 journal,
+                applied_durable: applied.clone(),
                 applied,
                 applied_changed: false,
+                relay,
                 sessions: HashMap::new(),
                 window,
                 window_add: BTreeSet::new(),
                 window_drop: BTreeSet::new(),
                 suspects,
-                awaiting: BTreeMap::new(),
+                awaiting,
                 holders: HashMap::new(),
                 counters: Counters::default(),
             }),
@@ -341,7 +400,25 @@ impl Repl {
     pub(crate) fn append(&self, st: &mut State, entry: Entry) -> u64 {
         let deps = self.deps(st);
         st.counters.entries_made += 1;
-        st.journal.append(deps, entry)
+        let key = versioned(&entry);
+        let seq = st.journal.append(deps, entry);
+        if let Some(k) = key {
+            // A later entry of an ended session's version (a suspect
+            // resent after a restart): it is the final one now.
+            let earlier: Vec<u64> = st
+                .awaiting
+                .iter()
+                .filter(|(_, x)| **x == k)
+                .map(|(s, _)| *s)
+                .collect();
+            if !earlier.is_empty() {
+                for s in earlier {
+                    st.awaiting.remove(&s);
+                }
+                st.awaiting.insert(seq, k);
+            }
+        }
+        seq
     }
 
     /// Records a change that was applied locally.
@@ -609,6 +686,7 @@ impl Repl {
         ops.extend(st.dirty.take_changed());
         let (jops, upto) = st.journal.take_changed();
         ops.extend(jops);
+        ops.extend(st.relay.take_changed());
         if std::mem::take(&mut st.applied_changed) {
             for (o, s) in &st.applied {
                 ops.push((Table::Positions, applied_key(*o), Some(encode(s))));
@@ -728,6 +806,7 @@ impl Repl {
                     "since_sent_ms": s.last_sent.elapsed().as_millis() as u64,
                 }))
                 .collect::<Vec<_>>(),
+            "relay_entries": st.relay.len(),
             "window": st.window.len(),
             "suspects": st.suspects.len(),
             "unclean_start": self.unclean_start,

@@ -21,6 +21,15 @@ use super::version;
 
 const POLL: Duration = Duration::from_millis(100);
 
+/// Why a copy is made (see [`Repl::copy_from`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Copy {
+    /// Freshness: the source holds a whole version.
+    Fresh,
+    /// Applying a forwarded entry.
+    Relayed,
+}
+
 /// The local copy is older than a committed version that no reachable
 /// node has.
 #[derive(Debug)]
@@ -155,6 +164,16 @@ impl Repl {
     /// version it then has.
     pub(crate) fn catch_up(&self, id: FileId, source: NodeId) -> io::Result<Option<Version>> {
         let _g = self.hold(id);
+        self.copy_from(id, source, Copy::Fresh)
+    }
+
+    /// [`catch_up`](Self::catch_up) for a caller that holds `id`.
+    pub(crate) fn copy_from(
+        &self,
+        id: FileId,
+        source: NodeId,
+        how: Copy,
+    ) -> io::Result<Option<Version>> {
         let path = self
             .state()
             .index
@@ -163,7 +182,13 @@ impl Repl {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         let remote = self.remote_hashes(source, id)?;
         let local = self.local_version(&id);
-        if remote.version <= local {
+        let older = match how {
+            Copy::Fresh => remote.version <= local,
+            // A relay's copy of the same version may have more of the
+            // session's writes.
+            Copy::Relayed => remote.version < local,
+        };
+        if older {
             // Nothing newer there (never go back to an older copy).
             return Ok(remote.version);
         }
@@ -184,18 +209,21 @@ impl Repl {
         drop(out);
         self.backing.set_attrs(&path, &remote.attrs)?;
         if let Err(e) = self.backing.sync_xattrs(&path, &remote.xattrs) {
-            log::warn!("freshness: copying the xattrs of {id} from node {source}: {e}");
+            log::warn!("replication: copying the xattrs of {id} from node {source}: {e}");
         }
         self.invalidate(&path);
         let mut st = self.state();
         if let Some(v) = remote.version {
             st.index.set_version(id, v);
         }
-        st.counters.fresh_pulls += 1;
+        if how == Copy::Fresh {
+            st.counters.fresh_pulls += 1;
+        }
         drop(st);
         self.flusher.flush_now()?;
-        if let Some(v) = remote.version {
-            // This node holds that version now (durably).
+        if let (Copy::Fresh, Some(v)) = (how, remote.version) {
+            // This node holds that version now (durably). (A relay's copy
+            // may be part of a session still writing: not announced.)
             self.announce_holders(id, v, vec![self.me, source]);
         }
         Ok(remote.version)

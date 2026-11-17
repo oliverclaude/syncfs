@@ -36,6 +36,21 @@ impl Repl {
         self.state().index.version(id).is_some_and(|l| l > version)
     }
 
+    /// Gives a file this node never touched (no index record yet) the
+    /// entry's id at `path`.
+    fn bind(&self, id: FileId, path: &[u8]) {
+        let mut st = self.state();
+        if st.index.path_of(&id).is_none() {
+            st.index.insert(path, id);
+        }
+    }
+
+    /// The local copy at `path` is now `version` of `id`.
+    fn record_version(&self, id: FileId, path: &[u8], version: Version) {
+        self.bind(id, path);
+        self.state().index.set_version(id, version);
+    }
+
     fn discard(&self, origin: NodeId, file: FileId, version: Version) {
         // Fire and forget: the answer has no listener.
         self.net.send(
@@ -48,7 +63,9 @@ impl Repl {
         );
     }
 
-    pub(crate) fn apply(&self, origin: NodeId, entry: &Entry) -> Applied {
+    /// Applies `origin`'s `entry`, which came from `via` (the origin, or a
+    /// node forwarding it: then data comes from `via` too).
+    pub(crate) fn apply(&self, origin: NodeId, via: NodeId, entry: &Entry) -> Applied {
         match entry {
             Entry::Create {
                 id,
@@ -153,7 +170,7 @@ impl Repl {
                 };
                 let _g = self.hold(*id);
                 self.backing.set_attrs(&p, attrs).map_err(skip)?;
-                self.state().index.set_version(*id, *version);
+                self.record_version(*id, &p, *version);
                 self.invalidate(&p);
                 Ok(true)
             }
@@ -177,7 +194,35 @@ impl Repl {
                 version,
                 attrs,
                 ..
-            } => self.apply_data(origin, *id, path, *version, attrs),
+            } if via == origin => self.apply_data(origin, *id, path, *version, attrs),
+            Entry::Data {
+                id, path, version, ..
+            } => self.apply_data_via(via, *id, path, *version),
+        }
+    }
+
+    /// A forwarded `Data` entry: the origin's dirty marks are out of reach,
+    /// so the content comes from the relay by hash comparison (the relay
+    /// applied the entry, so its copy is at least that version). The
+    /// origin drops its marks when this node acknowledges the session's
+    /// final entry.
+    fn apply_data_via(&self, via: NodeId, id: FileId, hint: &[u8], version: Version) -> Applied {
+        let _g = self.hold(id);
+        if self.superseded(&id, version) {
+            return Ok(false);
+        }
+        let Some(path) = self.local_path(Some(id), hint) else {
+            return Ok(false);
+        };
+        self.bind(id, &path);
+        match self.copy_from(id, via, super::fresh::Copy::Relayed) {
+            Ok(Some(v)) if v >= version => Ok(true),
+            Ok(v) => Err(ApplyError::Retry(io::Error::other(format!(
+                "node {via} has {v:?} of {id}, not {version:?}"
+            )))),
+            // Gone there; a later entry says what happened.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(ApplyError::Retry(e)),
         }
     }
 
@@ -223,7 +268,7 @@ impl Repl {
         out.sync_all().map_err(ApplyError::Retry)?;
         drop(out);
         self.backing.set_attrs(&path, attrs).map_err(skip)?;
-        self.state().index.set_version(id, version);
+        self.record_version(id, &path, version);
         self.invalidate(&path);
         Ok(true)
     }

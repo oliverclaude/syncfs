@@ -154,8 +154,7 @@ impl FrameDecoder {
     }
 }
 
-/// Everything nodes say to each other. `CatchUp*` is the planned
-/// vocabulary of step 8 and may still change (bumping the version).
+/// Everything nodes say to each other.
 ///
 /// Lock messages: `key` is the path relative to the mount root; `req`
 /// identifies one attempt of the requesting node, and replies echo it.
@@ -296,6 +295,12 @@ pub enum Message {
         /// reply only, `from == 0`).
         xattrs: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    /// How far the sender has durably applied each origin's journal (its
+    /// own journal under its own id). Sent to data peers about once a
+    /// second.
+    Positions {
+        applied: Vec<(NodeId, u64)>,
+    },
     /// The nodes known to hold `version` of `file` completely.
     VersionHolders {
         file: FileId,
@@ -303,7 +308,10 @@ pub enum Message {
         holders: Vec<NodeId>,
     },
 
-    // Step 8: rejoin.
+    /// Asks a node for the entries of other origins it keeps for
+    /// forwarding (`crate::repl::relay`): for each `(origin, after)`, the
+    /// entries after `after`, as `JournalEntry` messages (with the
+    /// original `origin`), then `CatchUpDone`.
     CatchUpRequest {
         req: u64,
         since: Vec<(NodeId, u64)>,
@@ -366,6 +374,9 @@ impl Message {
                 | Message::BlockDone { .. }
                 | Message::HashRequest { .. }
                 | Message::HashReply { .. }
+                | Message::Positions { .. }
+                | Message::CatchUpRequest { .. }
+                | Message::CatchUpDone { .. }
         )
     }
 
@@ -391,6 +402,7 @@ impl Message {
             Message::BlockDone { .. } => "block-done",
             Message::HashRequest { .. } => "hash-request",
             Message::HashReply { .. } => "hash-reply",
+            Message::Positions { .. } => "positions",
             Message::VersionHolders { .. } => "version-holders",
             Message::CatchUpRequest { .. } => "catch-up-request",
             Message::CatchUpDone { .. } => "catch-up-done",

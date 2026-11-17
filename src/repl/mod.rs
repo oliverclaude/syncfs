@@ -14,5 +14,8 @@ pub mod marker;
 mod model;
 pub mod net;
 pub mod ranges;
+pub mod relay;
+#[cfg(test)]
+mod relay_model;
 pub mod store;
 pub mod version;

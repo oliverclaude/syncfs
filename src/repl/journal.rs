@@ -22,7 +22,7 @@ pub struct Record {
     pub entry: Entry,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Journal {
     /// Next sequence number to assign.
     next: u64,
@@ -93,6 +93,11 @@ impl Journal {
             .take(max)
             .map(|(s, r)| (*s, r.clone()))
             .collect()
+    }
+
+    /// Every kept entry, in order.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, &Record)> + '_ {
+        self.entries.iter().map(|(s, r)| (*s, r))
     }
 
     pub fn durable(&self) -> u64 {
