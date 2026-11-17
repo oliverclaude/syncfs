@@ -48,25 +48,35 @@ struct Node {
     locks: LockManager,
 }
 
-/// Nodes 1..=n, connected, past their start-up quarantine.
-fn cluster(n: usize, lock_wait: &str) -> Vec<Node> {
+fn start(cfg: &Config) -> Node {
+    let net = Network::start(cfg).unwrap();
+    let locks = LockManager::start(Settings::from_config(cfg), net.clone());
+    Node { net, locks }
+}
+
+/// Nodes 1..=n, started together, connected.
+fn fresh_cluster(n: usize, lock_wait: &str) -> (Vec<Node>, Vec<Config>) {
     let ports = common::listen_ports(n);
     let members: Vec<(NodeId, u16)> = (1..=n as NodeId).zip(ports.iter().copied()).collect();
-    let nodes: Vec<Node> = members
+    let cfgs: Vec<Config> = members
         .iter()
-        .map(|&(id, port)| {
-            let cfg = config(id, &members, port, lock_wait);
-            let net = Network::start(&cfg).unwrap();
-            let locks = LockManager::start(Settings::from_config(&cfg), net.clone());
-            Node { net, locks }
-        })
+        .map(|&(id, port)| config(id, &members, port, lock_wait))
         .collect();
+    let nodes: Vec<Node> = cfgs.iter().map(start).collect();
     for node in &nodes {
-        assert!(node
-            .net
-            .wait_until(WAIT, |s| s.reachable == n && s.have_quorum));
+        assert!(node.net.wait_until(WAIT, |s| s.reachable == n));
     }
-    std::thread::sleep(LEASE + Duration::from_millis(50));
+    (nodes, cfgs)
+}
+
+/// Nodes 1..=n, connected, voting.
+fn cluster(n: usize, lock_wait: &str) -> Vec<Node> {
+    let (nodes, _) = fresh_cluster(n, lock_wait);
+    for node in &nodes {
+        common::wait_until("grace over", || {
+            node.locks.provider().render()["grants_after_ms"] == 0
+        });
+    }
     nodes
 }
 
@@ -81,26 +91,71 @@ fn shutdown(nodes: &[Node]) {
     }
 }
 
+fn grace(n: &Node) -> (bool, u64) {
+    let v = n.locks.provider().render();
+    (
+        v["grace_skipped"].as_bool().unwrap(),
+        v["grants_after_ms"].as_u64().unwrap(),
+    )
+}
+
 #[test]
-fn voters_refuse_during_startup_quarantine() {
-    let ports = common::listen_ports(3);
-    let members: Vec<(NodeId, u16)> = (1..=3).zip(ports.iter().copied()).collect();
-    let nodes: Vec<Node> = members
-        .iter()
-        .map(|&(id, port)| {
-            let cfg = config(id, &members, port, "300ms");
-            let net = Network::start(&cfg).unwrap();
-            let locks = LockManager::start(Settings::from_config(&cfg), net.clone());
-            Node { net, locks }
-        })
-        .collect();
-    for node in &nodes {
-        assert!(node.net.wait_until(WAIT, |s| s.reachable == 3));
-    }
-    // Still within one lease of starting: no votes, so no lock (EROFS).
-    assert_eq!(nodes[0].locks.acquire(&k("f")), Err(LockError::NoQuorum));
-    std::thread::sleep(LEASE);
+fn cold_start_skips_the_grace() {
+    let (nodes, _) = fresh_cluster(3, "300ms");
+    // All three nodes started fresh: they skip the grace (1 s) and grant
+    // as soon as everyone has answered the probe.
+    // as soon as everyone has answered the probe.
+    let t = Instant::now();
+    common::wait_until("all skip the grace", || {
+        nodes.iter().all(|n| grace(n) == (true, 0))
+    });
+    assert!(t.elapsed() < LEASE / 2, "{:?}", t.elapsed());
     assert_eq!(nodes[0].locks.acquire(&k("f")), Ok(()));
+    shutdown(&nodes);
+}
+
+#[test]
+fn restarted_voter_waits_while_others_hold_or_granted() {
+    let (mut nodes, cfgs) = fresh_cluster(3, "300ms");
+    common::wait_until("lock", || nodes[0].locks.acquire(&k("f")).is_ok());
+    // Node 3 restarts while node 1 holds a lease (granted by 1 and 2,
+    // maybe 3). Node 1 has acquired and node 2 has granted: not fresh.
+    nodes[2].locks.shutdown();
+    nodes[2].net.shutdown();
+    nodes[2] = start(&cfgs[2]);
+    assert!(nodes[2].net.wait_until(WAIT, |s| s.reachable == 3));
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    let (skipped, left) = grace(&nodes[2]);
+    assert!(!skipped && left > 0, "restarted voter skipped its grace");
+    // With node 2 gone, node 1's new locks need node 3's vote: refused
+    // until node 3's grace is over.
+    nodes[1].locks.shutdown();
+    nodes[1].net.shutdown();
+    assert!(nodes[0].net.wait_until(WAIT, |s| s.reachable == 2));
+    assert_eq!(nodes[0].locks.acquire(&k("g")), Err(LockError::NoQuorum));
+    common::wait_until("lock after node 3's grace", || {
+        nodes[0].locks.acquire(&k("g")).is_ok()
+    });
+    assert!(
+        started.elapsed() >= LEASE - Duration::from_millis(100),
+        "{:?}",
+        started.elapsed()
+    );
+    for n in [&nodes[0], &nodes[2]] {
+        n.locks.shutdown();
+        n.net.shutdown();
+    }
+}
+
+#[test]
+fn restart_with_no_lock_ever_taken_skips_the_grace() {
+    let (mut nodes, cfgs) = fresh_cluster(3, "300ms");
+    common::wait_until("grace over", || grace(&nodes[0]).0);
+    nodes[2].locks.shutdown();
+    nodes[2].net.shutdown();
+    nodes[2] = start(&cfgs[2]);
+    common::wait_until("restarted node skips", || grace(&nodes[2]).0);
     shutdown(&nodes);
 }
 

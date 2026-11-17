@@ -404,10 +404,32 @@ A lock is a lease granted by a quorum, acquired in two phases.
 - **Release.** Closing the last writable handle sends `LockRelease` to
   every node.
 - **Restarts.** A voter grants nothing during its first lease after
-  starting, because it has forgotten any lease it gave before a restart.
-  One restarted node does not block anyone (the others still form a
-  quorum), but after a cold start of the whole cluster, or of a majority,
-  writes fail with `EROFS` for the first `lock_lease_timeout`.
+  starting (the *start-up grace*), because it has forgotten any lease it
+  gave before a restart. One restarted node does not block anyone: the
+  others still form a quorum.
+- **Cold start.** The grace is skipped when no live lease can depend on
+  what this node forgot. While in its grace, a node asks every other node,
+  once per heartbeat, whether it is *fresh* for it: it has acquired no lock
+  since its own start, and no attempt it has in progress counts a vote
+  from the asking node. When every other member is reachable and all
+  answer fresh in the same round, the grace ends (`grace_skipped: true` in
+  `.syncfs/locks`).
+
+  Why this is safe: a lease this node granted before restarting only
+  matters if its holder still runs and believes it holds the lock. That
+  holder acquired the lock in its current run, so it is not fresh; if it
+  restarted since, it holds nothing. An attempt still in progress could
+  yet succeed with the old vote, so it counts too; the asking node, being
+  in its grace, cannot have voted since restarting, so any vote from it in
+  an attempt is an old one. Attempts started after the answer reach only
+  the new incarnation, which remembers what it grants. Every member must
+  answer, because an unreachable node could be a live holder.
+
+  Effect: after a cold start of the whole cluster, nodes skip the grace
+  within a heartbeat or two and writes work at once. A node restarting in
+  a cluster where some node has taken a lock since starting keeps its full
+  grace (the others form the quorum meanwhile). Once a lock has been taken,
+  nodes still probing keep their grace too.
 
 **Safety (at most one holder of conflicting keys).** A voter holds at most
 one confirmed lease among conflicting keys of different nodes, and it
@@ -419,7 +441,8 @@ margin`, and every voter's lease ended no earlier than `t + lease` (it
 started on arrival, after `t`), so the holder stops before any voter could
 grant the key to someone else, provided clocks run at about the same rate
 (the margin absorbs drift and a write that began just before the deadline).
-A restarted voter's lost memory is covered by its one-lease quarantine.
+A restarted voter's lost memory is covered by its one-lease grace, or by
+the cold-start probe (above).
 
 **No deadlock or livelock.** An attempt with the oldest ballot among the
 competitors is never refused `Older` and never preempted; it can only be
@@ -436,6 +459,17 @@ conflicting leases (about 8 million states in total), and that without timeouts
 every run ends with nobody stuck mid-attempt and the oldest ballot holding
 the lock. Lease timing is outside the model; it is covered by the argument
 above and by the expiry tests.
+
+The model also covers the start-up grace and the cold-start probe: one
+node may restart (losing its voter table, its requester and its
+connections; leases never expire, the worst case), and a restarted voter
+grants nothing until the probe succeeds. Results, all with no two holders:
+a voter-only node restarting, about 4.9 million states; a requester's node
+restarting, about 0.76 million; a cold start with every voter in its
+grace, about 23.6 million (opt-in test, 3 minutes optimized). Two
+deliberately broken variants are run to show the check has teeth, and
+both are caught with two holders: no grace after a restart, and a probe
+that ignores attempts in progress.
 
 ### Timings
 

@@ -136,9 +136,28 @@ struct State {
     /// Keys a local thread is acquiring right now; others wait for it.
     acquiring: HashSet<Key>,
     counters: Counters,
+    /// Since this process started: acquired a lock / granted a vote.
+    acquired_since_boot: bool,
+    granted_since_boot: bool,
+    /// Cold-start probe: current round and the nodes that answered fresh.
+    fresh_round: u64,
+    fresh_acks: BTreeSet<NodeId>,
+    grace_skipped: bool,
 }
 
 impl State {
+    /// Whether this node can be relying on a lease that `asker` granted
+    /// before it restarted: it has acquired a lock since it started, or an
+    /// attempt in progress already counts a vote from `asker` (which,
+    /// being in its start-up grace, cannot have voted since restarting).
+    fn fresh_for(&self, asker: NodeId) -> bool {
+        !self.acquired_since_boot
+            && !self
+                .pending
+                .values()
+                .any(|p| p.attempt.granted().contains(&asker))
+    }
+
     fn observe(&mut self, b: Ballot) {
         self.clock = self.clock.max(b.counter);
     }
@@ -190,6 +209,11 @@ impl LockManager {
                 held: BTreeMap::new(),
                 acquiring: HashSet::new(),
                 counters: Counters::default(),
+                acquired_since_boot: false,
+                granted_since_boot: false,
+                fresh_round: 0,
+                fresh_acks: BTreeSet::new(),
+                grace_skipped: false,
             }),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -366,7 +390,10 @@ impl Inner {
                 st.observe(ballot);
                 let (r, pre) = st.voter.request(now, from, req, &Key::new(&key), ballot);
                 match r {
-                    Reply::Grant => st.counters.votes_granted += 1,
+                    Reply::Grant => {
+                        st.counters.votes_granted += 1;
+                        st.granted_since_boot = true;
+                    }
                     Reply::Deny(..) => st.counters.votes_denied += 1,
                 }
                 for p in pre {
@@ -495,6 +522,33 @@ impl Inner {
                     break;
                 }
             }
+            Message::LockFreshQuery { round } => {
+                let fresh = st.fresh_for(from);
+                q.push_back((self.s.me, from, Message::LockFreshReply { round, fresh }));
+            }
+            Message::LockFreshReply { round, fresh } => {
+                if round != st.fresh_round || !st.voter.quarantined(now) {
+                    return;
+                }
+                if !fresh {
+                    log::debug!("locks: node {from} is not fresh; keeping the start-up grace");
+                    return;
+                }
+                st.fresh_acks.insert(from);
+                let all = self
+                    .s
+                    .members
+                    .iter()
+                    .all(|m| *m == self.s.me || st.fresh_acks.contains(m));
+                if all {
+                    st.voter.lift_quarantine(now);
+                    st.grace_skipped = true;
+                    log::info!(
+                        "locks: cold start (all {} nodes fresh): voting without the start-up grace",
+                        self.s.members.len()
+                    );
+                }
+            }
             other => log::debug!("locks: unexpected {} from node {from}", other.kind()),
         }
     }
@@ -556,6 +610,7 @@ impl Inner {
         match res {
             Ok((req, valid_until)) => {
                 st.counters.acquired += 1;
+                st.acquired_since_boot = true;
                 let h = st.held.entry(key.clone()).or_insert(Held {
                     ballot,
                     req,
@@ -728,6 +783,47 @@ impl Inner {
         self.send(out);
     }
 
+    /// While in the start-up grace, asks every other node whether it is
+    /// fresh; once all of them say so in one round, the grace ends. Returns
+    /// whether this node is still in the grace.
+    fn probe_fresh(&self) -> bool {
+        let mut st = lock(&self.st);
+        if !st.voter.quarantined(self.now_ms()) {
+            return false;
+        }
+        let snap = self.net.snapshot();
+        let others: Vec<NodeId> = self
+            .s
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| m != self.s.me)
+            .collect();
+        if others.is_empty() {
+            let now = self.now_ms();
+            st.voter.lift_quarantine(now);
+            st.grace_skipped = true;
+            return false;
+        }
+        if others
+            .iter()
+            .any(|&m| snap.state_of(m) != Some(PeerState::Up))
+        {
+            return true; // an unreachable node could be a live holder
+        }
+        st.fresh_round += 1;
+        st.fresh_acks.clear();
+        let round = st.fresh_round;
+        drop(st);
+        self.send(
+            others
+                .into_iter()
+                .map(|m| (m, Message::LockFreshQuery { round }))
+                .collect(),
+        );
+        true
+    }
+
     /// Starts a renewal round for every held lock.
     fn renew_all(&self) {
         let mut st = lock(&self.st);
@@ -801,6 +897,9 @@ impl Inner {
             "quorum": self.s.quorum(),
             "members": self.s.members,
             "grants_after_ms": st.voter.quarantine_until().saturating_sub(now_ms),
+            "grace_skipped": st.grace_skipped,
+            "acquired_since_start": st.acquired_since_boot,
+            "granted_since_start": st.granted_since_boot,
             "held": held.len(),
             "locks": held,
             "votes": votes,
@@ -810,13 +909,23 @@ impl Inner {
 }
 
 fn renew_loop(weak: Weak<Inner>) {
+    let mut next_renew = Instant::now();
     loop {
         let Some(inner) = weak.upgrade() else { return };
         if inner.stop.load(Ordering::SeqCst) {
             return;
         }
-        inner.renew_all();
-        let every = inner.s.renew_every();
+        if Instant::now() >= next_renew {
+            inner.renew_all();
+            next_renew = Instant::now() + inner.s.renew_every();
+        }
+        // During the start-up grace, probe for a cold start every heartbeat.
+        let quarantined = inner.probe_fresh();
+        let every = if quarantined {
+            inner.s.heartbeat.min(inner.s.renew_every())
+        } else {
+            next_renew.saturating_duration_since(Instant::now())
+        };
         // Wait for the next round, waking early on shutdown.
         let st = lock(&inner.st);
         let _ = inner

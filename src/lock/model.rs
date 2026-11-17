@@ -5,6 +5,13 @@
 //! TCP gives us. Leases never expire here; the timing argument (holder
 //! stops before any voter's lease ends) is separate and documented in the
 //! README.
+//!
+//! The start-up grace is modelled too: a node can restart (losing its voter
+//! table, its requester and its connections), and a restarted or freshly
+//! started voter grants nothing until the cold-start probe says every
+//! other node is fresh. Leases never expire, so a restart is the worst
+//! case: forgotten leases stay live forever. The time-based end of the
+//! grace (one lease) is not modelled.
 
 use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -26,6 +33,29 @@ enum Msg {
     Grant { req: u64 },
     Confirmed { req: u64 },
     Deny { req: u64, reason: DenyReason },
+    FreshQuery { round: u8 },
+    FreshReply { round: u8, fresh: bool },
+}
+
+/// What a node answers to the cold-start probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshRule {
+    /// The real rule: no lock acquired since start, no attempt pending
+    /// that counts a vote from the asker.
+    Full,
+    /// Deliberately broken: only "no lock acquired".
+    AcquiredOnly,
+    /// Deliberately broken: no grace at all after a restart.
+    NoGrace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+struct Boot {
+    acquired: bool,
+    /// Current probe round (0 = none) and the nodes that answered fresh.
+    round: u8,
+    acks: Vec<NodeId>,
+    rounds_left: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,12 +84,23 @@ struct State {
     /// `chans[from][to]`, nodes numbered from 1.
     chans: Vec<Vec<VecDeque<Msg>>>,
     reqs: Vec<Requester>,
+    boot: Vec<Boot>,
+    restarts_left: u8,
 }
 
 struct Model {
     n: usize,
     quorum: usize,
     timeouts: bool,
+    /// Node that may restart (once).
+    restart: Option<NodeId>,
+    /// All voters start in the grace (a cold start).
+    cold: bool,
+    rule: FreshRule,
+}
+
+fn quarantined_voter() -> Voter {
+    Voter::new(1, FOREVER) // the model's clock stays at 0
 }
 
 impl Model {
@@ -96,6 +137,7 @@ impl Model {
                 }
             }
             Step::Acquired => {
+                s.boot[node as usize - 1].acquired = true;
                 s.reqs[r].attempt = None;
                 s.reqs[r].state = RState::Holding;
             }
@@ -142,6 +184,26 @@ impl Model {
                 _ => {}
             }
         }
+        if let Some(r) = self.restart.filter(|_| s.restarts_left > 0) {
+            let mut t = s.clone();
+            self.do_restart(&mut t, r);
+            out.push(t);
+        }
+        for n in 1..=self.n as NodeId {
+            let b = &s.boot[n as usize - 1];
+            if s.voters[n as usize - 1].quarantined(0) && b.rounds_left > 0 {
+                let mut t = s.clone();
+                let b = &mut t.boot[n as usize - 1];
+                b.rounds_left -= 1;
+                b.round += 1;
+                b.acks.clear();
+                let round = b.round;
+                for m in self.members().into_iter().filter(|&m| m != n) {
+                    Self::send(&mut t, n, m, Msg::FreshQuery { round });
+                }
+                out.push(t);
+            }
+        }
         for from in 1..=self.n as NodeId {
             for to in 1..=self.n as NodeId {
                 if s.chans[from as usize - 1][to as usize - 1].is_empty() {
@@ -166,6 +228,51 @@ impl Model {
     fn settled(&self, s: &State) -> bool {
         !s.reqs.iter().any(|r| r.state == RState::Holding)
             && s.chans.iter().flatten().all(|c| c.is_empty())
+    }
+
+    fn do_restart(&self, s: &mut State, r: NodeId) {
+        s.restarts_left -= 1;
+        let ri = r as usize - 1;
+        s.voters[ri] = if self.rule == FreshRule::NoGrace {
+            Voter::new(0, FOREVER)
+        } else {
+            quarantined_voter()
+        };
+        s.boot[ri] = Boot {
+            rounds_left: 1,
+            ..Boot::default()
+        };
+        // Connections drop: messages in flight either way are lost.
+        for i in 0..self.n {
+            s.chans[ri][i].clear();
+            s.chans[i][ri].clear();
+        }
+        // Its requester dies (a holder stops holding).
+        for rq in s.reqs.iter_mut().filter(|q| q.node == r) {
+            rq.attempt = None;
+            rq.state = RState::Done;
+        }
+        // Others notice it went away.
+        for i in 0..s.reqs.len() {
+            if let Some(a) = s.reqs[i].attempt.as_mut() {
+                let step = a.on_unreachable(r);
+                self.step(s, i, step);
+            }
+        }
+    }
+
+    fn fresh(&self, s: &State, n: NodeId, asker: NodeId) -> bool {
+        let b = &s.boot[n as usize - 1];
+        let relies = s.reqs.iter().any(|q| {
+            q.node == n
+                && q.attempt
+                    .as_ref()
+                    .is_some_and(|a| a.granted().contains(&asker))
+        });
+        match self.rule {
+            FreshRule::Full => !b.acquired && !relies,
+            FreshRule::AcquiredOnly | FreshRule::NoGrace => !b.acquired,
+        }
     }
 
     fn key_of(s: &State, node: NodeId) -> Key {
@@ -206,6 +313,23 @@ impl Model {
             Msg::Release { ballot } => {
                 let key = Self::key_of(s, from);
                 s.voters[vi].release(from, &key, ballot);
+            }
+            Msg::FreshQuery { round } => {
+                let fresh = self.fresh(s, to, from);
+                Self::send(s, to, from, Msg::FreshReply { round, fresh });
+            }
+            Msg::FreshReply { round, fresh } => {
+                let b = &mut s.boot[vi];
+                if !fresh || round != b.round || !s.voters[vi].quarantined(0) {
+                    return;
+                }
+                if !b.acks.contains(&from) {
+                    b.acks.push(from);
+                    b.acks.sort_unstable();
+                }
+                if b.acks.len() == self.n - 1 {
+                    s.voters[vi].lift_quarantine(0);
+                }
             }
             Msg::Grant { req } | Msg::Confirmed { req } | Msg::Deny { req, .. } => {
                 let Some(r) = s.reqs.iter().position(|r| r.node == to) else {
@@ -255,10 +379,21 @@ impl Model {
     /// Explores everything reachable; returns (states, terminal states,
     /// terminal states in which every requester got the lock).
     fn explore(&self, reqs: Vec<Requester>) -> (usize, usize, usize) {
+        let voter = if self.cold {
+            quarantined_voter()
+        } else {
+            Voter::new(0, FOREVER)
+        };
+        let boot = Boot {
+            rounds_left: u8::from(self.cold),
+            ..Boot::default()
+        };
         let init = State {
-            voters: vec![Voter::new(0, FOREVER); self.n],
+            voters: vec![voter; self.n],
             chans: vec![vec![VecDeque::new(); self.n]; self.n],
             reqs,
+            boot: vec![boot; self.n],
+            restarts_left: u8::from(self.restart.is_some()),
         };
         // Fingerprints instead of whole states keep memory small; a
         // 64-bit collision among ~10^6 states is vanishingly unlikely.
@@ -284,7 +419,7 @@ impl Model {
                         .all(|r| matches!(r.state, RState::Done | RState::Exhausted)),
                     "stuck: {s:#?}"
                 );
-                if !self.timeouts {
+                if !self.timeouts && self.restart.is_none() && !self.cold {
                     assert!(
                         s.reqs.iter().any(|r| r.state == RState::Done),
                         "nobody acquired: {s:#?}"
@@ -322,14 +457,117 @@ fn requester(node: NodeId, counter: u64, key: &str, tries: u8) -> Requester {
 }
 
 fn run(n: usize, timeouts: bool, reqs: Vec<Requester>) {
+    run_with(n, timeouts, None, false, FreshRule::Full, reqs);
+}
+
+fn run_with(
+    n: usize,
+    timeouts: bool,
+    restart: Option<NodeId>,
+    cold: bool,
+    rule: FreshRule,
+    reqs: Vec<Requester>,
+) {
     let m = Model {
         n,
         quorum: n / 2 + 1,
         timeouts,
+        restart,
+        cold,
+        rule,
     };
     let (states, terminal, all_done) = m.explore(reqs);
-    eprintln!("{n} voters, timeouts {timeouts}: {states} states, {terminal} terminal, {all_done} all acquired");
+    eprintln!(
+        "{n} voters, timeouts {timeouts}, restart {restart:?}, cold {cold}, {rule:?}: \
+         {states} states, {terminal} terminal, {all_done} all acquired"
+    );
     assert!(terminal > 0);
+}
+
+/// Every voter starts in its grace. About 24 million states, 3 minutes
+/// optimized, so opt-in: `cargo test --release --lib cold_start_probe --
+/// --ignored`.
+#[test]
+#[ignore = "large; run with --release -- --ignored"]
+fn cold_start_probe() {
+    run_with(
+        3,
+        false,
+        None,
+        true,
+        FreshRule::Full,
+        vec![requester(1, 1, "f", 1), requester(2, 1, "f", 1)],
+    );
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow unoptimized; CI runs it with --release"
+)]
+fn voter_only_node_restarts() {
+    run_with(
+        3,
+        false,
+        Some(3),
+        false,
+        FreshRule::Full,
+        vec![requester(1, 1, "f", 1), requester(2, 1, "f", 1)],
+    );
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow unoptimized; CI runs it with --release"
+)]
+fn requester_node_restarts() {
+    run_with(
+        3,
+        false,
+        Some(2),
+        false,
+        FreshRule::Full,
+        vec![requester(1, 1, "f", 1), requester(2, 1, "f", 1)],
+    );
+}
+
+/// The checker must catch a broken grace: with no grace after a restart,
+/// a forgotten lease lets a second holder in.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow unoptimized; CI runs it with --release"
+)]
+#[should_panic(expected = "conflicting")]
+fn broken_no_grace_is_caught() {
+    run_with(
+        3,
+        false,
+        Some(3),
+        false,
+        FreshRule::NoGrace,
+        vec![requester(1, 1, "f", 1), requester(2, 1, "f", 1)],
+    );
+}
+
+/// ...and a probe that only asks "did you acquire a lock?" (ignoring
+/// attempts in progress that count the asker's old vote).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow unoptimized; CI runs it with --release"
+)]
+#[should_panic(expected = "conflicting")]
+fn broken_probe_is_caught() {
+    run_with(
+        3,
+        false,
+        Some(3),
+        false,
+        FreshRule::AcquiredOnly,
+        vec![requester(1, 1, "f", 1), requester(2, 1, "f", 1)],
+    );
 }
 
 #[test]

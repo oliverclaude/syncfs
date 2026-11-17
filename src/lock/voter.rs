@@ -65,6 +65,11 @@ impl Voter {
         now < self.grant_after
     }
 
+    /// Ends the start-up grace now (cold start: no live lease can exist).
+    pub fn lift_quarantine(&mut self, now: u64) {
+        self.grant_after = self.grant_after.min(now);
+    }
+
     pub fn quarantine_until(&self) -> u64 {
         self.grant_after
     }

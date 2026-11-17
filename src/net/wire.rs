@@ -264,6 +264,18 @@ pub enum Message {
     CatchUpDone {
         req: u64,
     },
+
+    // Step 5 addendum: skipping the start-up grace on a cold start.
+    /// "Could you be relying on a lease I granted before I restarted?"
+    LockFreshQuery {
+        round: u64,
+    },
+    /// `fresh`: no lock acquired since this process started, and no
+    /// attempt in progress that counts a vote from the asker.
+    LockFreshReply {
+        round: u64,
+        fresh: bool,
+    },
 }
 
 impl Message {
@@ -289,6 +301,8 @@ impl Message {
             Message::BlockPush { .. } => "block-push",
             Message::CatchUpRequest { .. } => "catch-up-request",
             Message::CatchUpDone { .. } => "catch-up-done",
+            Message::LockFreshQuery { .. } => "lock-fresh-query",
+            Message::LockFreshReply { .. } => "lock-fresh-reply",
         }
     }
 }

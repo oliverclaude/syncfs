@@ -652,6 +652,47 @@ fn locks_rename_of_locked_paths_is_busy() {
     });
 }
 
+/// With a 30 s lease, a whole-cluster cold start is writable within the
+/// convergence bound (the grace is skipped); a voter restarted after locks
+/// were taken keeps its full grace.
+#[test]
+fn locks_cold_start_skips_grace_restart_does_not() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(&[Mount, Daemon, Daemon], &["--lock-lease-timeout", "30s"]);
+    c.start_all();
+    c.converge("start");
+    let mnt = c.node(1).mnt();
+    let t = Instant::now();
+    eventually("first write", || std::fs::write(mnt.join("a"), b"x"));
+    eprintln!("cold start: writable after {:?}", t.elapsed());
+    // At least a quorum skipped (a node still probing after the first
+    // lock was taken sees a non-fresh holder and keeps its grace). Daemon
+    // status files are rewritten every 5 heartbeats.
+    eventually("a quorum skipped the grace", || {
+        let skipped = [1, 2, 3]
+            .iter()
+            .filter(|&&id| c.node(id).status("locks").unwrap()["grace_skipped"] == true)
+            .count();
+        (skipped >= 2)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("{skipped} skipped")))
+    });
+    c.node(3).kill();
+    c.node(3).start();
+    c.converge("voter 3 back");
+    let l = eventually("voter 3 status", || {
+        c.node(3)
+            .status("locks")
+            .filter(|l| l.is_object())
+            .ok_or_else(|| std::io::Error::other("no status"))
+    });
+    assert_eq!(l["grace_skipped"], false, "{l:#}");
+    assert!(l["grants_after_ms"].as_u64().unwrap() > 20_000, "{l:#}");
+    // Nodes 1 and 2 still make a quorum.
+    std::fs::write(mnt.join("b"), b"x").unwrap();
+}
+
 #[test]
 fn locks_killed_holder_expires() {
     require_fuse!();
