@@ -586,7 +586,24 @@ Each step ends with passing tests and a commit.
 6. **Write path** (done, freshness pending): lock, quorum check, local
    write, mark dirty (in memory); `freshness_timeout` option.
 7. **Async replication**: dirty-block bitmap and metadata journal.
-8. **Rejoin and recovery**.
+8. **Rejoin and recovery**. Planned:
+   - A node that rejoins with diverged, unreplicated changes keeps them as
+     `name.syncfs-conflict-<node>-<timestamp>` instead of being
+     overwritten; the count shows in `.syncfs/stats` and `status.json`.
+   - **Backing-disk loss.** Every backing directory carries a marker file
+     (cluster name, node id, disk id). If the marker is missing or the
+     directory is empty at start, the node never treats its local data
+     as the truth: it joins as a voter only, in rebuild mode. It rebuilds
+     the directory tree and metadata from peers and mounts right away;
+     reads of files not yet local are fetched on demand from a healthy
+     peer and verified by checksum, while a background job fills in the
+     rest (possibly from several peers at once). Partial loss uses the
+     same per-file checksum comparison. Peers see the new disk id as a
+     disk loss, not a normal rejoin, so the freshness check does not wait
+     for that node's lost writes. The rebuilding node refuses writes
+     (`EROFS`) until it has caught up, then takes a new disk id and
+     becomes a normal writer. Progress (files and bytes done, ETA) shows
+     in `.syncfs/replication` and `status.json`.
 9. **Packaging**: `.deb` for bookworm and trixie on amd64 and arm64, static
    musl portable binaries, systemd unit for daemon mode.
 10. **Soak test**: randomized multi-node run with restarts and partitions.
