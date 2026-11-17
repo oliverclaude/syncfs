@@ -402,6 +402,14 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // Drain stderr while it runs: debug output can fill the pipe and block
+    // the mount.
+    let mut stderr = child.stderr.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut s).unwrap();
+        s
+    });
     wait_until("debug mount", || is_mounted(&mnt));
     let _ = fs::read_dir(&mnt).unwrap().count();
     assert!(
@@ -409,9 +417,8 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
         "debug mode must not daemonize"
     );
     unmount(&mnt);
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(child.wait().unwrap().success());
+    let err = drain.join().unwrap();
     assert!(err.contains("DEBUG"), "{err}");
 }
 
