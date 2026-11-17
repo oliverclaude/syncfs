@@ -52,7 +52,9 @@ impl Environment {
         Ok(Self {
             // SAFETY: geteuid has no preconditions and cannot fail.
             is_root: unsafe { libc::geteuid() } == 0,
-            home: std::env::var_os("HOME").and_then(abs),
+            // mount(8) clears the environment before it runs a helper for a
+            // `user` fstab entry, so fall back to the passwd entry.
+            home: std::env::var_os("HOME").and_then(abs).or_else(passwd_home),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME").and_then(abs),
             cwd: std::env::current_dir()?,
         })
@@ -68,6 +70,30 @@ impl Environment {
             .clone()
             .or_else(|| self.home.as_ref().map(|h| h.join(".local/state")))
             .map(|d| d.join("syncfs"))
+    }
+}
+
+/// The home directory of the effective user from the passwd database.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 16 * 1024];
+    // SAFETY: passwd is plain data; getpwuid_r only writes into `pwd` and
+    // `buf` within the given length and sets `res` to null or `&pwd`.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut res: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut res,
+        );
+        if rc != 0 || res.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir))).filter(|p| p.is_absolute())
     }
 }
 
