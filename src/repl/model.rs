@@ -18,7 +18,7 @@
 //! * the copy a session writes on is at least as new as every committed
 //!   version (no committed version is lost by writing over an older copy).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use crate::config::NodeId;
 use crate::net::wire::{FileId, Outcome, Version};
@@ -79,11 +79,12 @@ impl Model {
         };
         let mut seen = HashSet::new();
         seen.insert(init.key());
-        let mut queue = VecDeque::from([init]);
-        while let Some(s) = queue.pop_front() {
+        // Depth first: the frontier stays small.
+        let mut stack = vec![init];
+        while let Some(s) = stack.pop() {
             for next in self.successors(&s) {
                 if seen.insert(next.key()) {
-                    queue.push_back(next);
+                    stack.push(next);
                 }
             }
         }
@@ -137,7 +138,8 @@ impl Model {
                 st.local[m] = st.local[from];
             }
         };
-        if !t.satisfied_by(st.local[m]) {
+        let announced_here = t.newest.is_some_and(|n| n.node == id(m)) && t.sources == [id(m)];
+        if !t.satisfied_by(st.local[m]) && !announced_here {
             for &src in &t.sources {
                 catch_up(&mut st, src as usize - 1);
             }

@@ -69,8 +69,19 @@ impl Repl {
         if t.satisfied_by(self.local_version(&id)) {
             return Ok(());
         }
-        self.state().counters.fresh_checks += 1;
         let newest = t.newest.expect("unsatisfied targets have a version");
+        if newest.node == self.me && newest.disk == self.disk && t.sources == [self.me] {
+            // This node announced it on this disk but never recorded a
+            // change (the version is recorded durably before the first
+            // write): e.g. it stopped between the lock and the first write.
+            // Nobody else can have it.
+            log::debug!(
+                "freshness: version {} of {id} was announced here but never written",
+                newest.seq
+            );
+            return Ok(());
+        }
+        self.state().counters.fresh_checks += 1;
         let deadline = Instant::now() + self.freshness_timeout;
         let mut waited = false;
         loop {

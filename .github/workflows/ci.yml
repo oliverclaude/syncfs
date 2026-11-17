@@ -34,7 +34,7 @@ jobs:
       - name: Lock protocol model check (optimized; skipped in the debug run)
         run: cargo test --release --lib lock::model -- --nocapture
       - name: File version model check (optimized; skipped in the debug run)
-        run: cargo test --release --lib repl::model -- --nocapture
+        run: cargo test --release --lib repl::model -- --nocapture --test-threads=1
       - name: Check that FUSE tests ran
         run: "! grep -E 'SKIPPED: (/dev/fuse|fusermount3)' test.log"
       - name: FUSE tests as root
