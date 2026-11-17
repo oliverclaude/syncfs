@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use common::Mounted;
+use common::{wait_until, Mounted};
 use serde_json::Value;
 
 const FILES: &[&str] = &[
@@ -207,7 +207,8 @@ fn counters_follow_operations() {
     assert!(delta("errors_total") >= 1);
     assert!(delta("requests_total") >= 7);
     assert!(delta("status_requests") >= 1);
-    assert_eq!(after["stats"]["open_files"], 0);
+    // The kernel sends release after close returns, asynchronously.
+    wait_until("open_files back to 0", || status(&m)["stats"]["open_files"] == 0);
     // Reading .syncfs is not counted as backing I/O.
     let a = status(&m);
     let b = status(&m);
