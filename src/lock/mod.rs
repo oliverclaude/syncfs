@@ -3,6 +3,7 @@
 
 pub mod attempt;
 pub mod audit;
+pub mod handoff;
 pub mod key;
 #[cfg(test)]
 mod model;

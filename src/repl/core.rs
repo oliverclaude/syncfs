@@ -58,6 +58,10 @@ pub(crate) struct Counters {
     /// paths restored from a peer (see `reconcile`).
     pub reconcile_sent: u64,
     pub reconcile_restored: u64,
+    /// Lock handoff: acquisitions that waited for a previous holder's
+    /// entries, and those that went ahead without them.
+    pub handoff_waits: u64,
+    pub handoff_gaps: u64,
 }
 
 pub(crate) struct State {
@@ -403,6 +407,15 @@ impl Repl {
                 .spawn(move || super::rebuild::rebuild_loop(weak))?;
             lock(&repl.threads).push(h);
         }
+        let (head, wait) = (Arc::downgrade(&repl), Arc::downgrade(&repl));
+        repl.locks.set_chain(crate::lock::manager::Chain {
+            head: Box::new(move || head.upgrade().map_or(0, |r| r.journal_head())),
+            wait: Box::new(move |after| {
+                if let Some(r) = wait.upgrade() {
+                    r.wait_applied(after);
+                }
+            }),
+        });
         Ok(repl)
     }
 

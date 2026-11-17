@@ -18,6 +18,7 @@ use crate::status::{FnProvider, Provider};
 
 use super::attempt::{Attempt, Phase, Step};
 use super::audit::{self, Event};
+use super::handoff::Handoff;
 use super::key::Key;
 use super::voter::{Reply, Voter};
 
@@ -145,6 +146,9 @@ struct Pending {
     file: Option<FileCtx>,
     /// Versions reported by granting voters.
     known: Vec<VersionInfo>,
+    /// Journal heads to apply first, from granting voters (see
+    /// [`super::handoff`]).
+    after: BTreeMap<NodeId, u64>,
     /// Version announced with the confirms; preset when re-acquiring.
     announce: Option<Version>,
 }
@@ -178,6 +182,7 @@ struct State {
     fresh_round: u64,
     fresh_acks: BTreeSet<NodeId>,
     grace_skipped: bool,
+    handoff: Handoff,
 }
 
 impl State {
@@ -212,7 +217,19 @@ struct Inner {
     cv: Condvar,
     stop: AtomicBool,
     renewer: Mutex<Option<std::thread::JoinHandle<()>>>,
+    chain: std::sync::OnceLock<Chain>,
 }
+
+/// How a node takes part in lock handoff (see [`super::handoff`]): its
+/// journal head, sent with every release, and a wait until it has applied
+/// other nodes' journals up to given heads.
+pub struct Chain {
+    pub head: Box<dyn Fn() -> u64 + Send + Sync>,
+    pub wait: Box<WaitFn>,
+}
+
+/// Waits until this node applied each `(origin, head)`'s journal up to it.
+pub type WaitFn = dyn Fn(&[(NodeId, u64)]) + Send + Sync;
 
 /// (from, to, message); `to == me` is handled in-process.
 type Queue = VecDeque<(NodeId, NodeId, Message)>;
@@ -261,10 +278,12 @@ impl LockManager {
                 fresh_round: 0,
                 fresh_acks: BTreeSet::new(),
                 grace_skipped: false,
+                handoff: Handoff::default(),
             }),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
             renewer: Mutex::new(None),
+            chain: std::sync::OnceLock::new(),
         });
         let weak: Weak<Inner> = Arc::downgrade(&inner);
         net.add_handler(
@@ -294,6 +313,11 @@ impl LockManager {
 
     pub fn settings(&self) -> &Settings {
         &self.inner.s
+    }
+
+    /// Turns on lock handoff (mount nodes, once replication runs).
+    pub fn set_chain(&self, chain: Chain) {
+        let _ = self.inner.chain.set(chain);
     }
 
     /// Takes (another reference to) the write lock on `key`, waiting up to
@@ -412,6 +436,7 @@ impl LockManager {
         if let Some(h) = lock(&inner.renewer).take() {
             let _ = h.join();
         }
+        let head = inner.head();
         let mut st = lock(&inner.st);
         let keys: Vec<(Key, Ballot, Option<Outcome>)> = st
             .held
@@ -426,6 +451,7 @@ impl LockManager {
                 key: k.as_bytes().to_vec(),
                 ballot: b,
                 outcome,
+                head,
             });
         }
         let out = inner.pump(&mut st, q);
@@ -556,13 +582,22 @@ impl Inner {
                     ));
                 }
                 let known = file.and_then(|f| lock(&self.versions).get(&f).cloned());
+                let after = match r {
+                    Reply::Grant => st.handoff.after(&Key::new(&key)),
+                    Reply::Deny(..) => Vec::new(),
+                };
                 self.reply(
                     q,
                     from,
                     req,
                     ballot,
                     r,
-                    Message::LockGrant { req, ballot, known },
+                    Message::LockGrant {
+                        req,
+                        ballot,
+                        known,
+                        after,
+                    },
                 );
             }
             Message::LockConfirm {
@@ -620,9 +655,12 @@ impl Inner {
                 key,
                 ballot,
                 outcome,
+                head,
             } => {
                 st.observe(ballot);
-                st.voter.release(from, &Key::new(&key), ballot);
+                let key = Key::new(&key);
+                st.voter.release(from, &key, ballot);
+                st.handoff.record(&key, from, head);
                 if let Some(o) = outcome.filter(|o| o.version.node == from) {
                     lock(&self.versions).on_release(o);
                 }
@@ -633,7 +671,12 @@ impl Inner {
                 holders,
             } => lock(&self.versions).on_holders(file, version, &holders),
             // Requester side.
-            Message::LockGrant { req, ballot, known } => {
+            Message::LockGrant {
+                req,
+                ballot,
+                known,
+                after,
+            } => {
                 let Some(p) = st.pending.get_mut(&req) else {
                     let late = st
                         .held
@@ -656,6 +699,10 @@ impl Inner {
                 };
                 if let Some(k) = known {
                     p.known.push(k);
+                }
+                for (n, h) in after {
+                    let e = p.after.entry(n).or_default();
+                    *e = (*e).max(h);
                 }
                 let step = p.attempt.on_grant(from);
                 self.step(st, req, step, q);
@@ -815,8 +862,10 @@ impl Inner {
         let (mut st, res) = self.attempts(st, key, ballot, deadline, fail_on_held, file, reuse);
         st.acquiring.remove(key);
         let mut acquired = Acquired::default();
+        let mut handoff = Vec::new();
         match &res {
-            Ok((req, valid_until, known, announced)) => {
+            Ok((req, valid_until, known, announced, after)) => {
+                handoff = after.clone();
                 let (req, valid_until) = (*req, *valid_until);
                 st.counters.acquired += 1;
                 st.acquired_since_boot = true;
@@ -851,7 +900,7 @@ impl Inner {
                 }
                 if h.refs == 0 {
                     // ensure() on a key nobody references: don't keep it.
-                    let out = self.drop_held(&mut st, key);
+                    let out = self.drop_held(&mut st, key, 0);
                     drop(st);
                     self.cv.notify_all();
                     self.send(out);
@@ -863,6 +912,12 @@ impl Inner {
         }
         drop(st);
         self.cv.notify_all();
+        handoff.retain(|(n, _)| *n != self.s.me);
+        if let (Ok(_), Some(c)) = (&res, self.chain.get()) {
+            if !handoff.is_empty() {
+                (c.wait)(&handoff);
+            }
+        }
         res.map(|_| acquired)
     }
 
@@ -881,7 +936,16 @@ impl Inner {
         reuse: Option<Version>,
     ) -> (
         MutexGuard<'a, State>,
-        Result<(u64, Instant, Vec<VersionInfo>, Option<Version>), LockError>,
+        Result<
+            (
+                u64,
+                Instant,
+                Vec<VersionInfo>,
+                Option<Version>,
+                Vec<(NodeId, u64)>,
+            ),
+            LockError,
+        >,
     ) {
         let mut backoff = Duration::from_millis(20);
         loop {
@@ -907,6 +971,7 @@ impl Inner {
                     confirm_sent: None,
                     file,
                     known: Vec::new(),
+                    after: BTreeMap::new(),
                     announce: reuse,
                 },
             );
@@ -953,7 +1018,8 @@ impl Inner {
             if p.attempt.phase == Phase::Acquired {
                 let sent = p.confirm_sent.expect("confirmed attempts sent confirms");
                 let valid = sent + self.s.lease.saturating_sub(self.s.margin());
-                return (st, Ok((req, valid, p.known, p.announce)));
+                let after = p.after.into_iter().collect();
+                return (st, Ok((req, valid, p.known, p.announce, after)));
             }
             // Withdraw every vote this attempt may have got (and the
             // announced version, if confirms went out).
@@ -968,6 +1034,7 @@ impl Inner {
                 key: key.as_bytes().to_vec(),
                 ballot,
                 outcome,
+                head: 0,
             });
             let out = self.pump(&mut st, q);
             drop(st);
@@ -992,7 +1059,7 @@ impl Inner {
         }
     }
 
-    fn drop_held(&self, st: &mut State, key: &Key) -> Vec<(NodeId, Message)> {
+    fn drop_held(&self, st: &mut State, key: &Key, head: u64) -> Vec<(NodeId, Message)> {
         let Some(h) = st.held.remove(key) else {
             return Vec::new();
         };
@@ -1003,11 +1070,14 @@ impl Inner {
             key: key.as_bytes().to_vec(),
             ballot: h.ballot,
             outcome,
+            head,
         });
         self.pump(st, q)
     }
 
     fn release(&self, key: &Key) {
+        // Before taking the state lock: the head comes from replication.
+        let head = self.head();
         let mut st = lock(&self.st);
         let Some(h) = st.held.get_mut(key) else {
             log::warn!("locks: releasing {key}, which is not held");
@@ -1017,10 +1087,14 @@ impl Inner {
         if h.refs > 0 {
             return;
         }
-        let out = self.drop_held(&mut st, key);
+        let out = self.drop_held(&mut st, key, head);
         drop(st);
         self.cv.notify_all();
         self.send(out);
+    }
+
+    fn head(&self) -> u64 {
+        self.chain.get().map_or(0, |c| (c.head)())
     }
 
     /// While in the start-up grace, asks every other node whether it is

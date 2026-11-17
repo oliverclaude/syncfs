@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::config::NodeId;
 
 pub const MAGIC: [u8; 6] = *b"SYNCFS";
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const PREAMBLE_LEN: usize = 8;
 /// Largest payload: a 16 MiB block (the largest `block_size`) plus headroom.
 pub const MAX_FRAME_LEN: u32 = 32 << 20;
@@ -193,6 +193,10 @@ pub enum Message {
         ballot: Ballot,
         /// What this voter knows about the requested file's versions.
         known: Option<VersionInfo>,
+        /// Journal heads of the nodes that released conflicting keys: the
+        /// new holder applies their journals that far first (see
+        /// `crate::lock::handoff`).
+        after: Vec<(NodeId, u64)>,
     },
     /// Refusal of a request, confirmation or renewal; also sent unasked
     /// when an older ballot preempts a provisional grant.
@@ -233,6 +237,8 @@ pub enum Message {
         ballot: Ballot,
         /// Whether the announced version was written.
         outcome: Option<Outcome>,
+        /// The releasing node's journal head (0: nothing to wait for).
+        head: u64,
     },
 
     // Asynchronous replication (see `crate::repl`).

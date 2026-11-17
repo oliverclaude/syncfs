@@ -9,6 +9,7 @@ pub mod core;
 pub mod dirty;
 pub mod files;
 pub mod fresh;
+pub mod handoff;
 pub mod journal;
 pub mod marker;
 #[cfg(test)]

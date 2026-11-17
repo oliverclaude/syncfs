@@ -283,7 +283,7 @@ no gossip.
 ### Wire format
 
 Every connection starts with an 8-byte preamble in each direction:
-`SYNCFS` and the protocol version as a big-endian u16 (currently 5). The
+`SYNCFS` and the protocol version as a big-endian u16 (currently 6). The
 preamble never changes, so nodes on different protocol versions recognise
 the mismatch, log it and close. After the preamble come frames:
 
@@ -702,6 +702,33 @@ version the granting voters report:
 
 Reads take no lock and are served from the local copy, which may lag by
 the replication delay.
+
+### Lock handoff
+
+Versions order changes to one file; namespace changes (create, unlink,
+rename, mkdir) travel in each origin's journal, which applies
+asynchronously. Without more, a node could take a lock right after
+another node released it and act on a namespace that does not show the
+previous holder's change yet (e.g. create a file the other node just
+created, giving two files at one path). So:
+
+- `LockRelease` carries the releasing node's journal head (its last
+  entry). Each voter keeps, per lock key, the newest head each node
+  released it with (at most 65,536 keys; the oldest are folded into one
+  floor that applies to every key).
+- `LockGrant` carries the heads recorded for keys that conflict with the
+  requested one (the key itself, its ancestors and its descendants).
+- After acquiring, the new holder waits until it has applied each of
+  those origins' journals up to the head, for at most `freshness_timeout`
+  and only while the origin, or a connected peer that has those entries,
+  is reachable. Otherwise it goes on (counted as `handoff_gaps` in
+  `status.json`, `handoff_waits` counts the waits).
+- A create that finds the name taken in the meantime (a peer's create
+  applied during the wait) opens the existing file instead, unless the
+  application asked for `O_EXCL`.
+
+The wait can stall behind entries this node defers because it holds a
+lock on their file itself; it then ends at `freshness_timeout`.
 
 ### Journal and dirty blocks
 

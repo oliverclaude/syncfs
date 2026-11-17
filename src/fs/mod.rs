@@ -389,6 +389,38 @@ impl<H: WriteHooks> SyncFs<H> {
         Ok(File::from(fd))
     }
 
+    /// Opens an existing file with the caller's `flags` (taking its write
+    /// lock if writable; `O_TRUNC` is a change of its own).
+    fn open_inode(&self, inode: Arc<Inode>, flags: i32) -> Res<u64> {
+        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+        if writable {
+            self.hooks.open_write(self.node(&inode))?;
+        } else {
+            self.hooks.open_read(self.node(&inode))?;
+        }
+        let opened = if flags & libc::O_TRUNC != 0 {
+            let op = Mutation::SetAttr {
+                node: self.node(&inode),
+                change: AttrChange {
+                    size: Some(0),
+                    ..Default::default()
+                },
+            };
+            self.mutate(op, || Self::open_backing(&inode, flags))
+        } else {
+            Self::open_backing(&inode, flags)
+        };
+        match opened {
+            Ok(file) => Ok(self.register_file(file, inode, writable)),
+            Err(e) => {
+                if writable {
+                    self.hooks.release_write(self.node(&inode));
+                }
+                Err(e)
+            }
+        }
+    }
+
     fn register_file(&self, file: File, inode: Arc<Inode>, writable: bool) -> u64 {
         let fh = self.new_fh();
         self.stats.file_opened(1);
@@ -822,36 +854,9 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         virtual_reply!(self, ino.0, reply, self.virt_open(ino.0, flags), |fh| reply
             .opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO));
-        let res = (|| {
-            let inode = self.inode(ino)?;
-            let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
-            if writable {
-                self.hooks.open_write(self.node(&inode))?;
-            } else {
-                self.hooks.open_read(self.node(&inode))?;
-            }
-            let opened = if flags.0 & libc::O_TRUNC != 0 {
-                let op = Mutation::SetAttr {
-                    node: self.node(&inode),
-                    change: AttrChange {
-                        size: Some(0),
-                        ..Default::default()
-                    },
-                };
-                self.mutate(op, || Self::open_backing(&inode, flags.0))
-            } else {
-                Self::open_backing(&inode, flags.0)
-            };
-            match opened {
-                Ok(file) => Ok(self.register_file(file, inode, writable)),
-                Err(e) => {
-                    if writable {
-                        self.hooks.release_write(self.node(&inode));
-                    }
-                    Err(e)
-                }
-            }
-        })();
+        let res = self
+            .inode(ino)
+            .and_then(|inode| self.open_inode(inode, flags.0));
         reply!(self, Op::Open, reply, res, |fh| reply
             .opened(FileHandle(fh), FopenFlags::empty()));
     }
@@ -1233,10 +1238,16 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
                 name,
                 kind: FileType::RegularFile,
             };
-            let (inode, attr, file) = self.mutate(op, || {
+            let created = self.mutate(op, || {
+                // Exclusive: if the name appeared since the kernel looked
+                // (a peer's create, applied while we took the lock), the
+                // file is opened as an existing one below instead.
                 let oflags = OFlags::from_bits_retain(
-                    ((flags & !libc::O_NOCTTY) | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                        as u32,
+                    ((flags & !libc::O_NOCTTY)
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC) as u32,
                 );
                 let fd = rustix::fs::openat(
                     &p.fd,
@@ -1248,7 +1259,21 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
                 self.chown_new(req, &p, name)?;
                 let (inode, attr) = self.do_lookup(&p, name)?;
                 Ok((inode, attr, File::from(fd)))
-            })?;
+            });
+            let (inode, attr, file) = match created {
+                Err(e) if e == Errno::EEXIST && flags & libc::O_EXCL == 0 => {
+                    let (inode, _) = self.do_lookup(&p, name)?;
+                    let fh = match self.open_inode(Arc::clone(&inode), flags) {
+                        Ok(fh) => fh,
+                        Err(e) => {
+                            self.inodes.forget(inode.ino, 1);
+                            return Err(e);
+                        }
+                    };
+                    return Ok((Self::attr(&inode)?, fh));
+                }
+                other => other?,
+            };
             if writable {
                 if let Err(e) = self.hooks.open_write(self.node(&inode)) {
                     self.inodes.forget(inode.ino, 1);
