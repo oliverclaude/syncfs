@@ -183,6 +183,9 @@ impl Repl {
         out.sync_all()?;
         drop(out);
         self.backing.set_attrs(&path, &remote.attrs)?;
+        if let Err(e) = self.backing.sync_xattrs(&path, &remote.xattrs) {
+            log::warn!("freshness: copying the xattrs of {id} from node {source}: {e}");
+        }
         self.invalidate(&path);
         let mut st = self.state();
         if let Some(v) = remote.version {

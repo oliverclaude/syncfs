@@ -206,7 +206,7 @@ threads. That is fine at this size, so there is no gossip or relaying.
 ### Wire format
 
 Every connection starts with an 8-byte preamble in each direction:
-`SYNCFS` and the protocol version as a big-endian u16 (currently 4). The
+`SYNCFS` and the protocol version as a big-endian u16 (currently 5). The
 preamble never changes, so nodes on different protocol versions recognise
 the mismatch, log it and close. After the preamble come frames:
 
@@ -568,8 +568,8 @@ version the granting voters report:
    stopped between the lock and the write).
 2. Otherwise it compares block hashes with a node that has the version
    (the writer while pending, else the holders) and pulls the blocks that
-   differ, then takes the size, attributes and version (xattrs are not
-   compared).
+   differ, then takes the size, attributes, extended attributes (all of
+   them: names missing there are removed here) and version.
 3. If no such node answers, `open()` (or the operation) blocks for up to
    `freshness_timeout` (default 30 s), retrying.
 4. Then it falls back: it catches up from the newest copy any reachable
@@ -664,7 +664,6 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
   directory-tree reconciliation is part of step 8.
 - Removes leave no tombstone in the version table, so a remove can race a
   stale write that a node makes after the fallback.
-- Freshness covers content and attributes, not xattrs.
 - Attribute and data caches are dropped after a peer's change; directory
   entries (a peer's create, rename or remove) show after the 1 s entry TTL.
 - If an origin is down, entries of other origins that depend on it wait.

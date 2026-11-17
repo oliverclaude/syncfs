@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::config::NodeId;
 
 pub const MAGIC: [u8; 6] = *b"SYNCFS";
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const PREAMBLE_LEN: usize = 8;
 /// Largest payload: a 16 MiB block (the largest `block_size`) plus headroom.
 pub const MAX_FRAME_LEN: u32 = 32 << 20;
@@ -290,6 +290,9 @@ pub enum Message {
         hashes: Vec<BlockHash>,
         /// More hashes follow (ask again from `from + hashes.len()`).
         more: bool,
+        /// The file's extended attributes, sorted by name (in the first
+        /// reply only, `from == 0`).
+        xattrs: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// The nodes known to hold `version` of `file` completely.
     VersionHolders {

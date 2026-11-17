@@ -216,10 +216,11 @@ impl Backing {
         self.set_attrs_at(&d, n, kind_of(&st), a)
     }
 
-    pub fn set_xattr(&self, path: &[u8], name: &[u8], value: Option<&[u8]>) -> io::Result<()> {
+    /// An O_PATH descriptor of the file itself and its `/proc` path, for
+    /// xattr calls; None for a symlink (user xattrs are not allowed on
+    /// those).
+    fn xattr_target(&self, path: &[u8]) -> io::Result<Option<(OwnedFd, String)>> {
         let (d, n) = self.parent(path)?;
-        // Through an O_PATH descriptor of the file itself (not a symlink:
-        // user xattrs are not allowed on those).
         let fd = rustix::fs::openat(
             &d,
             n,
@@ -228,9 +229,16 @@ impl Backing {
         )?;
         let st = rustix::fs::fstat(&fd)?;
         if FileType::from_raw_mode(st.st_mode) == FileType::Symlink {
-            return Ok(());
+            return Ok(None);
         }
         let p = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd));
+        Ok(Some((fd, p)))
+    }
+
+    pub fn set_xattr(&self, path: &[u8], name: &[u8], value: Option<&[u8]>) -> io::Result<()> {
+        let Some((_fd, p)) = self.xattr_target(path)? else {
+            return Ok(());
+        };
         let name = OsStr::from_bytes(name);
         match value {
             Some(v) => rustix::fs::setxattr(p.as_str(), name, v, rustix::fs::XattrFlags::empty())?,
@@ -240,6 +248,77 @@ impl Backing {
             },
         }
         Ok(())
+    }
+
+    /// Every extended attribute of the file at `path` with its value,
+    /// sorted by name (none for a symlink).
+    pub fn xattrs(&self, path: &[u8]) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some((_fd, p)) = self.xattr_target(path)? else {
+            return Ok(Vec::new());
+        };
+        let p = p.as_str();
+        let names = loop {
+            let len = rustix::fs::listxattr_query(p)?;
+            let mut buf = vec![0u8; len];
+            match rustix::fs::listxattr(p, &mut buf[..]) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    break buf;
+                }
+                // Grew in between.
+                Err(rustix::io::Errno::RANGE) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let mut out = Vec::new();
+        for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+            let os = OsStr::from_bytes(name);
+            let value = loop {
+                let len = match rustix::fs::getxattr_query(p, os) {
+                    Ok(n) => n,
+                    Err(rustix::io::Errno::NODATA) => break None,
+                    Err(e) => return Err(e.into()),
+                };
+                let mut buf = vec![0u8; len];
+                match rustix::fs::getxattr(p, os, &mut buf[..]) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        break Some(buf);
+                    }
+                    Err(rustix::io::Errno::RANGE) => continue,
+                    Err(rustix::io::Errno::NODATA) => break None,
+                    Err(e) => return Err(e.into()),
+                }
+            };
+            if let Some(v) = value {
+                out.push((name.to_vec(), v));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Makes the extended attributes of `path` exactly `want` (sorted by
+    /// name). Returns how many were set or removed.
+    pub fn sync_xattrs(&self, path: &[u8], want: &[(Vec<u8>, Vec<u8>)]) -> io::Result<usize> {
+        let have = self.xattrs(path)?;
+        let mut changed = 0;
+        for (name, _) in &have {
+            if want.binary_search_by(|(n, _)| n.cmp(name)).is_err() {
+                self.set_xattr(path, name, None)?;
+                changed += 1;
+            }
+        }
+        for (name, value) in want {
+            let same = have
+                .binary_search_by(|(n, _)| n.cmp(name))
+                .is_ok_and(|i| have[i].1 == *value);
+            if !same {
+                self.set_xattr(path, name, Some(value))?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     /// Opens a regular file for reading (never following a symlink).
@@ -349,5 +428,37 @@ mod tests {
         b.link(b"d/g", b"h").unwrap();
         b.remove(b"d/g", false).unwrap();
         assert!(b.exists(b"h"));
+    }
+
+    #[test]
+    fn xattrs_are_listed_and_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Backing::open(dir.path()).unwrap();
+        b.create(
+            b"f",
+            NodeKind::File,
+            &Attrs {
+                mode: 0o644,
+                ..Default::default()
+            },
+            0,
+            b"",
+        )
+        .unwrap();
+        if b.set_xattr(b"f", b"user.a", Some(b"1")).is_err() {
+            eprintln!("no user xattrs on {}; skipping", dir.path().display());
+            return;
+        }
+        b.set_xattr(b"f", b"user.b", Some(b"2")).unwrap();
+        let want = vec![
+            (b"user.b".to_vec(), b"two".to_vec()),
+            (b"user.c".to_vec(), b"3".to_vec()),
+        ];
+        assert_eq!(b.sync_xattrs(b"f", &want).unwrap(), 3);
+        assert_eq!(b.xattrs(b"f").unwrap(), want);
+        assert_eq!(b.sync_xattrs(b"f", &want).unwrap(), 0);
+        b.create(b"l", NodeKind::Symlink, &Attrs::default(), 0, b"f")
+            .unwrap();
+        assert!(b.xattrs(b"l").unwrap().is_empty());
     }
 }

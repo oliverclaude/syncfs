@@ -326,7 +326,7 @@ impl Repl {
                 st.index.version(&file),
             )
         };
-        let reply = |found, size, attrs, hashes: Vec<BlockHash>, more| Message::HashReply {
+        let reply = |found, size, attrs, hashes: Vec<BlockHash>, more, xattrs| Message::HashReply {
             req,
             found,
             version,
@@ -335,6 +335,7 @@ impl Repl {
             from: first,
             hashes,
             more,
+            xattrs,
         };
         let msg = (|| {
             let path = path?;
@@ -352,9 +353,20 @@ impl Repl {
             for n in first..end {
                 hashes.push(hash_block(&Backing::read_block(&f, n, block_size).ok()?));
             }
-            Some(reply(true, size, attrs, hashes, end < total))
+            let xattrs = if first == 0 {
+                match self.backing.xattrs(&path) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log::warn!("replication: reading xattrs of {file}: {e}");
+                        return None;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            Some(reply(true, size, attrs, hashes, end < total, xattrs))
         })()
-        .unwrap_or_else(|| reply(false, 0, Attrs::default(), Vec::new(), false));
+        .unwrap_or_else(|| reply(false, 0, Attrs::default(), Vec::new(), false, Vec::new()));
         self.net.send(peer, msg);
     }
 
@@ -381,6 +393,7 @@ impl Repl {
                     attrs,
                     hashes,
                     more,
+                    xattrs,
                     ..
                 } => {
                     if !found {
@@ -392,6 +405,9 @@ impl Repl {
                     out.version = version;
                     out.size = size;
                     out.attrs = attrs;
+                    if out.hashes.is_empty() {
+                        out.xattrs = xattrs;
+                    }
                     out.hashes.extend(hashes);
                     if !more {
                         return Ok(out);
@@ -459,6 +475,7 @@ pub(crate) struct RemoteFile {
     pub size: u64,
     pub attrs: Attrs,
     pub hashes: Vec<BlockHash>,
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 pub(crate) struct Pulled {
