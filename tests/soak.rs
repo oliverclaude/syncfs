@@ -1551,7 +1551,8 @@ fn soak(kinds: &[Kind]) {
             ));
         }
     }
-    if !bad.is_empty() {
+    // `SYNCFS_SOAK_KEEP=1`: keep the directory of a passing run too.
+    if !bad.is_empty() || std::env::var_os("SYNCFS_SOAK_KEEP").is_some() {
         let keep = std::mem::replace(
             &mut s.tmp,
             tempfile::Builder::new()
@@ -1572,6 +1573,10 @@ fn soak(kinds: &[Kind]) {
         }
         let _ = std::fs::write(kept.join("ops.tsv"), dump);
         // The nodes stop with `s`; their directories stay for inspection.
+        if bad.is_empty() {
+            eprintln!("soak: kept {}", kept.display());
+            return;
+        }
         panic!(
             "soak failed (seed {seed:#x}; node logs and lock logs in {}):\n{}",
             kept.display(),
