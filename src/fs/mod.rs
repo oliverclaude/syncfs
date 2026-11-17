@@ -118,7 +118,9 @@ impl<H: WriteHooks> SyncFs<H> {
             Mode::empty(),
         )?;
         let st = rustix::fs::statat(&fd, "", AtFlags::EMPTY_PATH)?;
-        let shadowed = rustix::fs::statat(&fd, virt::NAME, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        // The disk marker (crate::repl::marker) lives there on purpose.
+        let shadowed = rustix::fs::statat(&fd, virt::NAME, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+            && !crate::repl::marker::only_marker(&root);
         if shadowed {
             log::warn!(
                 "{}/{} exists in the backing directory; it is hidden by the virtual {} directory",
@@ -140,6 +142,12 @@ impl<H: WriteHooks> SyncFs<H> {
             status_files: RwLock::new(HashMap::new()),
             shadowed,
         })
+    }
+
+    /// The inode table, to map backing files to kernel inodes (for cache
+    /// invalidation after replication changed a file).
+    pub fn inode_table(&self) -> Arc<inode::InodeTable> {
+        Arc::clone(&self.inodes)
     }
 
     /// Whether a real `.syncfs` in the backing directory is shadowed.

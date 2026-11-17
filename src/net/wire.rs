@@ -251,12 +251,11 @@ pub enum Message {
         origin: NodeId,
         seq: u64,
     },
-    /// Asks for blocks of `file`: the ones this node is missing according
-    /// to the sender's dirty bitmap (`blocks: None`), or the listed ranges.
+    /// Asks for blocks of `file`, or drops marks (see [`PullMode`]).
     BlockPull {
         req: u64,
         file: FileId,
-        blocks: Option<Vec<(u64, u64)>>,
+        mode: PullMode,
     },
     /// One block (shorter at the end of the file; empty past it).
     BlockData {
@@ -344,7 +343,24 @@ impl Message {
     pub fn is_bulk(&self) -> bool {
         matches!(
             self,
-            Message::JournalEntry { .. } | Message::BlockData { .. } | Message::HashReply { .. }
+            Message::JournalEntry { .. }
+                | Message::BlockData { .. }
+                | Message::BlockDone { .. }
+                | Message::HashReply { .. }
+        )
+    }
+
+    /// Replication messages (handled by `crate::repl`).
+    pub fn is_repl(&self) -> bool {
+        matches!(
+            self,
+            Message::JournalEntry { .. }
+                | Message::JournalAck { .. }
+                | Message::BlockPull { .. }
+                | Message::BlockData { .. }
+                | Message::BlockDone { .. }
+                | Message::HashRequest { .. }
+                | Message::HashReply { .. }
         )
     }
 
@@ -452,6 +468,21 @@ impl std::fmt::Display for FileId {
         }
         Ok(())
     }
+}
+
+/// What a `BlockPull` asks for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+pub enum PullMode {
+    /// The blocks the asker is missing according to the answering node's
+    /// dirty bitmap. `restart`: the asker starts applying an entry, so
+    /// blocks sent to it earlier and not acknowledged were lost (a failed
+    /// attempt) and are marked again first.
+    Dirty { restart: bool },
+    /// These block ranges.
+    Ranges(Vec<(u64, u64)>),
+    /// The asker already has this version: drop its marks up to it.
+    Discard(Version),
 }
 
 /// BLAKE3 of a block, truncated.

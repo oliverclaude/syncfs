@@ -38,6 +38,44 @@ impl Ranges {
         }
     }
 
+    /// Removes `[a, b)`.
+    pub fn remove(&mut self, a: u64, b: u64) {
+        if a >= b {
+            return;
+        }
+        let hit: Vec<(u64, u64)> = self
+            .0
+            .range(..b)
+            .filter(|(_, &e)| e > a)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in hit {
+            self.0.remove(&s);
+            if s < a {
+                self.0.insert(s, a);
+            }
+            if e > b {
+                self.0.insert(b, e);
+            }
+        }
+    }
+
+    /// Removes what `other` covers; returns what was actually removed.
+    pub fn subtract(&mut self, other: &Ranges) -> Ranges {
+        let mut removed = Ranges::default();
+        for (a, b) in other.iter() {
+            for (s, e) in self.0.range(..b).filter(|(_, &e)| e > a) {
+                removed.insert((*s).max(a), (*e).min(b));
+            }
+            self.remove(a, b);
+        }
+        removed
+    }
+
+    pub fn contains(&self, x: u64) -> bool {
+        self.0.range(..=x).next_back().is_some_and(|(_, &e)| x < e)
+    }
+
     /// Number of elements.
     pub fn len(&self) -> u64 {
         self.0.iter().map(|(s, e)| e - s).sum()
@@ -157,6 +195,11 @@ mod tests {
                 } else {
                     r.insert(a, b);
                     s.extend(a..b);
+                }
+                if next() % 4 == 0 {
+                    let (c, d) = (next() % 64, next() % 8);
+                    r.remove(c, c + d);
+                    s.retain(|&i| i < c || i >= c + d);
                 }
                 let back: BTreeSet<u64> = r.iter().flat_map(|(a, b)| a..b).collect();
                 assert_eq!(back, s);

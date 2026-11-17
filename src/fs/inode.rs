@@ -111,6 +111,17 @@ impl InodeTable {
             .ok_or(Errno::ESTALE)
     }
 
+    /// The number of the live inode for backing file `st`, if the kernel
+    /// knows it.
+    pub fn live_number(&self, st: &Stat) -> Option<u64> {
+        let inner = self.lock();
+        inner
+            .numbers
+            .get(&key(st))
+            .copied()
+            .filter(|n| inner.live.contains_key(n))
+    }
+
     /// The inode number for a backing identity, assigning one if new.
     /// Used by `readdir`, which reports numbers without taking a lookup.
     pub fn number_for(&self, k: Key) -> u64 {

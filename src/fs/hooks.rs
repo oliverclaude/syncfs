@@ -8,7 +8,7 @@
 //!
 //! A standalone node uses [`LocalOnly`], which allows everything; a cluster
 //! node uses `lock::ClusterHooks`: whole-file write locks and the quorum
-//! check in `before`, dirty marks (`crate::dirty`) in `after` and `failed`.
+//! check in `before`, replication records (`crate::repl`) in `after` and `failed`.
 //! Step 7 replicates what was marked.
 
 use std::ffi::OsStr;
@@ -56,6 +56,46 @@ impl<'a> NodeRef<'a> {
             .strip_prefix(self.root)
             .map(Path::to_path_buf)
             .map_err(|_| io::Error::other("file is outside the backing directory"))
+    }
+
+    /// The file's current attributes.
+    pub fn stat(&self) -> io::Result<rustix::fs::Stat> {
+        Ok(rustix::fs::statat(
+            &self.inode.fd,
+            "",
+            rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?)
+    }
+
+    /// Attributes of `name` in this directory (not following a symlink).
+    pub fn stat_child(&self, name: &std::ffi::OsStr) -> io::Result<rustix::fs::Stat> {
+        Ok(rustix::fs::statat(
+            &self.inode.fd,
+            name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?)
+    }
+
+    /// Target of the symlink `name` in this directory.
+    pub fn readlink_child(&self, name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+        Ok(rustix::fs::readlinkat(&self.inode.fd, name, Vec::new())?.into_bytes())
+    }
+
+    /// Value of extended attribute `name` (None if it has none).
+    pub fn xattr(&self, name: &std::ffi::OsStr) -> io::Result<Option<Vec<u8>>> {
+        if self.inode.kind == FileType::Symlink {
+            return Ok(None);
+        }
+        let target = self.inode.proc_path();
+        let len = match rustix::fs::getxattr_query(target.as_str(), name) {
+            Ok(n) => n,
+            Err(rustix::io::Errno::NODATA) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut buf = vec![0u8; len];
+        let n = rustix::fs::getxattr(target.as_str(), name, &mut buf[..])?;
+        buf.truncate(n);
+        Ok(Some(buf))
     }
 }
 
