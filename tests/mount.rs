@@ -383,6 +383,9 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
     assert_eq!(fs::read(b.join("f")).unwrap(), b"daemon");
     unmount(&mnt);
     wait_until("unmount", || !is_mounted(&mnt));
+    // The daemon still closes its store after the unmount; the next mount
+    // with the same state directory can only open it after that.
+    wait_until("daemon exit", || store_free(&state.join("store.redb")));
 
     // A failing mount reports the error and a non-zero status.
     let out = Command::new(BIN)
@@ -531,4 +534,19 @@ fn multi_user_as_root() {
     std::os::unix::fs::chown(m.m("secret"), Some(nobody), None).unwrap();
     assert_eq!(fs::metadata(m.b("secret")).unwrap().uid(), nobody);
     m.finish();
+}
+
+/// Whether no process holds the store's lock (redb takes an exclusive
+/// `flock` while open).
+fn store_free(p: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = fs::File::open(p) else {
+        return true;
+    };
+    let fd = f.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return false;
+    }
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    true
 }
