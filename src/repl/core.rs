@@ -168,6 +168,9 @@ pub struct Repl {
     pub(crate) threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     pub(crate) inbox: Mutex<HashMap<NodeId, Inbox>>,
     pub(crate) unclean_start: bool,
+    pub(crate) started: Instant,
+    /// Caught up after the start (or gave up waiting): see `rejoin`.
+    pub(crate) rejoined: AtomicBool,
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
     invalidator: std::sync::OnceLock<Invalidator>,
@@ -322,6 +325,8 @@ impl Repl {
             threads: Mutex::new(Vec::new()),
             inbox: Mutex::new(HashMap::new()),
             unclean_start: !clean,
+            started: Instant::now(),
+            rejoined: AtomicBool::new(cfg.peers.iter().all(|p| p.id == cfg.node_id)),
             this: std::sync::OnceLock::new(),
             invalidator: std::sync::OnceLock::new(),
             stats: std::sync::OnceLock::new(),
@@ -930,6 +935,7 @@ impl Repl {
             "window": st.window.len(),
             "suspects": st.suspects.len(),
             "unclean_start": self.unclean_start,
+            "rejoining": !self.rejoined.load(Ordering::Relaxed),
             "in_sync": st.dirty.files() == 0 && !lagging && st.sessions.is_empty(),
             "freshness_timeout": humantime::format_duration(self.freshness_timeout).to_string(),
             "store_commits": self.flusher.store().commits(),

@@ -1253,6 +1253,28 @@ fn removes_leave_tombstones() {
     in_sync(&c, 2);
 }
 
+/// A node that restarts takes changes only once it has caught up with its
+/// peers: its mkdir of a directory a peer made meanwhile fails with EEXIST
+/// instead of racing the peer's entry.
+#[test]
+fn restarted_node_catches_up_before_changes() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &[]);
+    c.node(2).stop();
+    let m1 = c.node(1).mnt();
+    for i in 0..50 {
+        std::fs::write(m1.join(format!("f{i}")), format!("{i}\n")).unwrap();
+    }
+    std::fs::create_dir(m1.join("d")).unwrap();
+    c.node(2).start();
+    let r = std::fs::create_dir(c.node(2).mnt().join("d"));
+    assert_eq!(errno(r), Some(libc::EEXIST));
+    let r = c.node(2).status("replication").unwrap();
+    assert_eq!(r["rejoining"], false, "{r:#}");
+    wait_same_tree(&c, 1, 2);
+}
+
 /// Step 8 (backing-disk loss, option C). A voter-only daemon restarted as a
 /// mount has an empty backing directory with no marker: it must rebuild
 /// from its peers like a node that lost its disk (mount at once, fetch on

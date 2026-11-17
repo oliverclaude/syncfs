@@ -696,6 +696,17 @@ marked again if the connection drops or the peer starts over.
 - **Bulk lane.** Journal entries, blocks and hash replies go over the
   bulk lane to the peer (see [Topology](#topology)).
 
+### Rejoin
+
+After a start, local changes (writes, opens for writing, namespace
+changes) wait until the node has applied every origin's entries as far as
+each connected data peer reports applied (`Positions`), so a node that was
+away does not change a namespace it has not caught up with. If that takes
+longer than `freshness_timeout` from the start (or no data peer connects),
+changes go ahead; per-file freshness still applies. A cluster whose other
+nodes are all voter daemons does not wait. `rejoining` in
+`.syncfs/replication` shows the state.
+
 ### Crash window
 
 The store is flushed in batches every 100 ms (each flush is one durable
@@ -724,7 +735,7 @@ the disk-loss rebuild; for now a missing marker just gets a new disk id.
 `journal_queue`, `open_sessions`, `sessions` (up to 20: file id, path,
 version, ms since the last interim entry), `window`, `suspects`, `unclean_start`,
 `in_sync` (nothing dirty, unacknowledged or open), `freshness_timeout`,
-`store_commits`, `store_failures`, `versions` (this node's voter table:
+`rejoining`, `store_commits`, `store_failures`, `versions` (this node's voter table:
 `files`, `pending`, `latest_committed`), per peer `stores_data`, `disk`,
 `journal_unacked`, `dirty_blocks`, `applied_from`, and `counters`
 (`entries_made`, `entries_applied`, `entries_skipped`, `apply_errors`,

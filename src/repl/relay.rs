@@ -118,6 +118,11 @@ impl RelayLog {
     }
 
     /// What `peer` advertised for `origin`.
+    /// Whether `peer` told its positions since start.
+    pub fn heard_from(&self, peer: NodeId) -> bool {
+        self.known.contains_key(&peer)
+    }
+
     pub fn position(&self, peer: NodeId, origin: NodeId) -> u64 {
         self.known
             .get(&peer)

@@ -267,6 +267,7 @@ impl ClusterHooks {
 
 impl WriteHooks for ClusterHooks {
     fn before(&self, op: &Mutation<'_>) -> Result<OpGuard, Errno> {
+        self.repl.rejoin_gate();
         match *op {
             Mutation::Write { node, .. }
             | Mutation::Allocate { node, .. }
@@ -331,6 +332,7 @@ impl WriteHooks for ClusterHooks {
     }
 
     fn open_write(&self, node: NodeRef<'_>) -> Result<(), Errno> {
+        self.repl.rejoin_gate();
         let Some(key) = key_of(node)? else {
             return Ok(());
         };
