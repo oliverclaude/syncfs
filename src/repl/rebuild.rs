@@ -236,7 +236,8 @@ impl Repl {
         let all = self.backing.list()?;
         let start = all.partition_point(|p| p.as_slice() <= after);
         let mut nodes = Vec::new();
-        for path in all[start..].iter().take(TREE_PAGE) {
+        let page = &all[start..all.len().min(start + TREE_PAGE)];
+        for path in page {
             let Ok(stat) = self.backing.stat(path) else {
                 continue; // Gone meanwhile.
             };
@@ -263,7 +264,9 @@ impl Repl {
                 lineage: st.index.lineage(&id),
             });
         }
-        let more = all.len() > start + nodes.len();
+        // By paths visited, not nodes sent: a path that is gone (or cannot
+        // be read) must not keep the caller asking for the same page.
+        let more = all.len() > start + page.len();
         Ok((nodes, more))
     }
 
@@ -274,7 +277,14 @@ impl Repl {
         loop {
             let req = self.req();
             let after = nodes.last().map(|n| n.path.clone()).unwrap_or_default();
-            let rpc = self.call(source, req, Message::TreeRequest { req, after })?;
+            let rpc = self.call(
+                source,
+                req,
+                Message::TreeRequest {
+                    req,
+                    after: after.clone(),
+                },
+            )?;
             match rpc.recv()? {
                 Message::TreeReply {
                     rebuilding,
@@ -287,9 +297,19 @@ impl Repl {
                         return Ok(None);
                     }
                     first.get_or_insert(positions);
+                    let moved = !page.is_empty();
                     nodes.extend(page);
                     if !more {
                         return Ok(first.map(|p| (p, nodes)));
+                    }
+                    if !moved {
+                        // Nothing to go on from: the tree is incomplete, so
+                        // it must not be used (its absent paths would look
+                        // like local-only ones). The caller tries again.
+                        return Err(io::Error::other(format!(
+                            "node {source}'s tree listing stopped making progress after {}",
+                            String::from_utf8_lossy(&after)
+                        )));
                     }
                 }
                 other => return Err(io::Error::other(format!("unexpected {}", other.kind()))),
