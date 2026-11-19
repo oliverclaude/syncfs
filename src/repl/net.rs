@@ -732,8 +732,13 @@ pub(crate) enum ApplyError {
     Skip(io::Error),
 }
 
+/// An entry retried this long is reported (once) as stuck.
+const STUCK_AFTER: Duration = Duration::from_secs(10);
+
 fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
     let mut backoff = Duration::from_millis(50);
+    // The entry being retried: (seq, since, reported).
+    let mut retrying: Option<(u64, Instant, bool)> = None;
     loop {
         let Some(r) = weak.upgrade() else { return };
         if r.stopping() {
@@ -823,6 +828,22 @@ fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
             }
             Err(ApplyError::Retry(e)) => {
                 log::debug!("replication: entry {seq} from node {origin}: {e}; retrying");
+                let (since, reported) = match &mut retrying {
+                    Some((s, since, reported)) if *s == seq => (*since, reported),
+                    _ => {
+                        let r = retrying.insert((seq, Instant::now(), false));
+                        (r.1, &mut r.2)
+                    }
+                };
+                if !*reported && since.elapsed() >= STUCK_AFTER {
+                    *reported = true;
+                    log::warn!(
+                        "replication: entry {seq} from node {origin} still not applied after \
+                         {}s ({e}); later entries from node {origin} wait for it: {:?}",
+                        STUCK_AFTER.as_secs(),
+                        q.entry
+                    );
+                }
                 // A copy whose sender went away is dropped: the origin
                 // resends on its next connection, and meanwhile the relay
                 // loop asks a peer that has the entry.
