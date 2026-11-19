@@ -410,18 +410,25 @@ impl Index {
         self.restore_versions(versions);
     }
 
-    /// The versions of the files at `paths` (which are about to be
-    /// removed and inserted again).
-    fn versions_of(&self, paths: &[(Vec<u8>, FileId)]) -> Vec<(FileId, Version)> {
+    /// The versions and lineages of the files at `paths` (which are about
+    /// to be removed and inserted again: removing a file's last path drops
+    /// its record).
+    fn versions_of(&self, paths: &[(Vec<u8>, FileId)]) -> Vec<(FileId, Version, Vec<Version>)> {
         paths
             .iter()
-            .filter_map(|(_, id)| Some((*id, self.version(id)?)))
+            .filter_map(|(_, id)| Some((*id, self.version(id)?, self.lineage(id))))
             .collect()
     }
 
-    fn restore_versions(&mut self, versions: Vec<(FileId, Version)>) {
-        for (id, v) in versions {
-            self.set_version(id, v);
+    fn restore_versions(&mut self, versions: Vec<(FileId, Version, Vec<Version>)>) {
+        for (id, v, lineage) in versions {
+            if let Some(r) = self.files.get_mut(&id) {
+                if r.version.is_none_or(|old| v >= old) {
+                    r.version = Some(v);
+                    r.lineage = lineage;
+                    self.changed.insert(id);
+                }
+            }
         }
     }
 
@@ -507,6 +514,24 @@ mod tests {
         std::os::unix::fs::symlink("d", root.join("sd")).unwrap();
         let want = vec![vec![b"d/a".to_vec(), b"d/b".to_vec()]];
         assert_eq!(scan_hard_links(root).unwrap(), want);
+    }
+
+    #[test]
+    fn renames_keep_the_lineage() {
+        let mut ix = Index::default();
+        ix.insert(b"f", id(1));
+        ix.insert(b"g", id(2));
+        ix.set_version(id(1), ver(1, 2));
+        ix.set_version(id(1), ver(2, 1));
+        ix.set_version(id(2), ver(1, 3));
+        ix.set_version(id(2), ver(2, 3));
+        ix.rename(b"f", b"h");
+        assert_eq!(ix.version(&id(1)), Some(ver(2, 1)));
+        assert_eq!(ix.lineage(&id(1)), vec![ver(1, 2)]);
+        ix.exchange(b"h", b"g");
+        assert_eq!(ix.get(b"g"), Some(id(1)));
+        assert_eq!(ix.lineage(&id(1)), vec![ver(1, 2)]);
+        assert_eq!(ix.lineage(&id(2)), vec![ver(1, 3)]);
     }
 
     #[test]
