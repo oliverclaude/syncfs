@@ -448,6 +448,7 @@ Consequences of path keys, by design:
 | No quorum reachable | `EROFS` at once (reads keep working) |
 | Lock held by another node | wait up to `lock_wait` (default 10 s), then `EBUSY`; `lock_wait: 0` fails at once |
 | Rename involving a path another node holds a lock on | `EBUSY` at once |
+| The previous holder's changes not applied here within `freshness_timeout` although it is reachable (see [Lock handoff](#lock-handoff)) | `EBUSY` |
 | Lease lapsed (quorum lost while holding) | writes try to re-acquire; `EROFS` if that fails |
 | Voters still in their start-up grace period (below), or not answering, until `lock_wait` | `EROFS` |
 
@@ -720,15 +721,21 @@ created, giving two files at one path). So:
   requested one (the key itself, its ancestors and its descendants).
 - After acquiring, the new holder waits until it has applied each of
   those origins' journals up to the head, for at most `freshness_timeout`
-  and only while the origin, or a connected peer that has those entries,
-  is reachable. Otherwise it goes on (counted as `handoff_gaps` in
-  `status.json`, `handoff_waits` counts the waits).
+  (`handoff_waits` in `status.json` counts the waits).
+- If the entries are still missing after `freshness_timeout` although the
+  origin, or a connected peer that has them, is reachable, the node gives
+  the lock back and the operation fails with `EBUSY` (a warning in the
+  log; `handoff_refused` in the lock counters). The application can retry.
+- If nobody connected has them (the previous holder is down or cut off),
+  it goes on without them at once, as the freshness check's fallback does
+  (`handoff_gaps`).
 - A create that finds the name taken in the meantime (a peer's create
   applied during the wait) opens the existing file instead, unless the
   application asked for `O_EXCL`.
 
 The wait can stall behind entries this node defers because it holds a
-lock on their file itself; it then ends at `freshness_timeout`.
+lock on their file itself; it then ends at `freshness_timeout` with
+`EBUSY`.
 
 ### Journal and dirty blocks
 

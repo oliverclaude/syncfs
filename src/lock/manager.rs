@@ -85,13 +85,17 @@ pub enum LockError {
     Busy(Option<NodeId>),
     #[error("shutting down")]
     Shutdown,
+    /// The previous holders' changes were not applied here within
+    /// `freshness_timeout` (see [`super::handoff`]).
+    #[error("the previous holder's changes did not arrive in time")]
+    HandoffTimeout,
 }
 
 impl LockError {
     pub fn errno(self) -> Errno {
         match self {
             LockError::NoQuorum | LockError::Shutdown => Errno::EROFS,
-            LockError::Busy(_) => Errno::EBUSY,
+            LockError::Busy(_) | LockError::HandoffTimeout => Errno::EBUSY,
         }
     }
 }
@@ -164,6 +168,9 @@ struct Counters {
     acquired: u64,
     busy: u64,
     no_quorum: u64,
+    /// Acquired, but given back: the previous holders' changes did not
+    /// arrive within `freshness_timeout` (`EBUSY`).
+    handoff_refused: u64,
     retries: u64,
     renewed: u64,
     lapsed: u64,
@@ -235,7 +242,9 @@ pub struct Chain {
 }
 
 /// Waits until this node applied each `(origin, head)`'s journal up to it.
-pub type WaitFn = dyn Fn(&[(NodeId, u64)]) + Send + Sync;
+/// False: they did not arrive within `freshness_timeout`; the lock must
+/// not be used.
+pub type WaitFn = dyn Fn(&[(NodeId, u64)]) -> bool + Send + Sync;
 
 /// (from, to, message); `to == me` is handled in-process.
 type Queue = VecDeque<(NodeId, NodeId, Message)>;
@@ -941,8 +950,26 @@ impl Inner {
         self.cv.notify_all();
         handoff.retain(|(n, _)| *n != self.s.me);
         if let (Ok(_), Some(c)) = (&res, self.chain.get()) {
-            if !handoff.is_empty() {
-                (c.wait)(&handoff);
+            if !handoff.is_empty() && !(c.wait)(&handoff) {
+                // Acting on a namespace without the previous holder's
+                // changes could diverge: give the lock back.
+                let mut st = lock(&self.st);
+                st.counters.handoff_refused += 1;
+                let mut out = Vec::new();
+                if let Some(h) = st.held.get_mut(key) {
+                    if add_ref {
+                        h.refs = h.refs.saturating_sub(1);
+                    }
+                    if h.refs == 0 {
+                        out = self.drop_held(&mut st, key, 0);
+                    } else {
+                        h.ready = true;
+                    }
+                }
+                drop(st);
+                self.cv.notify_all();
+                self.send(out);
+                return Err(LockError::HandoffTimeout);
             }
         }
         if res.is_ok() && !(acquired.new_session && file.is_some()) {

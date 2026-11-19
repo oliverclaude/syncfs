@@ -1358,6 +1358,47 @@ fn crash_window_namespace_changes_are_reconciled() {
     assert_eq!(r["counters"]["reconcile_restored"], 1, "{r:#}");
 }
 
+/// A new lock holder first applies the previous holder's journal up to
+/// the head it released with. If those entries do not arrive within
+/// `freshness_timeout` while their origin is connected, the operation
+/// fails with EBUSY instead of acting on a namespace without them.
+#[test]
+fn handoff_timeout_refuses_with_ebusy() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &[]);
+    // Node 1 flushes its store rarely, so its journal entries are not
+    // sent (only durable entries are) while it stays connected.
+    c.node(1).stop();
+    c.node(1)
+        .env
+        .push(("SYNCFS_TEST_FLUSH_INTERVAL_MS".into(), "60000".into()));
+    c.node(1).start();
+    c.converge("node 1 back");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    std::fs::create_dir(m1.join("d")).unwrap();
+    let t = Instant::now();
+    let r = std::fs::create_dir(m2.join("d"));
+    assert_eq!(errno(r), Some(libc::EBUSY));
+    // After waiting freshness_timeout (2 s), not much longer.
+    assert!(
+        t.elapsed() >= Duration::from_millis(1900) && t.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(!m2.join("d").exists());
+    let l = c.node(2).status("locks").unwrap();
+    assert_eq!(l["counters"]["handoff_refused"], 1, "{l:#}");
+    // Once node 1's entries go out, the same operation sees them.
+    c.node(1).stop();
+    c.node(1).env.clear();
+    c.node(1).start();
+    c.converge("node 1 flushing again");
+    wait_same_tree(&c, 1, 2);
+    assert_eq!(errno(std::fs::create_dir(m2.join("d"))), Some(libc::EEXIST));
+}
+
 /// After a reconnect, local changes wait (briefly) until the node has
 /// caught up with the peer: a node that was cut off gets EEXIST for a
 /// directory made meanwhile instead of racing the peer's entry.
