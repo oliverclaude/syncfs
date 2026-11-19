@@ -732,6 +732,10 @@ created, giving two files at one path). So:
 - A create that finds the name taken in the meantime (a peer's create
   applied during the wait) opens the existing file instead, unless the
   application asked for `O_EXCL`.
+- An open (or truncate) whose file the wait removed or moved away from the
+  path (e.g. a peer renamed another file onto it) fails with `ESTALE`; the
+  kernel then looks the path up again and retries once, so the
+  application opens the file that is there now.
 
 The wait can stall behind entries this node defers because it holds a
 lock on their file itself; it then ends at `freshness_timeout` with

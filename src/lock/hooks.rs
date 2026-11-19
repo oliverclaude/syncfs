@@ -150,19 +150,31 @@ impl ClusterHooks {
             log::debug!("locks: {key}: {e}");
             e.errno()
         })?;
-        if let (true, Some(f)) = (acquired.new_session, file) {
+        let (true, Some(f)) = (acquired.new_session, file) else {
+            return Ok(());
+        };
+        // The kernel looked the inode up before the lock was held: the
+        // previous holder's changes, applied by the handoff, may have
+        // removed it or put another file at the path. ESTALE makes the
+        // kernel look the path up again and retry once.
+        if self.file_of(node) != file {
+            log::debug!("locks: {key}: another file is there after the handoff (ESTALE)");
             self.repl.session_opened(f);
-            let fresh = self.repl.ensure_fresh(f, &acquired.known);
-            if let Err(e) = fresh {
-                release(&self.locks, &self.repl, key);
-                self.locks.ready(key);
-                return Err(match e {
-                    crate::repl::fresh::NotFresh::Stale => Errno::EBUSY,
-                    crate::repl::fresh::NotFresh::Removed => Errno::ENOENT,
-                });
-            }
+            release(&self.locks, &self.repl, key);
             self.locks.ready(key);
+            return Err(Errno::ESTALE);
         }
+        self.repl.session_opened(f);
+        let fresh = self.repl.ensure_fresh(f, &acquired.known);
+        if let Err(e) = fresh {
+            release(&self.locks, &self.repl, key);
+            self.locks.ready(key);
+            return Err(match e {
+                crate::repl::fresh::NotFresh::Stale => Errno::EBUSY,
+                crate::repl::fresh::NotFresh::Removed => Errno::ENOENT,
+            });
+        }
+        self.locks.ready(key);
         Ok(())
     }
 

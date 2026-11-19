@@ -547,28 +547,28 @@ fn locks_conflicting_open_is_busy_and_reads_stay_local() {
 }
 
 /// A file replaced by a peer's rename while this node waited for its lock
-/// is gone: the open fails with `ENOENT` instead of writing to a file
-/// nobody else will see (found by the soak test).
+/// is gone: the open gets `ESTALE` and the kernel looks the path up again,
+/// so it opens the renamed file instead of writing to one nobody else will
+/// see (found by the soak test).
 #[test]
-fn locks_open_of_a_file_replaced_while_waiting_is_enoent() {
+fn locks_open_of_a_file_replaced_while_waiting_opens_the_new_file() {
     require_fuse!();
     use Kind::{Daemon, Mount};
     let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f", "g"]);
     let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
     let w = open_rw(&m1.join("f")).unwrap();
     let f2 = m2.join("f");
-    let waiter = std::thread::spawn(move || open_rw(&f2).map(drop));
+    let waiter = std::thread::spawn(move || {
+        let mut f = open_rw(&f2)?;
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s)?;
+        Ok::<_, std::io::Error>(s)
+    });
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(m1.join("g"), b"renamed\n").unwrap();
     std::fs::rename(m1.join("g"), m1.join("f")).unwrap();
     drop(w);
-    assert_eq!(errno(waiter.join().unwrap()), Some(libc::ENOENT));
-    // Opened again, it is the renamed file.
-    let mut w2 = eventually("node 2 opens", || open_rw(&m2.join("f")));
-    let mut s = String::new();
-    std::io::Read::read_to_string(&mut w2, &mut s).unwrap();
-    assert_eq!(s, "renamed\n");
-    drop(w2);
+    assert_eq!(waiter.join().unwrap().unwrap(), "renamed\n");
     c.converge("end");
 }
 
