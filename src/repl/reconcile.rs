@@ -187,6 +187,7 @@ impl Repl {
 
 /// Runs the comparison once the node has caught up (see the module docs).
 pub(crate) fn reconcile_loop(weak: Weak<Repl>) {
+    let mut warned = false;
     loop {
         let Some(r) = weak.upgrade() else { return };
         if r.stopping() {
@@ -219,12 +220,19 @@ pub(crate) fn reconcile_loop(weak: Weak<Repl>) {
                         let mut st = r.state();
                         st.counters.reconcile_sent += sent;
                         st.counters.reconcile_restored += restored;
+                        drop(st);
+                        r.reconciled.store(true, Ordering::Release);
+                        r.cv.notify_all();
+                        return;
                     }
-                    Err(e) => log::warn!("reconcile: comparing with node {p}: {e}"),
+                    // A partial pass is not a comparison: try again (it
+                    // is idempotent) until the rejoin deadline.
+                    Err(e) if !warned => {
+                        warned = true;
+                        log::warn!("reconcile: comparing with node {p}: {e}; retrying");
+                    }
+                    Err(e) => log::debug!("reconcile: comparing with node {p}: {e}; retrying"),
                 }
-                r.reconciled.store(true, Ordering::Release);
-                r.cv.notify_all();
-                return;
             }
         } else if r.rejoined.load(Ordering::Acquire) {
             break;
