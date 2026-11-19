@@ -201,6 +201,7 @@ pub struct Repl {
     /// Drops the kernel's cached attributes and data of a backing file.
     invalidator: std::sync::OnceLock<Invalidator>,
     entry_invalidator: std::sync::OnceLock<EntryInvalidator>,
+    inval_barrier: std::sync::OnceLock<InvalBarrier>,
     /// The mount's counters (`.syncfs/stats`).
     pub(crate) stats: std::sync::OnceLock<Arc<crate::status::Stats>>,
 }
@@ -209,6 +210,9 @@ pub type Invalidator = Box<dyn Fn(&rustix::fs::Stat) + Send + Sync>;
 /// Drops the kernel's cached directory entry `name` of the directory with
 /// that stat.
 pub type EntryInvalidator = Box<dyn Fn(&rustix::fs::Stat, &std::ffi::OsStr) + Send + Sync>;
+/// Waits (at most the given time) until the inode invalidations queued so
+/// far reached the kernel; false if they did not in time.
+pub type InvalBarrier = Box<dyn Fn(std::time::Duration) -> bool + Send + Sync>;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -383,6 +387,7 @@ impl Repl {
             invalidator: std::sync::OnceLock::new(),
             stats: std::sync::OnceLock::new(),
             entry_invalidator: std::sync::OnceLock::new(),
+            inval_barrier: std::sync::OnceLock::new(),
         });
         let _ = repl.this.set(Arc::downgrade(&repl));
         let weak = Arc::downgrade(&repl);
@@ -418,6 +423,25 @@ impl Repl {
             wait: Box::new(move |after| wait.upgrade().is_none_or(|r| r.wait_applied(after))),
         });
         Ok(repl)
+    }
+
+    /// Sets how to wait for queued inode invalidations (once mounted).
+    pub fn set_inval_barrier(&self, f: InvalBarrier) {
+        let _ = self.inval_barrier.set(f);
+    }
+
+    /// A new lock session reads through the kernel's caches: they must not
+    /// hold a copy older than what replication applied before the session
+    /// started (the invalidations go through a thread of their own).
+    pub fn wait_invalidated(&self) {
+        if let Some(f) = self.inval_barrier.get() {
+            if !f(self.freshness_timeout) {
+                log::warn!(
+                    "replication: kernel cache invalidations still pending after {}",
+                    humantime::format_duration(self.freshness_timeout)
+                );
+            }
+        }
     }
 
     /// Sets how to drop the kernel's caches of a file (once mounted).

@@ -176,6 +176,7 @@ impl ClusterHooks {
                 crate::repl::fresh::NotFresh::Removed => Errno::ENOENT,
             });
         }
+        self.repl.wait_invalidated();
         self.locks.ready(key);
         Ok(())
     }

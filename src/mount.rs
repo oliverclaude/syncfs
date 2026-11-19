@@ -250,39 +250,84 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         let mounted = mounted.inspect(|s| {
             if let Some(repl) = &repl {
                 // The kernel takes the directory's or file's lock to
-                // invalidate, so the calls go through a thread of their
+                // invalidate, so the calls go through threads of their
                 // own: an operation holding that lock may be waiting for
                 // replication to apply the entry that invalidates (e.g. a
-                // rename waiting for the lock handoff).
+                // rename waiting for the lock handoff). Entries and inodes
+                // have a thread each, so that a new lock session can wait
+                // for the data invalidations (see `Repl::set_inval_barrier`)
+                // without waiting behind a directory one.
+                let (entries_tx, entries_rx) =
+                    std::sync::mpsc::channel::<(u64, std::ffi::OsString)>();
+                let (inodes_tx, inodes_rx) = std::sync::mpsc::channel::<u64>();
+                // (queued, done) inode invalidations.
+                let progress = Arc::new((
+                    std::sync::Mutex::new((0u64, 0u64)),
+                    std::sync::Condvar::new(),
+                ));
                 let notifier = s.session.notifier();
-                let (tx, rx) = std::sync::mpsc::channel::<(u64, Option<std::ffi::OsString>)>();
                 let spawned = std::thread::Builder::new()
-                    .name("syncfs-inval".into())
+                    .name("syncfs-inval-e".into())
                     .spawn(move || {
-                        for (ino, name) in rx {
-                            let res = match &name {
-                                Some(n) => notifier.inval_entry(fuser::INodeNo(ino), n),
-                                None => notifier.inval_inode(fuser::INodeNo(ino), 0, 0),
-                            };
-                            if let Err(e) = res {
-                                log::debug!("invalidating {name:?} of inode {ino}: {e}");
+                        for (ino, name) in entries_rx {
+                            if let Err(e) = notifier.inval_entry(fuser::INodeNo(ino), &name) {
+                                log::debug!("invalidating entry {name:?} of inode {ino}: {e}");
                             }
                         }
                     });
+                let notifier = s.session.notifier();
+                let done = Arc::clone(&progress);
+                let spawned = spawned.and_then(|_| {
+                    std::thread::Builder::new()
+                        .name("syncfs-inval-i".into())
+                        .spawn(move || {
+                            for ino in inodes_rx {
+                                if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, 0) {
+                                    log::debug!("invalidating inode {ino}: {e}");
+                                }
+                                let (m, cv) = &*done;
+                                crate::repl::core::lock(m).1 += 1;
+                                cv.notify_all();
+                            }
+                        })
+                });
                 if let Err(e) = spawned {
-                    log::error!("cannot start the cache invalidation thread: {e}");
+                    log::error!("cannot start the cache invalidation threads: {e}");
                     return;
                 }
-                let (entries, dirs) = (tx.clone(), Arc::clone(&inodes));
+                let dirs = Arc::clone(&inodes);
                 repl.set_entry_invalidator(Box::new(move |st, name| {
                     if let Some(ino) = dirs.live_number(st) {
-                        let _ = entries.send((ino, Some(name.to_os_string())));
+                        let _ = entries_tx.send((ino, name.to_os_string()));
                     }
                 }));
+                let queued = Arc::clone(&progress);
+                let inodes_tx = std::sync::Mutex::new(inodes_tx);
                 repl.set_invalidator(Box::new(move |st| {
                     if let Some(ino) = inodes.live_number(st) {
-                        let _ = tx.send((ino, None));
+                        // Counted under the lock the sender sits behind, so
+                        // a barrier never misses one in flight.
+                        let tx = crate::repl::core::lock(&inodes_tx);
+                        crate::repl::core::lock(&queued.0).0 += 1;
+                        let _ = tx.send(ino);
                     }
+                }));
+                repl.set_inval_barrier(Box::new(move |timeout| {
+                    let (m, cv) = &*progress;
+                    let mut g = crate::repl::core::lock(m);
+                    let want = g.0;
+                    let deadline = std::time::Instant::now() + timeout;
+                    while g.1 < want {
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            return false;
+                        }
+                        g = cv
+                            .wait_timeout(g, deadline - now)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                    }
+                    true
                 }));
             }
         });
