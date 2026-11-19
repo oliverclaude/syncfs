@@ -157,7 +157,9 @@ impl ClusterHooks {
         // previous holder's changes, applied by the handoff, may have
         // removed it or put another file at the path. ESTALE makes the
         // kernel look the path up again and retry once.
-        if self.file_of(node) != file {
+        // Also when the file itself was moved away from the path.
+        let moved = !matches!(key_of(node), Ok(Some(k)) if &k == key);
+        if moved || self.file_of(node) != file {
             log::debug!("locks: {key}: another file is there after the handoff (ESTALE)");
             self.repl.session_opened(f);
             release(&self.locks, &self.repl, key);

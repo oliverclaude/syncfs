@@ -572,6 +572,42 @@ fn locks_open_of_a_file_replaced_while_waiting_opens_the_new_file() {
     c.converge("end");
 }
 
+/// A file a peer renamed away while this node waited for its lock: the
+/// open gets `ESTALE`, and the kernel's second try (with `O_CREAT`)
+/// creates the path anew instead of writing into the renamed file (found
+/// by the soak test as a lost committed write).
+#[test]
+fn locks_open_of_a_file_renamed_away_while_waiting_does_not_follow_it() {
+    require_fuse!();
+    use std::io::Write;
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    let w = open_rw(&m1.join("f")).unwrap();
+    let f2 = m2.join("f");
+    let waiter = std::thread::spawn(move || {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&f2)?;
+        f.write_all(b"node 2\n")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::rename(m1.join("f"), m1.join("h")).unwrap();
+    drop(w);
+    waiter.join().unwrap().unwrap();
+    c.converge("end");
+    let b1 = c.node(1).backing();
+    eventually("node 1 has both files", || {
+        let f = std::fs::read_to_string(b1.join("f"))?;
+        let h = std::fs::read_to_string(b1.join("h"))?;
+        (f == "node 2\n" && h == "initial\n")
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("f {f:?}, h {h:?}")))
+    });
+}
+
 /// Unlinking a file a peer just wrote, without opening it here first: the
 /// tombstone descends from the peer's version (no conflict copy on the
 /// writer), although this node never fetched that content (found by the
