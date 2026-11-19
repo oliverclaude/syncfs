@@ -427,17 +427,27 @@ impl Node {
         }
         self.signal(if clean { libc::SIGTERM } else { libc::SIGKILL });
         let t = Instant::now();
-        let mut again = false;
+        let (mut again, mut aborted) = (false, false);
         let mut c = self.child.take().unwrap();
         while c.try_wait().unwrap().is_none() {
             if clean && !again && t.elapsed() > Duration::from_secs(2) {
                 again = true;
                 unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
             }
-            if t.elapsed() > Duration::from_secs(30) {
+            if t.elapsed() > Duration::from_secs(30) && !aborted {
+                // A thread stuck in the kernel (e.g. an invalidation
+                // waiting for a directory lock that an operation on this
+                // mount holds) keeps a killed daemon from exiting until
+                // its FUSE connection is aborted.
+                aborted = true;
+                let how = if self.kind == Kind::Mount && abort_fuse(&self.mnt()) {
+                    "; aborted its FUSE connection"
+                } else {
+                    ""
+                };
                 HUNG.lock()
                     .unwrap()
-                    .push(format!("node {} did not stop in 30 s", self.id));
+                    .push(format!("node {} did not stop in 30 s{how}", self.id));
                 let _ = c.kill();
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -1089,6 +1099,23 @@ impl Soak {
 
 /// Problems found outside the checks (a stop that hung).
 static HUNG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Aborts the FUSE connection of the mount at `mnt` (its device number in
+/// mountinfo names it under /sys/fs/fuse/connections); false if it cannot.
+fn abort_fuse(mnt: &Path) -> bool {
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let want = mnt.to_string_lossy();
+    let dev = info.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        (f.get(4) == Some(&&*want)).then(|| f.get(2).map(|d| d.to_string()))?
+    });
+    let Some(minor) = dev.as_deref().and_then(|d| d.split(':').nth(1)) else {
+        return false;
+    };
+    std::fs::write(format!("/sys/fs/fuse/connections/{minor}/abort"), "1").is_ok()
+}
 
 // --------------------------------------------------------------- checks
 
