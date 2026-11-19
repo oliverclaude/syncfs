@@ -443,6 +443,33 @@ impl LockManager {
 
     /// Drops one reference; the last one releases the lock everywhere.
     pub fn release(&self, key: &Key) {
+        if self.release_ref(key).is_some() {
+            self.finish_release(key);
+        }
+    }
+
+    /// Drops one reference. For the last one, returns the session's file
+    /// (if any): the lock then stays held, with other references waiting
+    /// (as for a session being set up), until
+    /// [`finish_release`](Self::finish_release), so the caller can end
+    /// the session first without another reference joining it.
+    pub fn release_ref(&self, key: &Key) -> Option<Option<FileId>> {
+        let mut st = lock(&self.inner.st);
+        let Some(h) = st.held.get_mut(key) else {
+            log::warn!("locks: releasing {key}, which is not held");
+            return None;
+        };
+        h.refs = h.refs.saturating_sub(1);
+        if h.refs > 0 {
+            return None;
+        }
+        h.ready = false;
+        Some(h.file)
+    }
+
+    /// Releases the lock everywhere after the last
+    /// [`release_ref`](Self::release_ref) (unless it was taken again).
+    pub fn finish_release(&self, key: &Key) {
         self.inner.release(key);
     }
 
@@ -1143,11 +1170,13 @@ impl Inner {
         let head = self.head();
         let mut st = lock(&self.st);
         let Some(h) = st.held.get_mut(key) else {
-            log::warn!("locks: releasing {key}, which is not held");
             return;
         };
-        h.refs = h.refs.saturating_sub(1);
         if h.refs > 0 {
+            // Taken again meanwhile (e.g. `ensure` re-acquired it).
+            h.ready = true;
+            drop(st);
+            self.cv.notify_all();
             return;
         }
         let out = self.drop_held(&mut st, key, head);

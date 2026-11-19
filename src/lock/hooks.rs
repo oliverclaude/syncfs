@@ -439,11 +439,17 @@ impl WriteHooks for ClusterHooks {
 /// Drops a reference to `key`; the last one ends the session (its
 /// changes go into the journal) before the lock is released.
 fn release(locks: &LockManager, repl: &Repl, key: &Key) {
-    let file = locks.last_reference(key);
+    // Atomic with dropping the reference: another local reference cannot
+    // join the session between the check and its end (it would keep
+    // writing in a session already sent, and its own release would end
+    // the session count of a later one).
+    let Some(file) = locks.release_ref(key) else {
+        return;
+    };
     if let Some(file) = file {
         repl.end_session(file);
     }
-    locks.release(key);
+    locks.finish_release(key);
     if let Some(file) = file {
         repl.session_closed(file);
     }
