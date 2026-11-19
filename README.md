@@ -736,6 +736,13 @@ created, giving two files at one path). So:
   from the path (e.g. a peer renamed another file onto it) fails with
   `ESTALE`; the kernel then looks the path up again and retries once, so
   the application opens or removes the file that is there now.
+- The same holds without a wait: the kernel may still have a name cached
+  for a moment after a peer's rename applied here (its cache is
+  invalidated asynchronously). The first open of a file replication
+  renamed (or replaced), and the first unlink of a name it renamed a file
+  away from, fail with `ESTALE` until the kernel looks the name up again,
+  so the retry reaches whatever is at the name now, not the renamed file.
+  This costs at most one extra lookup per renamed file.
 - Unlinking a file's last link does not fetch its newest content first:
   the tombstone lists the newest version the lock knows of in its lineage,
   so peers that wrote it don't keep a conflict copy. If the unlink fails,

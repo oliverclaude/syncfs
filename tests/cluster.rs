@@ -608,6 +608,46 @@ fn locks_open_of_a_file_renamed_away_while_waiting_does_not_follow_it() {
     });
 }
 
+/// An open through a name the kernel still has cached after a peer
+/// renamed the file away gets `ESTALE`, and the kernel's second lookup
+/// finds the name gone; the write does not land in the renamed file (found
+/// by the soak test). Node 2's unlink of `x` waits for node 1's lock with
+/// the directory locked, which holds back the kernel's invalidation of `f`.
+#[test]
+fn locks_open_through_a_name_a_peer_renamed_away_does_not_follow_it() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f", "x"]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    let x1 = open_rw(&m1.join("x")).unwrap();
+    std::fs::metadata(m2.join("f")).unwrap();
+    let x2 = m2.join("x");
+    let remover = std::thread::spawn(move || std::fs::remove_file(&x2));
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::rename(m1.join("f"), m1.join("g")).unwrap();
+    let b2 = c.node(2).backing();
+    eventually("node 2 applies the rename", || {
+        std::fs::metadata(b2.join("g")).map(|_| ())
+    });
+    // With the fix the kernel's second lookup waits for the directory, so
+    // node 1 lets the unlink go on a little later.
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        drop(x1);
+    });
+    let opened = std::fs::OpenOptions::new().write(true).open(m2.join("f"));
+    if let Ok(f) = &opened {
+        use std::io::Write;
+        (&*f).write_all(b"through the old name\n").unwrap();
+    }
+    releaser.join().unwrap();
+    remover.join().unwrap().unwrap();
+    c.converge("end");
+    assert_eq!(std::fs::read_to_string(b2.join("g")).unwrap(), "initial\n");
+    assert!(!b2.join("f").exists());
+    assert_eq!(errno(opened.map(|_| ())), Some(libc::ENOENT));
+}
+
 /// Unlinking a file a peer just wrote, without opening it here first: the
 /// tombstone descends from the peer's version (no conflict copy on the
 /// writer), although this node never fetched that content (found by the

@@ -202,6 +202,7 @@ pub struct Repl {
     invalidator: std::sync::OnceLock<Invalidator>,
     entry_invalidator: std::sync::OnceLock<EntryInvalidator>,
     inval_barrier: std::sync::OnceLock<InvalBarrier>,
+    move_notifier: std::sync::OnceLock<MoveNotifier>,
     /// The mount's counters (`.syncfs/stats`).
     pub(crate) stats: std::sync::OnceLock<Arc<crate::status::Stats>>,
 }
@@ -213,6 +214,10 @@ pub type EntryInvalidator = Box<dyn Fn(&rustix::fs::Stat, &std::ffi::OsStr) + Se
 /// Waits (at most the given time) until the inode invalidations queued so
 /// far reached the kernel; false if they did not in time.
 pub type InvalBarrier = Box<dyn Fn(std::time::Duration) -> bool + Send + Sync>;
+/// Replication renamed the file with that stat (if known) away from `name`
+/// in the directory with that stat.
+pub type MoveNotifier =
+    Box<dyn Fn(Option<&rustix::fs::Stat>, &rustix::fs::Stat, &std::ffi::OsStr) + Send + Sync>;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -388,6 +393,7 @@ impl Repl {
             stats: std::sync::OnceLock::new(),
             entry_invalidator: std::sync::OnceLock::new(),
             inval_barrier: std::sync::OnceLock::new(),
+            move_notifier: std::sync::OnceLock::new(),
         });
         let _ = repl.this.set(Arc::downgrade(&repl));
         let weak = Arc::downgrade(&repl);
@@ -466,6 +472,25 @@ impl Repl {
         };
         if let Ok(st) = self.backing.stat(parent) {
             f(&st, std::ffi::OsStr::from_bytes(name));
+        }
+    }
+
+    /// Sets how to tell the mount which files replication renamed.
+    pub fn set_move_notifier(&self, f: MoveNotifier) {
+        let _ = self.move_notifier.set(f);
+    }
+
+    /// Replication renamed `file` (its stat from before) away from `path`.
+    pub(crate) fn note_moved(&self, path: &[u8], file: Option<&rustix::fs::Stat>) {
+        let Some(f) = self.move_notifier.get() else {
+            return;
+        };
+        let (parent, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => (&b""[..], path),
+        };
+        if let Ok(st) = self.backing.stat(parent) {
+            f(file, &st, std::ffi::OsStr::from_bytes(name));
         }
     }
 

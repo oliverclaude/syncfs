@@ -297,6 +297,8 @@ impl<H: WriteHooks> SyncFs<H> {
         let st = rustix::fs::statat(&fd, "", AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW)
             .map_err(errno)?;
         let inode = self.inodes.lookup(fd, &st);
+        // The kernel's entry for the name is fresh now.
+        self.inodes.take_moved_from(parent.ino, name);
         Ok((Arc::clone(&inode), to_attr(inode.ino, &st)))
     }
 
@@ -731,6 +733,12 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
         let res = Self::guard(parent, name)
             .and_then(|()| self.inode(parent))
             .and_then(|p| {
+                // As in open: the kernel's entry may still name the file a
+                // peer renamed away.
+                if self.inodes.take_moved_from(p.ino, name) {
+                    log::debug!("unlink: {name:?} was renamed away by a peer (ESTALE)");
+                    return Err(Errno::ESTALE);
+                }
                 let op = Mutation::Remove {
                     parent: self.node(&p),
                     name,
@@ -856,6 +864,16 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
             .opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO));
         let res = self
             .inode(ino)
+            .and_then(|inode| {
+                // Replication renamed the file after the kernel looked it
+                // up: the kernel may have reached it through its old name.
+                // ESTALE makes it look the name up again and retry once.
+                if self.inodes.take_moved(inode.ino) {
+                    log::debug!("open: inode {} was renamed by a peer (ESTALE)", inode.ino);
+                    return Err(Errno::ESTALE);
+                }
+                Ok(inode)
+            })
             .and_then(|inode| self.open_inode(inode, flags.0));
         reply!(self, Op::Open, reply, res, |fh| reply
             .opened(FileHandle(fh), FopenFlags::empty()));

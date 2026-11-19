@@ -31,6 +31,9 @@ use rustix::fs::Stat;
 
 use super::attr::{key, kind_from_mode};
 
+/// At most this many names renamed away are remembered.
+const MOVED_FROM_MAX: usize = 4096;
+
 /// FUSE inode number of the root directory.
 pub const ROOT: u64 = 1;
 
@@ -57,6 +60,9 @@ impl Inode {
 struct Live {
     inode: Arc<Inode>,
     nlookup: u64,
+    /// Replication renamed the file since: the kernel may still reach it
+    /// under its old name.
+    moved: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +70,9 @@ struct Inner {
     live: HashMap<u64, Live>,
     numbers: HashMap<Key, u64>,
     next: u64,
+    /// Names (directory inode, name) replication renamed a file away
+    /// from, until the kernel looks them up again.
+    moved_from: std::collections::HashSet<(u64, std::ffi::OsString)>,
 }
 
 #[derive(Debug)]
@@ -87,6 +96,7 @@ impl InodeTable {
             Live {
                 inode: root,
                 nlookup: u64::MAX / 2,
+                moved: false,
             },
         );
         Self {
@@ -94,6 +104,7 @@ impl InodeTable {
                 live,
                 numbers: HashMap::from([(k, ROOT)]),
                 next: ROOT + 1,
+                moved_from: std::collections::HashSet::new(),
             }),
         }
     }
@@ -155,6 +166,7 @@ impl InodeTable {
                 key: k,
             }),
             nlookup: 0,
+            moved: false,
         });
         live.nlookup += 1;
         Arc::clone(&live.inode)
@@ -169,6 +181,46 @@ impl InodeTable {
                 inner.live.remove(&ino);
             }
         }
+    }
+
+    /// Replication renamed the file `file` (if the kernel knows it) away
+    /// from `name` in the directory `dir`. The kernel may still have the old
+    /// name cached (its invalidation is asynchronous), so the next open of
+    /// the file and the next unlink of the name get `ESTALE`
+    /// ([`InodeTable::take_moved`], [`InodeTable::take_moved_from`]).
+    pub fn mark_moved(&self, file: Option<&Stat>, dir: &Stat, name: &std::ffi::OsStr) {
+        let mut inner = self.lock();
+        if let Some(n) = file.and_then(|st| inner.numbers.get(&key(st)).copied()) {
+            if let Some(l) = inner.live.get_mut(&n) {
+                l.moved = true;
+            }
+        }
+        let Some(d) = inner.numbers.get(&key(dir)).copied() else {
+            return;
+        };
+        if inner.live.contains_key(&d) {
+            // Bounded: a dropped mark only loses one retry.
+            if inner.moved_from.len() >= MOVED_FROM_MAX {
+                inner.moved_from.clear();
+            }
+            inner.moved_from.insert((d, name.to_os_string()));
+        }
+    }
+
+    /// Whether `ino` was renamed by replication since its last open (and
+    /// clears it: the kernel retries an open once, after looking the name
+    /// up again).
+    pub fn take_moved(&self, ino: u64) -> bool {
+        self.lock()
+            .live
+            .get_mut(&ino)
+            .is_some_and(|l| std::mem::take(&mut l.moved))
+    }
+
+    /// Whether replication renamed a file away from `name` in `dir` since
+    /// the kernel last looked it up (and clears it).
+    pub fn take_moved_from(&self, dir: u64, name: &std::ffi::OsStr) -> bool {
+        self.lock().moved_from.remove(&(dir, name.to_os_string()))
     }
 
     /// Number of inodes with an open descriptor.
@@ -196,6 +248,24 @@ mod tests {
         .unwrap();
         let st = statat(&fd, "", AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW).unwrap();
         (fd, st)
+    }
+
+    #[test]
+    fn a_moved_file_and_name_get_one_estale_each() {
+        let dir = std::env::temp_dir().join(format!("syncfs-inode-moved-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"x").unwrap();
+        let (rfd, rst) = path_fd(&dir);
+        let t = InodeTable::new(rfd, &rst);
+        let (fa, sa) = path_fd(&dir.join("a"));
+        let a = t.lookup(fa, &sa);
+        let name = std::ffi::OsStr::new("a");
+        t.mark_moved(Some(&sa), &rst, name);
+        assert!(t.take_moved(a.ino));
+        assert!(!t.take_moved(a.ino));
+        assert!(t.take_moved_from(ROOT, name));
+        assert!(!t.take_moved_from(ROOT, name));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

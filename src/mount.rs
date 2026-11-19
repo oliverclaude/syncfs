@@ -296,6 +296,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
                     return;
                 }
                 let dirs = Arc::clone(&inodes);
+                let moved = Arc::clone(&inodes);
                 repl.set_entry_invalidator(Box::new(move |st, name| {
                     if let Some(ino) = dirs.live_number(st) {
                         let _ = entries_tx.send((ino, name.to_os_string()));
@@ -311,6 +312,9 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
                         crate::repl::core::lock(&queued.0).0 += 1;
                         let _ = tx.send(ino);
                     }
+                }));
+                repl.set_move_notifier(Box::new(move |file, dir, name| {
+                    moved.mark_moved(file, dir, name);
                 }));
                 repl.set_inval_barrier(Box::new(move |timeout| {
                     let (m, cv) = &*progress;

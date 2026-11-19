@@ -195,9 +195,14 @@ impl Repl {
                         return Ok(false);
                     }
                 }
+                let (moved, replaced) = (self.backing.stat(from).ok(), self.backing.stat(to).ok());
                 self.backing.rename(from, to, *flags).map_err(skip)?;
                 self.invalidate_entry(from);
                 self.invalidate_entry(to);
+                // The kernel may still reach both files under their old
+                // names; the next open or unlink there gets ESTALE.
+                self.note_moved(from, moved.as_ref());
+                self.note_moved(to, replaced.as_ref());
                 let mut st = self.state();
                 let replaced = st.index.get(to);
                 if *flags & libc::RENAME_EXCHANGE != 0 {
