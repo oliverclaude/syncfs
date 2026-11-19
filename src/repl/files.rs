@@ -320,6 +320,20 @@ impl Index {
         self.changed.insert(id);
     }
 
+    /// `id`'s copy also went through `v` (newer than its other earlier
+    /// versions, older than its own).
+    pub fn note_lineage(&mut self, id: FileId, v: Version) {
+        if let Some(r) = self.files.get_mut(&id) {
+            if !r.lineage.contains(&v) && r.version.is_some_and(|own| v < own) {
+                let at = r.lineage.partition_point(|x| *x < v);
+                r.lineage.insert(at, v);
+                let excess = r.lineage.len().saturating_sub(LINEAGE);
+                r.lineage.drain(..excess);
+                self.changed.insert(id);
+            }
+        }
+    }
+
     /// Drops tombstones older than [`TOMBSTONE_KEEP`].
     pub fn expire_tombstones(&mut self) -> usize {
         let cut = now_secs().saturating_sub(TOMBSTONE_KEEP.as_secs());
@@ -514,6 +528,22 @@ mod tests {
         std::os::unix::fs::symlink("d", root.join("sd")).unwrap();
         let want = vec![vec![b"d/a".to_vec(), b"d/b".to_vec()]];
         assert_eq!(scan_hard_links(root).unwrap(), want);
+    }
+
+    #[test]
+    fn note_lineage_inserts_in_order_below_the_own_version() {
+        let mut ix = Index::default();
+        ix.insert(b"f", id(1));
+        ix.set_version(id(1), ver(2, 1));
+        ix.bury(id(1), ver(6, 2));
+        assert_eq!(ix.lineage(&id(1)), vec![ver(2, 1)]);
+        ix.note_lineage(id(1), ver(5, 1));
+        ix.note_lineage(id(1), ver(5, 1));
+        // Not older than the own version: not a predecessor.
+        ix.note_lineage(id(1), ver(7, 3));
+        assert_eq!(ix.lineage(&id(1)), vec![ver(2, 1), ver(5, 1)]);
+        let removed = diverged(Some(ver(5, 1)), 1, 1, ver(6, 2), &ix.lineage(&id(1)));
+        assert!(!removed, "the tombstone includes node 1's version 5");
     }
 
     #[test]
