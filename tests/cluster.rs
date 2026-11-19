@@ -572,6 +572,68 @@ fn locks_open_of_a_file_replaced_while_waiting_opens_the_new_file() {
     c.converge("end");
 }
 
+/// Unlinking a file a peer just wrote, without opening it here first: the
+/// tombstone descends from the peer's version (no conflict copy on the
+/// writer), although this node never fetched that content (found by the
+/// soak test).
+#[test]
+fn locks_unlink_after_a_peer_write_is_not_a_conflict() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    for round in 0..3 {
+        let name = format!("f{round}");
+        std::fs::write(m2.join(&name), b"from node 2\n").unwrap();
+        c.converge(&format!("created {round}"));
+        std::fs::write(m1.join(&name), b"from node 1\n").unwrap();
+        std::fs::remove_file(m2.join(&name)).unwrap();
+        let b1 = c.node(1).backing().join(&name);
+        eventually("node 1 applies the remove", || {
+            (!b1.exists())
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other("still there"))
+        });
+    }
+    c.converge("end");
+    let leftovers: Vec<_> = std::fs::read_dir(c.node(1).backing())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("syncfs-conflict"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    assert_eq!(c.node(1).status("stats").unwrap()["conflict_copies"], 0);
+}
+
+/// An unlink whose file the lock handoff replaced (a peer renamed another
+/// file onto the path while this node waited) gets `ESTALE`; the kernel
+/// looks the path up again and removes the file that is there now.
+#[test]
+fn locks_unlink_of_a_file_replaced_while_waiting_removes_the_new_file() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f", "g"]);
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    let w = open_rw(&m1.join("f")).unwrap();
+    let f2 = m2.join("f");
+    let waiter = std::thread::spawn(move || std::fs::remove_file(&f2));
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(m1.join("g"), b"renamed\n").unwrap();
+    std::fs::rename(m1.join("g"), m1.join("f")).unwrap();
+    drop(w);
+    waiter.join().unwrap().unwrap();
+    c.converge("end");
+    let b1 = c.node(1).backing();
+    eventually("node 1 applies the remove", || {
+        (!b1.join("f").exists() && !b1.join("g").exists())
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other("still there"))
+    });
+    assert_eq!(c.node(1).status("stats").unwrap()["conflict_copies"], 0);
+    assert_eq!(c.node(2).status("stats").unwrap()["conflict_copies"], 0);
+}
+
 /// Writers on every mount contend for one file; their critical sections
 /// (open for writing .. close) never overlap.
 fn contend(kinds: &[Kind]) {

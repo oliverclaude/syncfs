@@ -31,6 +31,9 @@ pub(crate) struct Session {
     pub data: bool,
     pub meta: bool,
     pub last_sent: Instant,
+    /// A remove session's newest known version of the file, which this
+    /// node may not have fetched: the tombstone's lineage lists it.
+    pub superseded: Option<Version>,
 }
 
 #[derive(Default, Serialize)]
@@ -523,6 +526,7 @@ impl Repl {
                 // out (peers' later versions must descend from it).
                 meta: true,
                 last_sent: Instant::now(),
+                superseded: None,
             },
         );
         st.index.set_version(id, version);
@@ -536,6 +540,49 @@ impl Repl {
             self.flusher.flush_now()?;
         }
         Ok(())
+    }
+
+    /// A session with `version` is about to remove `id`'s last link.
+    /// Unlike [`begin_change`](Self::begin_change) the local copy does not
+    /// take the version yet (only the tombstone does, once the remove is
+    /// recorded), and the session sends nothing if the remove fails.
+    /// `superseded`: the newest version the lock knows of, which the
+    /// tombstone descends from without this node fetching it.
+    pub fn begin_remove(
+        &self,
+        id: FileId,
+        version: Version,
+        superseded: Option<Version>,
+    ) -> std::io::Result<()> {
+        let mut st = self.state();
+        if st.sessions.contains_key(&id) {
+            return Ok(());
+        }
+        st.sessions.insert(
+            id,
+            Session {
+                version,
+                data: false,
+                meta: false,
+                last_sent: Instant::now(),
+                superseded,
+            },
+        );
+        st.window_drop.remove(&id);
+        let new = st.window.insert(id);
+        if new {
+            st.window_add.insert(id);
+        }
+        drop(st);
+        if new {
+            self.flusher.flush_now()?;
+        }
+        Ok(())
+    }
+
+    /// Whether a session on `id` is still open (a recorded remove ends it).
+    pub fn in_session(&self, id: &FileId) -> bool {
+        self.state().sessions.contains_key(id)
     }
 
     fn deps(&self, st: &State) -> Vec<(NodeId, u64)> {
@@ -641,11 +688,14 @@ impl Repl {
                 // a tombstone at the session's version.
                 let buried = s.index.get(&path).and_then(|id| {
                     let last = s.index.rec(&id).is_some_and(|r| r.paths.len() == 1);
-                    let v = s.sessions.get(&id).map(|x| x.version)?;
-                    (last && !is_dir).then_some((id, v))
+                    let x = s.sessions.get(&id)?;
+                    (last && !is_dir).then_some((id, x.version, x.superseded))
                 });
-                if let Some((id, version)) = buried {
+                if let Some((id, version, superseded)) = buried {
                     s.index.bury(id, version);
+                    if let Some(v) = superseded.filter(|v| *v < version) {
+                        s.index.note_lineage(id, v);
+                    }
                     s.dirty.forget(id);
                     s.sessions.remove(&id);
                     s.window_drop.insert(id);

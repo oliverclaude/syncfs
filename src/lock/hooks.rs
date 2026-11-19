@@ -247,14 +247,49 @@ impl ClusterHooks {
                 log::debug!("locks: {key}: {e}");
                 e.errno()
             })?;
-        if acquired.new_session {
-            // A new file: nothing to catch up on.
-            self.repl.session_opened(file);
-            self.locks.ready(&key);
+        if !acquired.new_session {
+            // Another reference's session (fresh already) does the remove.
+            let guard = self.guard(vec![key.clone()]);
+            self.begin(&key)?;
+            return Ok(Some(guard));
         }
-        let guard = self.guard(vec![key.clone()]);
-        self.begin(&key)?;
-        Ok(Some(guard))
+        self.repl.session_opened(file);
+        // The kernel looked the name up before the lock was held: the
+        // handoff may have put another file there (see acquire_content).
+        let now = self
+            .repl
+            .id_for(&crate::repl::core::path_bytes(&dir.join(name)));
+        if now != file {
+            log::debug!("locks: {key}: another file is there after the handoff (ESTALE)");
+            release(&self.locks, &self.repl, &key);
+            self.locks.ready(&key);
+            return Err(Errno::ESTALE);
+        }
+        // The tombstone descends from the newest version the lock knows
+        // of, without fetching its content.
+        let local = self.repl.local_version(&file);
+        let superseded = crate::repl::version::target(&acquired.known)
+            .newest
+            .filter(|n| local.is_none_or(|l| *n > l));
+        let Some((_, version)) = self.locks.session(&key) else {
+            self.locks.ready(&key);
+            return Ok(Some(self.guard(vec![key.clone()])));
+        };
+        let begun = self.repl.begin_remove(file, version, superseded);
+        self.locks.ready(&key);
+        if let Err(e) = begun {
+            log::error!("replication: cannot record {file} as changing: {e}");
+            release(&self.locks, &self.repl, &key);
+            return Err(Errno::EIO);
+        }
+        let (locks, repl) = (self.locks.clone(), Arc::clone(&self.repl));
+        Ok(Some(OpGuard::new(move || {
+            // Recorded (the remove ended the session): the version exists.
+            if !repl.in_session(&file) {
+                locks.mark_written(&key);
+            }
+            release(&locks, &repl, &key);
+        })))
     }
 
     /// Moves write locks under `from` to the same place under `to`.

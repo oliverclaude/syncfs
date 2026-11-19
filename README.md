@@ -732,10 +732,14 @@ created, giving two files at one path). So:
 - A create that finds the name taken in the meantime (a peer's create
   applied during the wait) opens the existing file instead, unless the
   application asked for `O_EXCL`.
-- An open (or truncate) whose file the wait removed or moved away from the
-  path (e.g. a peer renamed another file onto it) fails with `ESTALE`; the
-  kernel then looks the path up again and retries once, so the
-  application opens the file that is there now.
+- An open, truncate or unlink whose file the wait removed or moved away
+  from the path (e.g. a peer renamed another file onto it) fails with
+  `ESTALE`; the kernel then looks the path up again and retries once, so
+  the application opens or removes the file that is there now.
+- Unlinking a file's last link does not fetch its newest content first:
+  the tombstone lists the newest version the lock knows of in its lineage,
+  so peers that wrote it don't keep a conflict copy. If the unlink fails,
+  nothing is recorded and the local copy keeps its version.
 
 The wait can stall behind entries this node defers because it holds a
 lock on their file itself; it then ends at `freshness_timeout` with
