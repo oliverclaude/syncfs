@@ -126,10 +126,12 @@ impl Backing {
                     p.push(b'/');
                 }
                 p.extend_from_slice(name.as_bytes());
-                if let Ok(md) = e.metadata() {
-                    if md.is_dir() && md.dev() == dev {
-                        stack.push(p.clone());
-                    }
+                // `file_type` does not follow a symlink: one to a
+                // directory is an entry, not a subtree.
+                if e.file_type().is_ok_and(|t| t.is_dir())
+                    && e.metadata().is_ok_and(|md| md.dev() == dev)
+                {
+                    stack.push(p.clone());
                 }
                 out.push(p);
             }
@@ -491,6 +493,27 @@ mod tests {
         b.link(b"d/g", b"h").unwrap();
         b.remove(b"d/g", false).unwrap();
         assert!(b.exists(b"h"));
+    }
+
+    /// A symlink to a directory is one entry: the walk does not descend
+    /// into its target (issue #1).
+    #[test]
+    fn list_does_not_follow_directory_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f"), b"x").unwrap();
+        std::os::unix::fs::symlink("d", root.join("link")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+        let b = Backing::open(&root).unwrap();
+        let want: Vec<Vec<u8>> = ["d", "d/f", "link", "out"]
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        assert_eq!(b.list().unwrap(), want);
     }
 
     #[test]

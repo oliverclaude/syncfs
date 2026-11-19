@@ -71,13 +71,19 @@ pub fn scan_hard_links(root: &std::path::Path) -> std::io::Result<Vec<Vec<Vec<u8
                 p.push(b'/');
             }
             p.extend_from_slice(name.as_bytes());
+            // `file_type` does not follow symlinks: a symlink is neither
+            // a directory to descend into nor a name of the file.
+            let Ok(t) = e.file_type() else { continue };
+            if !t.is_dir() && !t.is_file() {
+                continue;
+            }
             let Ok(md) = e.metadata() else { continue };
             if md.dev() != dev {
                 continue;
             }
-            if md.is_dir() {
+            if t.is_dir() {
                 stack.push(p);
-            } else if md.is_file() && md.nlink() > 1 {
+            } else if md.nlink() > 1 {
                 by_inode.entry(md.ino()).or_default().push(p);
             }
         }
@@ -486,6 +492,21 @@ mod tests {
             node,
             disk: node as u64,
         }
+    }
+
+    /// A symlink to a hard-linked file, or to a directory holding one, is
+    /// not taken for another link of it (issue #1).
+    #[test]
+    fn hard_link_scan_skips_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("d/a"), b"x").unwrap();
+        std::fs::hard_link(root.join("d/a"), root.join("d/b")).unwrap();
+        std::os::unix::fs::symlink("d/a", root.join("s")).unwrap();
+        std::os::unix::fs::symlink("d", root.join("sd")).unwrap();
+        let want = vec![vec![b"d/a".to_vec(), b"d/b".to_vec()]];
+        assert_eq!(scan_hard_links(root).unwrap(), want);
     }
 
     #[test]
