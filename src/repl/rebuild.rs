@@ -307,25 +307,18 @@ impl Repl {
             let dir = orphan_dir.get_or_insert_with(|| {
                 format!("{}/{}/{stamp}", crate::fs::virt::NAME, marker::ORPHANS).into_bytes()
             });
-            let root = r.backing.path();
-            let from = root.join(std::ffi::OsStr::from_bytes(path));
-            let mut to_rel = dir.clone();
-            to_rel.push(b'/');
-            to_rel.extend_from_slice(path);
-            let to = root.join(std::ffi::OsStr::from_bytes(&to_rel));
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&from, &to)?;
+            r.backing.move_aside(path, dir)?;
+            let mut to = dir.clone();
+            to.push(b'/');
+            to.extend_from_slice(path);
             log::warn!(
                 "rebuild: {} is not on node {source}; moved to {}",
                 String::from_utf8_lossy(path),
-                to.display()
+                String::from_utf8_lossy(&to)
             );
             orphans += 1;
             Ok(())
         };
-        use std::os::unix::ffi::OsStrExt;
         let wanted: BTreeSet<&[u8]> = nodes.iter().map(|n| n.path.as_slice()).collect();
         // Local paths the source does not have (outermost only).
         let mut gone: Vec<Vec<u8>> = Vec::new();

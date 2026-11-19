@@ -160,6 +160,44 @@ impl Backing {
         Ok((fd, OsStr::from_bytes(name)))
     }
 
+    /// Moves `path` (a peer-style path, checked) to `into/path`, where
+    /// `into` is a directory below the root's `.syncfs` (e.g. the rebuild's
+    /// orphans), creating the directories on the way. Every directory is
+    /// opened beneath the root without following symlinks, so a symlink
+    /// in either path cannot move anything outside the backing directory.
+    pub fn move_aside(&self, path: &[u8], into: &[u8]) -> io::Result<()> {
+        let (from_dir, from_name) = self.parent(path)?;
+        let mut target: Vec<u8> = into.to_vec();
+        if let Some(i) = path.iter().rposition(|b| *b == b'/') {
+            target.push(b'/');
+            target.extend_from_slice(&path[..i]);
+        }
+        let mut dir = rustix::fs::openat(
+            &self.root,
+            ".",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        for c in target.split(|b| *b == b'/') {
+            if c.is_empty() || c == b"." || c == b".." || c.contains(&0) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad path"));
+            }
+            let c = OsStr::from_bytes(c);
+            match rustix::fs::mkdirat(&dir, c, Mode::from_raw_mode(0o700)) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(e.into()),
+            }
+            dir = rustix::fs::openat2(
+                &dir,
+                c,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )?;
+        }
+        Ok(rustix::fs::renameat(&from_dir, from_name, &dir, from_name)?)
+    }
+
     pub fn stat(&self, path: &[u8]) -> io::Result<Stat> {
         let (d, n) = self.parent(path)?;
         Ok(rustix::fs::statat(&d, n, AtFlags::SYMLINK_NOFOLLOW)?)
@@ -514,6 +552,34 @@ mod tests {
             .map(|p| p.as_bytes().to_vec())
             .collect();
         assert_eq!(b.list().unwrap(), want);
+    }
+
+    /// Moving a path aside never reaches through a symlink (issue #1).
+    #[test]
+    fn move_aside_stays_beneath_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f"), b"x").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let b = Backing::open(&root).unwrap();
+        assert!(b.move_aside(b"link/file", b".syncfs/orphans/t").is_err());
+        assert!(outside.join("file").exists());
+        // An orphans directory replaced by a symlink is not followed.
+        std::fs::create_dir(root.join(".syncfs")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".syncfs/orphans")).unwrap();
+        assert!(b.move_aside(b"d/f", b".syncfs/orphans/t").is_err());
+        assert!(!outside.join("t").exists());
+        std::fs::remove_file(root.join(".syncfs/orphans")).unwrap();
+        b.move_aside(b"d/f", b".syncfs/orphans/t").unwrap();
+        assert!(root.join(".syncfs/orphans/t/d/f").exists());
+        assert!(!root.join("d/f").exists());
+        // The symlink itself can be moved aside (not what it points to).
+        b.move_aside(b"link", b".syncfs/orphans/t").unwrap();
+        assert!(outside.join("file").exists());
     }
 
     #[test]
