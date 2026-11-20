@@ -1104,6 +1104,15 @@ Each step ends with passing tests and a commit.
    (including root and `user` fstab mounts) and released by CI.
 10. **Soak test**: randomized multi-node run with restarts and partitions.
 
+## Issue tracking
+
+Open work is scored and picked as described in [CONTRIBUTING.md](CONTRIBUTING.md):
+every issue and enhancement gets `effort` and `likelihood` labels (lower
+is better) and a short reason when it is filed. Work is taken in lowest
+total first (ties: lower effort, then lower issue number). A bug found
+while working on something else is filed as its own issue and left for
+later.
+
 ## Building
 
 ```sh
