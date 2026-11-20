@@ -16,11 +16,15 @@ on:
     - cron: "0 20 * * *" # 22:00 SAST
   workflow_dispatch:
 
+# contents: write is only on the nightly and release jobs, which publish
+# (and, for nightly, prune old nightly-* pre-releases). Everything else
+# gets read, including fork pull requests.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  NIGHTLY_KEEP: "14"
 
 jobs:
   # The version suffix, and whether a nightly has anything new to build.
@@ -68,7 +72,6 @@ jobs:
           fi
 
   deb:
-    name: deb ${{ matrix.suite }} ${{ matrix.arch }}
     needs: version
     if: needs.version.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
@@ -103,7 +106,6 @@ jobs:
           if-no-files-found: error
 
   musl:
-    name: musl ${{ matrix.os }}
     needs: version
     if: needs.version.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
@@ -148,6 +150,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [deb, musl]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -171,7 +176,11 @@ jobs:
     if: needs.version.outputs.nightly == 'true' && needs.version.outputs.skip != 'true'
     needs: [version, deb, musl]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -193,3 +202,7 @@ jobs:
             --target "$GITHUB_SHA" --prerelease --latest=false \
             --title "syncfs $TAG" \
             --notes "Nightly build of $GITHUB_SHA (main). Debian packages for bookworm (+deb12) and trixie (+deb13) on amd64 and arm64, and static musl binaries for x86_64 and aarch64. Not a release: see the README's Installing section."
+      - name: Prune old nightly pre-releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/prune-nightlies.sh --delete --keep "$NIGHTLY_KEEP" --repo "$GITHUB_REPOSITORY"

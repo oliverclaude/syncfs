@@ -67,6 +67,9 @@ upgrades the one before, and the `0.1.0` release upgrades every nightly.
 Note that it also sorts below `0.1.0~pre` (`nightly` < `pre`). A second
 nightly on the same day (after `main` moved) replaces that day's release
 under the same version, so `apt` needs `--reinstall` to pick it up.
+The workflow keeps the 14 newest `nightly-YYYYMMDD` pre-releases and
+deletes older ones (and their tags). It never touches `v*` releases.
+`NIGHTLY_KEEP` in the workflow sets the number.
 Scheduled runs can start late, and GitHub disables scheduled workflows
 after 60 days without activity in the repository.
 
