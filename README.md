@@ -55,6 +55,21 @@ builds the static archive (needs `musl-tools`). Set `SYNCFS_PRE=pre` for
 a `~pre` version. The `Package` workflow does all of this on x86_64 and
 arm64 runners and publishes a pre-release for each `v*` tag.
 
+**Nightly builds.** Every day at 20:00 UTC (22:00 SAST), and when run by
+hand (`gh workflow run Package --ref main`), the `Package` workflow builds
+`main` with the same jobs and publishes the result as the pre-release
+`nightly-YYYYMMDD` (the UTC date). It is never marked latest. If `main` is
+still at the commit of the newest release (a `v*` tag or the last
+nightly), it builds nothing. The package version is
+`0.1.0~nightly.YYYYMMDD` (`0.1.0.nightly.YYYYMMDD` in asset names,
+`0.1.0-nightly.YYYYMMDD` for the musl archives): each day's nightly
+upgrades the one before, and the `0.1.0` release upgrades every nightly.
+Note that it also sorts below `0.1.0~pre` (`nightly` < `pre`). A second
+nightly on the same day (after `main` moved) replaces that day's release
+under the same version, so `apt` needs `--reinstall` to pick it up.
+Scheduled runs can start late, and GitHub disables scheduled workflows
+after 60 days without activity in the repository.
+
 ## Design
 
 - **Local source of truth.** Every mounting node stores its data in a local

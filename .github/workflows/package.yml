@@ -2,23 +2,78 @@ name: Package
 
 # .deb packages (bookworm, trixie x amd64, arm64), each test-installed in a
 # clean container of its suite, and static musl binaries (x86_64, aarch64).
-# A v* tag publishes them all as a GitHub pre-release.
+# A v* tag publishes them all as a GitHub pre-release. Nightly (and on
+# workflow_dispatch) the same builds of main are published as the
+# pre-release nightly-YYYYMMDD, unless main has not changed since the
+# newest release.
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  schedule:
+    - cron: "0 20 * * *" # 22:00 SAST
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  # Version suffix: 0.1.0 + "pre" -> 0.1.0~pre (deb) / 0.1.0-pre (tarball).
-  SYNCFS_PRE: pre
 
 jobs:
+  # The version suffix, and whether a nightly has anything new to build.
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      # 0.1.0 + "pre" -> 0.1.0~pre (deb) / 0.1.0-pre (tarball); nightly:
+      # 0.1.0~nightly.YYYYMMDD, below the 0.1.0 release and rising per day.
+      pre: ${{ steps.v.outputs.pre }}
+      nightly: ${{ steps.v.outputs.nightly }}
+      tag: ${{ steps.v.outputs.tag }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != schedule ] && [ "$EVENT" != workflow_dispatch ]; then
+            echo "pre=pre" >> "$GITHUB_OUTPUT"
+            echo "nightly=false" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "nightlies are built from main only (not $GITHUB_REF)" >&2
+            exit 1
+          fi
+          day=$(date -u +%Y%m%d)
+          echo "pre=nightly.$day" >> "$GITHUB_OUTPUT"
+          echo "nightly=true" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-$day" >> "$GITHUB_OUTPUT"
+          newest=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
+            --exclude-drafts --json tagName -q '.[0].tagName')
+          at=""
+          if [ -n "$newest" ]; then
+            at=$(gh api "repos/$GITHUB_REPOSITORY/commits/$newest" -q .sha)
+          fi
+          echo "newest release: ${newest:-none} at ${at:-none}; main at $GITHUB_SHA"
+          if [ "$at" = "$GITHUB_SHA" ]; then
+            echo "main is already released as $newest: skipping" >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   deb:
     name: deb ${{ matrix.suite }} ${{ matrix.arch }}
+    needs: version
+    if: needs.version.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
+    env:
+      SYNCFS_PRE: ${{ needs.version.outputs.pre }}
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +104,11 @@ jobs:
 
   musl:
     name: musl ${{ matrix.os }}
+    needs: version
+    if: needs.version.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
+    env:
+      SYNCFS_PRE: ${{ needs.version.outputs.pre }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,8 +148,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [deb, musl]
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -109,3 +166,30 @@ jobs:
           gh release create "$GITHUB_REF_NAME" * --repo "$GITHUB_REPOSITORY" \
             --prerelease --title "syncfs $GITHUB_REF_NAME" \
             --notes "Pre-release build of $GITHUB_SHA. Debian packages for bookworm (+deb12) and trixie (+deb13) on amd64 and arm64, and static musl binaries for x86_64 and aarch64. See the README's Packages section."
+
+  nightly:
+    if: needs.version.outputs.nightly == 'true' && needs.version.outputs.skip != 'true'
+    needs: [version, deb, musl]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          cd dist
+          for f in *~*; do mv "$f" "$(echo "$f" | tr '~' .)"; done
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          # A second build the same day (main moved since) replaces it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create "$TAG" * --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "syncfs $TAG" \
+            --notes "Nightly build of $GITHUB_SHA (main). Debian packages for bookworm (+deb12) and trixie (+deb13) on amd64 and arm64, and static musl binaries for x86_64 and aarch64. Not a release: see the README's Installing section."
