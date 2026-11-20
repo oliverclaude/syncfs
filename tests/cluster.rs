@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use common::{is_mounted, unmount, wait_for, wait_until, BIN};
+use common::{is_mounted, unmount, wait_for, wait_until, wait_until_for, BIN, MOUNT_WAIT};
 
 /// Heartbeat used by the test clusters; peers are down after 3 of these.
 const HEARTBEAT: &str = "100ms";
@@ -71,7 +71,7 @@ impl Node {
             .unwrap();
         self.child = Some(child);
         let f = self.status_file();
-        wait_until(&format!("node {} start", self.id), || {
+        wait_until_for(&format!("node {} start", self.id), MOUNT_WAIT, || {
             if let Some(st) = self.child.as_mut().unwrap().try_wait().unwrap() {
                 let log = std::fs::read_to_string(self.dir.join("log")).unwrap_or_default();
                 panic!("node {} exited: {st}\n{log}", self.id);

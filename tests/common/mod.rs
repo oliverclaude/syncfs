@@ -52,14 +52,37 @@ pub fn is_mounted(mountpoint: &Path) -> bool {
         .any(|l| l.split(' ').nth(4) == Some(want.as_str()))
 }
 
-pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+/// Default bound for [`wait_until`]. Mount and daemon-start waits use
+/// [`MOUNT_WAIT`] instead: under load a FUSE mount can take longer than
+/// this (issue #12).
+pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+
+/// Bound for waiting until a test mount or daemon is up.
+pub const MOUNT_WAIT: Duration = Duration::from_secs(30);
+
+pub fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+    wait_until_for(what, DEFAULT_WAIT, cond)
+}
+
+pub fn wait_until_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+    let timeout = wait_floor(timeout);
     let start = Instant::now();
     while !cond() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "timed out waiting for {what}"
-        );
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// If `SYNCFS_TEST_WAIT` is set to a number of seconds, use at least that
+/// long, so a loaded machine can stretch waits without a rebuild.
+pub fn wait_floor(timeout: Duration) -> Duration {
+    wait_floor_from(timeout, std::env::var("SYNCFS_TEST_WAIT").ok().as_deref())
+}
+
+pub fn wait_floor_from(timeout: Duration, env: Option<&str>) -> Duration {
+    match env.and_then(|s| s.parse::<u64>().ok()) {
+        Some(secs) => timeout.max(Duration::from_secs(secs)),
+        None => timeout,
     }
 }
 
@@ -135,7 +158,7 @@ impl Mounted {
             child: Some(child),
         };
         let mnt = m.mnt.clone();
-        wait_until("mount", || {
+        wait_until_for("mount", MOUNT_WAIT, || {
             if let Some(status) = m.child.as_mut().unwrap().try_wait().unwrap() {
                 panic!("syncfs exited early: {status}");
             }

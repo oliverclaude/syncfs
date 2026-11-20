@@ -11,7 +11,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
-use common::{is_mounted, unmount, wait_until, Mounted, BIN};
+use common::{is_mounted, unmount, wait_until_for, Mounted, BIN, MOUNT_WAIT};
 
 fn cpath(p: &Path) -> CString {
     CString::new(p.as_os_str().as_bytes()).unwrap()
@@ -358,6 +358,53 @@ fn allow_other_mount() {
 }
 
 #[test]
+fn wait_until_for_times_out_at_the_given_bound() {
+    let start = std::time::Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_until_for("never", std::time::Duration::from_millis(80), || false);
+    }));
+    assert!(err.is_err());
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(80),
+        "{elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(400),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn wait_until_for_accepts_a_condition_that_becomes_true_before_the_bound() {
+    let start = std::time::Instant::now();
+    wait_until_for("soon", std::time::Duration::from_millis(400), || {
+        start.elapsed() >= std::time::Duration::from_millis(80)
+    });
+}
+
+#[test]
+fn test_wait_env_raises_the_timeout_floor() {
+    use std::time::Duration;
+    assert_eq!(
+        common::wait_floor_from(Duration::from_secs(10), None),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        common::wait_floor_from(Duration::from_secs(10), Some("not-a-number")),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        common::wait_floor_from(Duration::from_secs(30), Some("10")),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        common::wait_floor_from(Duration::from_secs(10), Some("30")),
+        Duration::from_secs(30)
+    );
+}
+
+#[test]
 fn daemonizes_by_default_and_debug_stays_in_foreground() {
     require_fuse!();
     let tmp = tempfile::tempdir().unwrap();
@@ -382,10 +429,12 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
     fs::write(mnt.join("f"), b"daemon").unwrap();
     assert_eq!(fs::read(b.join("f")).unwrap(), b"daemon");
     unmount(&mnt);
-    wait_until("unmount", || !is_mounted(&mnt));
+    wait_until_for("unmount", MOUNT_WAIT, || !is_mounted(&mnt));
     // The daemon still closes its store after the unmount; the next mount
     // with the same state directory can only open it after that.
-    wait_until("daemon exit", || store_free(&state.join("store.redb")));
+    wait_until_for("daemon exit", MOUNT_WAIT, || {
+        store_free(&state.join("store.redb"))
+    });
 
     // A failing mount reports the error and a non-zero status.
     let out = Command::new(BIN)
@@ -413,7 +462,7 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
         std::io::Read::read_to_string(&mut stderr, &mut s).unwrap();
         s
     });
-    wait_until("debug mount", || is_mounted(&mnt));
+    wait_until_for("debug mount", MOUNT_WAIT, || is_mounted(&mnt));
     let _ = fs::read_dir(&mnt).unwrap().count();
     assert!(
         child.try_wait().unwrap().is_none(),

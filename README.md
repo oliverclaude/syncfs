@@ -980,6 +980,8 @@ for forwarding). Daemons show their version table in `status.json`.
 
 - `cargo test` runs unit tests plus FUSE mount tests (as the current user;
   they skip with a message when `/dev/fuse` or `fusermount3` is missing).
+  Mount and daemon-start waits allow 30 s (other waits 10 s);
+  `SYNCFS_TEST_WAIT` (seconds) raises those bounds when set.
   Run the `mount`, `status` and `cluster` test binaries with `sudo` too for
   the root and multi-user cases; CI does both on x86_64 and arm64.
 - `tests/net.rs` runs membership in process: handshake rejections, leave
