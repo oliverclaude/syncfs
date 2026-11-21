@@ -93,11 +93,6 @@ impl Reloader {
         }
     }
 
-    /// The configuration in effect.
-    pub fn current(&self) -> &Config {
-        &self.current
-    }
-
     /// Reloads (on SIGHUP), taking the options of a pending remount if
     /// there are any, and logs what happened.
     pub fn reload(&mut self) -> Outcome {

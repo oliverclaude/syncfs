@@ -259,6 +259,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String], base: reload::Base) -> anyhow:
                     net: None,
                     cluster: None,
                     reloader: None,
+                    registration: None,
                 })
                 .map_err(Into::into)
         };
@@ -361,6 +362,8 @@ pub fn run(cfg: &Config, kernel_flags: &[String], base: reload::Base) -> anyhow:
         served.net = Some(net);
         served.cluster = cluster;
         served.reloader = Some(reloader);
+        // Before mount(8) returns, so that a remount right after finds it.
+        served.registration = Some(Registration::new(cfg));
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
         Ok(served)
     };
@@ -376,6 +379,7 @@ struct Served {
     net: Option<Network>,
     cluster: Option<Cluster>,
     reloader: Option<Reloader>,
+    registration: Option<Registration>,
 }
 
 /// The cluster services of a mount node.
@@ -548,6 +552,7 @@ fn mount_direct(
             net: None,
             cluster: None,
             reloader: None,
+            registration: None,
         }),
         Err(e) => {
             // SAFETY: valid path string.
@@ -598,9 +603,9 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         net,
         cluster,
         reloader,
+        registration,
     } = served;
     let mut reloader = reloader.expect("set once mounted");
-    let registration = Registration::new(reloader.current());
     let mut unmounter = session.unmount_callable();
     let unmounting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&unmounting);

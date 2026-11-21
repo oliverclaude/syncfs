@@ -44,6 +44,7 @@ pub fn run(cfg: &Config, base: reload::Base) -> anyhow::Result<()> {
         Arc<Flusher>,
         std::thread::JoinHandle<()>,
         Reloader,
+        Registration,
     );
     let start = || -> anyhow::Result<Running> {
         let store = Store::open(&cfg.state_dir)
@@ -85,14 +86,23 @@ pub fn run(cfg: &Config, base: reload::Base) -> anyhow::Result<()> {
                 shown: Some(shown),
             },
         );
-        Ok((net, status, locks, flusher, flush_thread, reloader))
+        // Before the parent returns, so that a reload right after finds it.
+        let registration = Registration::new(cfg);
+        Ok((
+            net,
+            status,
+            locks,
+            flusher,
+            flush_thread,
+            reloader,
+            registration,
+        ))
     };
     let path = status_path(cfg);
     process::run(
         cfg.foreground,
         start,
-        move |(net, status, locks, flusher, flush_thread, reloader), signals| {
-            let registration = Registration::new(cfg);
+        move |(net, status, locks, flusher, flush_thread, reloader, registration), signals| {
             let res = serve(&net, &status, &path, reloader, signals);
             drop(registration);
             locks.shutdown();
