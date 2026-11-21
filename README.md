@@ -39,7 +39,9 @@ The package enables and starts nothing. To run a voter daemon, set
 `/etc/syncfs/syncfs.yaml` and `systemctl enable --now syncfs-daemon`. To
 mount through systemd instead of fstab, write `/etc/syncfs/data.yaml`
 (with the same cluster settings, plus `backing_dir` and `mountpoint`) and
-`systemctl enable --now syncfs@data`; stopping the unit unmounts cleanly.
+`systemctl enable --now syncfs@data`; stopping the unit unmounts cleanly,
+and `systemctl reload` re-reads the config file in place (see
+[Reloading the configuration](#reloading-the-configuration)).
 
 **Any Linux on x86_64 or aarch64**: the `syncfs-*-linux-musl.tar.gz`
 archives hold a static binary (no libraries needed; the kernel's FUSE and,
@@ -178,7 +180,9 @@ fusermount3 -u /mnt/data                   # unmount (or: umount /mnt/data as ro
 
 - Without `-f`/`debug`, the command returns once the mount is up (or fails
   with the reason) and a detached daemon keeps serving, logging to syslog.
-  SIGINT, SIGTERM or SIGHUP unmount cleanly. A root mount that is busy
+  SIGINT or SIGTERM unmount cleanly; SIGHUP reloads the configuration
+  (see [Reloading the configuration](#reloading-the-configuration)). A
+  root mount that is busy
   (a file open, a process inside it) keeps serving after the first signal
   (logged); a second signal detaches it lazily, like `umount -l`, and the
   daemon exits when the last open file is closed. A user mount is
@@ -219,6 +223,57 @@ directory comes from the user's passwd home (`~/.local/state/syncfs`).
 (e.g. `syncfs`) is only a label and the backing directory comes from the
 config file. The helper supports mount's `-f` (fake), `-s` (sloppy:
 ignore unknown options), `-v` and `-n`.
+
+### Reloading the configuration
+
+A running mount or voter daemon reloads its configuration in place, with
+no unmount and without stopping the applications using it:
+
+```sh
+mount -o remount,lock_wait=20s /mnt/data   # new -o options, then reload
+mount -o remount /mnt/data                 # re-read the config file
+systemctl reload syncfs@data               # the same for a unit (SIGHUP)
+kill -HUP "$(cat /var/lib/syncfs/syncfs.pid)"   # or by hand
+```
+
+Open files, held locks and cluster connections are not touched. The new
+configuration is built like the first one: defaults < config file < `-o`
+options < the command-line flags the daemon was started with (so a
+remount cannot override a flag; it logs a warning if it tries). The `-o`
+options of a remount are added after the ones in effect: options given at
+mount time stay unless the remount overrides them. A plain SIGHUP re-reads
+the config file with the options in effect.
+
+| Settings | On reload |
+|----------|-----------|
+| `log_level`, `lock_wait`, `freshness_timeout` | applied at once |
+| `lock_lease_timeout`, `heartbeat_interval` | applied at once, with a warning: every node relies on them, so change them to the same value on all nodes (and in the config file or fstab, or a restart brings the old value back). Until all agree, a voter refuses lock requests and renewals asking for a longer lease than its own, and nodes with different heartbeats may call each other down. Lowering the lease is safe in any order |
+| everything else (`cluster_name`, `node_id`, `mode`, `listen`, `peers`, `backing_dir`, `mountpoint`, `state_dir`, `block_size`, `allow_other`, `allow_root`, `debug`, `foreground`) | refused: these are the node's identity or fixed when the kernel mount is made (`debug` also turns on the FUSE request log and the foreground; `foreground` is whether the process daemonized). Unmount and mount again to change them |
+
+All or nothing: if any refused setting differs, the daemon logs an error
+naming each one and changes nothing; otherwise it logs every change (`old
+-> new`), or that nothing changed. The outcome is only in the daemon's
+log (syslog or the journal; stderr in the foreground). `mount -o remount`
+exits 0 once the daemon has the request, and fails only if it cannot
+find or signal the daemon, or the options do not parse. Kernel mount
+flags (`nosuid`, `noexec`, ...) are not changed by a remount.
+
+How it works: a signal carries no options, so the helper writes them to
+`<state_dir>/remount.json` (atomically, by rename) and sends SIGHUP. It
+finds the daemon by the mountpoint, through the registration every mount
+writes when it starts serving: `/run/syncfs/mount-HASH.json` for root
+(`$XDG_RUNTIME_DIR/syncfs`, or `/run/user/UID/syncfs`, or
+`~/.local/state/syncfs/run` for a user), holding its pid and state
+directory. Every daemon also writes `<state_dir>/syncfs.pid`; both are
+removed on exit. util-linux runs `mount.syncfs` with the fstab entry's
+options, or, for a mount with no fstab entry, `mount.fuse.syncfs` with
+the kernel's options for the mount (`rw,nosuid,...,user_id=0,...`), then
+`remount`, then the new options; the helper drops the options before
+`remount` that only describe the mount as the kernel shows it. It never
+calls mount(2) for a remount: the kernel's FUSE mount accepts no changes
+(`mount -i -o remount`, which skips the helper, fails with "No changes
+allowed in reconfigure"). `mount -f -o remount` checks the options and
+signals nothing.
 
 ## The `.syncfs` status directory
 
@@ -396,7 +451,9 @@ counts towards every quorum but never takes a lock). It daemonizes unless `--for
 no `.syncfs` directory to read, it writes the same status as JSON to
 `<state_dir>/status.json`. The file is replaced atomically on every
 membership change and at least every 5 heartbeat intervals, and removed on
-a clean exit.
+a clean exit. SIGINT and SIGTERM stop it; SIGHUP (`systemctl reload
+syncfs-daemon`) reloads its configuration like a mount's, minus the
+mount-only settings.
 
 ```sh
 syncfs --mode daemon --node-id 3 --listen 0.0.0.0:7420 \
@@ -589,6 +646,15 @@ that ignores attempts in progress.
 All nodes should use the same `lock_lease_timeout`. A voter refuses to
 confirm a lease longer than its own (`LockDeny Lease`, logged), since its
 start-up grace would not cover it.
+
+A reload may change `lock_lease_timeout` and `heartbeat_interval` while
+locks are held. Each attempt fixes the lease it asks for when it starts,
+and each renewal round extends a lease only by the lease that round asked
+for, so a holder never counts on a longer lease than the voters granted.
+Held leases keep their deadlines, the renewer reschedules at once, and the
+derived values above (request timeout, provisional grant lifetime) follow
+the new heartbeat. Open connections get the new down timeout (3 ×
+heartbeat) without reconnecting.
 
 ## Write path
 
@@ -1001,6 +1067,14 @@ for forwarding). Daemons show their version table in `status.json`.
   (conflicting opens, 3 and 5 nodes taking turns, a killed holder, a
   partition giving `EROFS` while reads work, voter daemons forming the
   quorum).
+- Reload: unit tests of what a reload may change (`config::diff`), of the
+  helper's remount options and of the request file; `tests/locks.rs`
+  changes lock timings and the heartbeat under a held lock;
+  `tests/cluster.rs` remounts a cluster mount through the helper while a
+  file is open and its lock held (the new `lock_wait` is live, the lock
+  session and the file survive), checks that a refused change leaves the
+  configuration alone and the helper still exits 0, and that SIGHUP
+  re-reads the YAML on mounts and voters without unmounting.
 - Replication: unit tests of the store, journal, dirty bitmaps, file index
   and backing access; the version model check (`src/repl/model.rs`, run
   optimized in CI); `tests/cluster.rs` checks that two mounts' backing trees
@@ -1043,8 +1117,10 @@ for forwarding). Daemons show their version table in `status.json`.
   unmounting on SIGTERM), and that remove keeps and purge deletes the
   conffile. `scripts/unit-test.sh SUITE DEB` boots systemd in a
   privileged container and starts and stops `syncfs-daemon` and
-  `syncfs@data` (mounted, used, unmounted on stop), and checks that an
-  instance without its config is skipped. Both take an optional
+  `syncfs@data` (mounted, used, reloaded with `systemctl reload`,
+  unmounted on stop), and checks that an instance without its config is
+  skipped. `deb-test.sh` also reloads root mounts with `mount -o remount`,
+  with and without an fstab entry. Both take an optional
   architecture to emulate (e.g. `arm64`); under qemu-user the setuid
   `mount` is not setuid, so the `user` mount check fails there. CI runs both natively for all four packages and smoke-tests the static
   binaries (a mount, and `--version` in an empty container).

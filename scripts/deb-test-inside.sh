@@ -31,6 +31,29 @@ findmnt -no FSTYPE /mnt/a | grep -q fuse.syncfs || fail "/mnt/a type: $(findmnt 
 echo written > /mnt/b/new
 [ "$(cat /srv/b/new)" = written ] || fail "write through /mnt/b"
 grep -q '^mode: mount' /mnt/a/.syncfs/node || fail "status file"
+
+step "mount -o remount reloads the configuration"
+# The daemon reloads after the helper signals it: wait for the change.
+waitfor() { for _ in $(seq 50); do grep -q "$1" "$2" && return 0; sleep 0.1; done; return 1; }
+exec 3>>/mnt/a/file
+echo appended >&3
+mount -o remount,lock_wait=7s /mnt/a || fail "remount /mnt/a (fstab, mount.syncfs)"
+waitfor '^lock_wait: 7s' /mnt/a/.syncfs/config || fail "remount /mnt/a not applied: $(cat /mnt/a/.syncfs/config)"
+echo again >&3
+exec 3>&-
+[ "$(cat /srv/a/file)" = "$(printf 'hello\nappended\nagain')" ] || fail "file open across the remount: $(cat /srv/a/file)"
+mount -o remount,lock_wait=8s /mnt/b || fail "remount /mnt/b (fstab, fuse.syncfs)"
+waitfor '^lock_wait: 8s' /mnt/b/.syncfs/config || fail "remount /mnt/b not applied"
+mount -o remount,cluster_name=other /mnt/b || fail "a refused remount must still exit 0"
+sleep 1
+grep -q '^cluster_name: syncfs' /mnt/b/.syncfs/config || fail "refused remount was applied"
+mkdir -p /srv/c /mnt/c
+mount -t syncfs /srv/c /mnt/c -o state_dir=/var/lib/syncfs/c
+mount -o remount,lock_wait=9s /mnt/c || fail "remount without an fstab entry (mount.fuse.syncfs)"
+waitfor '^lock_wait: 9s' /mnt/c/.syncfs/config || fail "remount /mnt/c not applied"
+mount -o remount,lock_wait=soon /mnt/c 2>/dev/null && fail "bad remount option accepted"
+findmnt /mnt/c >/dev/null || fail "remount unmounted /mnt/c"
+umount /mnt/c
 umount /mnt/a
 umount /mnt/b
 mount | grep -q /mnt/a && fail "still mounted"

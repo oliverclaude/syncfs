@@ -6,6 +6,12 @@
 # in /usr/share/doc/syncfs/examples/syncfs.yaml.
 #
 # Check the result with:  syncfs --config /etc/syncfs/syncfs.yaml --print-config
+#
+# A running node re-reads this file on `systemctl reload`, SIGHUP or
+# `mount -o remount MOUNTPOINT`. Only log_level, lock_wait,
+# freshness_timeout, lock_lease_timeout and heartbeat_interval change in
+# place (the last two on every node); a reload that changes anything else
+# is refused and logged.
 
 # Name of the cluster: 1-64 characters of A-Z a-z 0-9 . _ -
 # Nodes only talk to nodes with the same cluster_name and the same set of

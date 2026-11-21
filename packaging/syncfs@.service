@@ -10,6 +10,9 @@ ConditionPathExists=/etc/syncfs/%i.yaml
 Type=simple
 # Stops (SIGTERM) unmount cleanly. Each instance keeps its own state.
 ExecStart=/usr/bin/syncfs --config /etc/syncfs/%i.yaml --state-dir /var/lib/syncfs/%i --foreground
+# `systemctl reload` re-reads /etc/syncfs/%i.yaml in place: open files and
+# locks stay; the outcome is in the journal.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 StateDirectory=syncfs/%i

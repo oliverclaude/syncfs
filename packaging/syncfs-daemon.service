@@ -8,6 +8,9 @@ After=network-online.target
 Type=simple
 # Settings (cluster_name, node_id, listen, peers) from /etc/syncfs/syncfs.yaml.
 ExecStart=/usr/bin/syncfs --mode daemon --foreground
+# `systemctl reload` re-reads /etc/syncfs/syncfs.yaml in place; the outcome
+# is in the journal.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 StateDirectory=syncfs

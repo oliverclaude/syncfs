@@ -46,6 +46,13 @@ else
 fi
 systemctl is-active syncfs-daemon
 test -d /var/lib/syncfs
+echo "lock_wait: 6s" >> /etc/syncfs/syncfs.yaml
+systemctl reload syncfs-daemon
+# status.json is rewritten at least every 5 heartbeats.
+for i in $(seq 150); do grep -q "\"lock_wait\": *\"6s\"" /var/lib/syncfs/status.json && break; sleep 0.1; done
+grep -q "\"lock_wait\": *\"6s\"" /var/lib/syncfs/status.json
+systemctl is-active syncfs-daemon
+echo reloaded
 systemctl stop syncfs-daemon
 ! systemctl is-active syncfs-daemon
 systemctl show -p Result --value syncfs-daemon | grep -x success'
@@ -63,6 +70,13 @@ systemctl is-active syncfs@data
 findmnt -no FSTYPE /mnt/data
 test "$(cat /mnt/data/f)" = hi
 echo w > /mnt/data/g && test "$(cat /srv/data/g)" = w
+echo "lock_wait: 6s" >> /etc/syncfs/data.yaml
+systemctl reload syncfs@data
+for i in $(seq 50); do grep -q "^lock_wait: 6s" /mnt/data/.syncfs/config && break; sleep 0.1; done
+grep "^lock_wait: 6s" /mnt/data/.syncfs/config
+systemctl is-active syncfs@data
+findmnt /mnt/data >/dev/null
+echo reloaded, still mounted
 test -d /var/lib/syncfs/data
 systemctl stop syncfs@data
 ! findmnt /mnt/data
