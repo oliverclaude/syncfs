@@ -14,13 +14,13 @@ form a cluster and keep a full copy of the same filesystem on every node.
 Builds of each `v*` tag are on the
 [releases page](https://github.com/oliverclaude/syncfs/releases), with a
 `SHA256SUMS` file (`sha256sum -c SHA256SUMS`). Asset names spell the
-package version `0.1.0~pre` as `0.1.0.pre`, because GitHub rewrites `~`.
+package version `0.2.0~pre` as `0.2.0.pre`, because GitHub rewrites `~`.
 
 **Debian 12 (bookworm) and 13 (trixie)**, amd64 and arm64: take the
 package for your suite (`+deb12` or `+deb13`) and architecture, then
 
 ```sh
-sudo apt install ./syncfs_0.1.0.pre-1+deb13_amd64.deb
+sudo apt install ./syncfs_0.2.0.pre-1+deb13_amd64.deb
 ```
 
 It depends on `fuse3` and `procps` (`kill`, for `systemctl reload`) and installs:
@@ -63,10 +63,10 @@ hand (`gh workflow run Package --ref main`), the `Package` workflow builds
 `nightly-YYYYMMDD` (the UTC date). It is never marked latest. If `main` is
 still at the commit of the newest release (a `v*` tag or the last
 nightly), it builds nothing. The package version is
-`0.1.0~nightly.YYYYMMDD` (`0.1.0.nightly.YYYYMMDD` in asset names,
-`0.1.0-nightly.YYYYMMDD` for the musl archives): each day's nightly
-upgrades the one before, and the `0.1.0` release upgrades every nightly.
-Note that it also sorts below `0.1.0~pre` (`nightly` < `pre`). A second
+`0.2.0~nightly.YYYYMMDD` (`0.2.0.nightly.YYYYMMDD` in asset names,
+`0.2.0-nightly.YYYYMMDD` for the musl archives): each day's nightly
+upgrades the one before, and the `0.2.0` release upgrades every nightly.
+Note that it also sorts below `0.2.0~pre` (`nightly` < `pre`). A second
 nightly on the same day (after `main` moved) replaces that day's release
 under the same version, so `apt` needs `--reinstall` to pick it up.
 The workflow keeps the 14 newest `nightly-YYYYMMDD` pre-releases and

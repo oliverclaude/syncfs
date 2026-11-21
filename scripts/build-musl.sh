@@ -3,7 +3,7 @@
 # and packs it with the docs, example config and systemd units:
 #
 #   SYNCFS_PRE=pre scripts/build-musl.sh OUTDIR
-#   -> OUTDIR/syncfs-0.1.0-pre-x86_64-linux-musl.tar.gz
+#   -> OUTDIR/syncfs-0.2.0-pre-x86_64-linux-musl.tar.gz
 #
 # Needs rustup, musl-tools (musl-gcc) and binutils (readelf).
 set -eu

@@ -31,8 +31,8 @@ jobs:
   version:
     runs-on: ubuntu-24.04
     outputs:
-      # 0.1.0 + "pre" -> 0.1.0~pre (deb) / 0.1.0-pre (tarball); nightly:
-      # 0.1.0~nightly.YYYYMMDD, below the 0.1.0 release and rising per day.
+      # 0.2.0 + "pre" -> 0.2.0~pre (deb) / 0.2.0-pre (tarball); nightly:
+      # 0.2.0~nightly.YYYYMMDD, below the 0.2.0 release and rising per day.
       pre: ${{ steps.v.outputs.pre }}
       nightly: ${{ steps.v.outputs.nightly }}
       tag: ${{ steps.v.outputs.tag }}

@@ -1,6 +1,6 @@
 [package]
 name = "syncfs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A replicating FUSE filesystem: every node keeps a full local copy, writes need quorum and a whole-file lock"
 license = "MIT OR Apache-2.0"
