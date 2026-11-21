@@ -3,11 +3,12 @@
 `syncfs` is a replicating FUSE filesystem for Linux. Several `syncfs` nodes
 form a cluster and keep a full copy of the same filesystem on every node.
 
-> **Status:** pre-release. Build plan steps 1 to 9 are done: configuration,
+> **Status:** pre-release. Build plan steps 1 to 10 are done: configuration,
 > the FUSE filesystem, the `.syncfs` status directory, membership, quorum
-> locks, the write path, replication, rejoin and recovery, and packaging
-> (`.deb` and static binaries, see [Installing](#installing)). Step 10, a
-> randomized soak test, is next.
+> locks, the write path, replication, rejoin and recovery, packaging
+> (`.deb` and static binaries, see [Installing](#installing)), and a
+> randomized soak test. [v0.2.0-pre](https://github.com/oliverclaude/syncfs/releases/tag/v0.2.0-pre)
+> is published. Open work is on the [issue list](https://github.com/oliverclaude/syncfs/issues).
 
 ## Installing
 
