@@ -9,6 +9,9 @@ pub use partial::PartialConfig;
 pub use types::{check_host_port, LogLevel, Mode, NodeId, Peer};
 pub use units::{ByteSize, HumanDuration};
 
+mod live;
+pub use live::{LiveDuration, SharedConfig};
+
 mod options;
 pub use options::{parse_mount_options, MountOptions, OptionError};
 

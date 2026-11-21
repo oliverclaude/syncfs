@@ -145,7 +145,7 @@ impl Repl {
             return Ok(());
         }
         self.state().counters.fresh_checks += 1;
-        let deadline = Instant::now() + self.freshness_timeout;
+        let deadline = Instant::now() + self.freshness_timeout.get();
         let mut waited = false;
         loop {
             for &s in t.sources.iter().filter(|&&s| s != self.me) {
@@ -167,7 +167,7 @@ impl Repl {
                 self.state().counters.fresh_waits += 1;
                 log::info!(
                     "freshness: waiting up to {} for a node with version {} of {id}",
-                    humantime::format_duration(self.freshness_timeout),
+                    humantime::format_duration(self.freshness_timeout.get()),
                     newest.seq
                 );
             }
@@ -368,7 +368,7 @@ impl Repl {
             return;
         }
         let _g = self.hold(id);
-        let deadline = Instant::now() + self.freshness_timeout;
+        let deadline = Instant::now() + self.freshness_timeout.get();
         let peers = loop {
             if !self.state().suspects.contains(&id) {
                 return;

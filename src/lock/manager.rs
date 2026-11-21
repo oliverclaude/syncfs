@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use fuser::Errno;
 use serde_json::json;
 
-use crate::config::{Config, NodeId};
+use crate::config::{Config, LiveDuration, NodeId};
 use crate::net::wire::{Ballot, DenyReason, FileId, Message, Outcome, Version, VersionInfo};
 use crate::net::{Network, PeerState};
 use crate::repl::version::{self, VersionTable};
@@ -22,17 +22,30 @@ use super::handoff::Handoff;
 use super::key::Key;
 use super::voter::{Reply, Voter};
 
-/// Timing and membership, derived from the config.
+/// Timing and membership, derived from the config. Clones share the
+/// timings, which a reload can change (see [`LockManager::set_timings`]).
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub me: NodeId,
     /// Every node, voters included, sorted.
     pub members: Vec<NodeId>,
-    pub lease: Duration,
-    pub wait: Duration,
-    pub heartbeat: Duration,
+    timing: Arc<Timing>,
     /// This node's disk id, stamped into the versions it makes.
     pub disk: u64,
+}
+
+#[derive(Debug)]
+struct Timing {
+    lease: LiveDuration,
+    wait: LiveDuration,
+    heartbeat: LiveDuration,
+}
+
+/// How long before its lease could end anywhere a holder of a `lease`
+/// stops relying on it: covers clock rate differences and a write that
+/// started just before the deadline.
+pub fn margin_for(lease: Duration) -> Duration {
+    (lease / 10).max(Duration::from_millis(50))
 }
 
 impl Settings {
@@ -45,11 +58,28 @@ impl Settings {
         Settings {
             me: cfg.node_id,
             members,
-            lease: cfg.lock_lease_timeout.get(),
-            wait: cfg.lock_wait.get(),
-            heartbeat: cfg.heartbeat_interval.get(),
+            timing: Arc::new(Timing {
+                lease: LiveDuration::new(cfg.lock_lease_timeout.get()),
+                wait: LiveDuration::new(cfg.lock_wait.get()),
+                heartbeat: LiveDuration::new(cfg.heartbeat_interval.get()),
+            }),
             disk: 0,
         }
+    }
+
+    /// `lock_lease_timeout`: the lease this node asks for from now on.
+    pub fn lease(&self) -> Duration {
+        self.timing.lease.get()
+    }
+
+    /// `lock_wait`.
+    pub fn wait(&self) -> Duration {
+        self.timing.wait.get()
+    }
+
+    /// `heartbeat_interval`.
+    pub fn heartbeat(&self) -> Duration {
+        self.timing.heartbeat.get()
     }
 
     pub fn quorum(&self) -> usize {
@@ -60,12 +90,12 @@ impl Settings {
     /// anywhere: covers clock rate differences and a write that started
     /// just before the deadline.
     pub fn margin(&self) -> Duration {
-        (self.lease / 10).max(Duration::from_millis(50))
+        margin_for(self.lease())
     }
 
     /// How long one attempt waits for votes.
     pub fn request_timeout(&self) -> Duration {
-        (self.heartbeat * 2).clamp(Duration::from_millis(200), Duration::from_secs(2))
+        (self.heartbeat() * 2).clamp(Duration::from_millis(200), Duration::from_secs(2))
     }
 
     pub fn provisional_ttl(&self) -> Duration {
@@ -73,7 +103,7 @@ impl Settings {
     }
 
     pub fn renew_every(&self) -> Duration {
-        self.lease / 3
+        self.lease() / 3
     }
 }
 
@@ -103,6 +133,10 @@ impl LockError {
 struct Renewal {
     req: u64,
     sent: Instant,
+    /// The lease asked for in this round: voters extend by this much, so
+    /// the holder must not count on more, even if a reload changed
+    /// `lock_lease_timeout` since.
+    lease: Duration,
     acks: BTreeSet<NodeId>,
 }
 
@@ -153,6 +187,9 @@ struct Pending {
     key: Key,
     attempt: Attempt,
     confirm_sent: Option<Instant>,
+    /// The lease asked for in every confirm of this attempt (fixed when it
+    /// starts, so a reload cannot change it halfway).
+    lease: Duration,
     file: Option<FileCtx>,
     /// Versions reported by granting voters.
     known: Vec<VersionInfo>,
@@ -229,6 +266,8 @@ struct Inner {
     st: Mutex<State>,
     cv: Condvar,
     stop: AtomicBool,
+    /// Set by a reload: the renewer recomputes its schedule.
+    retime: AtomicBool,
     renewer: Mutex<Option<std::thread::JoinHandle<()>>>,
     chain: std::sync::OnceLock<Chain>,
 }
@@ -269,7 +308,7 @@ impl LockManager {
         versions: Arc<Mutex<VersionTable>>,
     ) -> LockManager {
         let epoch = Instant::now();
-        let lease_ms = s.lease.as_millis() as u64;
+        let lease_ms = s.lease().as_millis() as u64;
         let voter = Voter::new(
             // Grants nothing for one lease after start: see the README.
             lease_ms,
@@ -297,6 +336,7 @@ impl LockManager {
             }),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
+            retime: AtomicBool::new(false),
             renewer: Mutex::new(None),
             chain: std::sync::OnceLock::new(),
         });
@@ -320,14 +360,31 @@ impl LockManager {
             "locks: {} members, quorum {}, lease {:?}, granting from {:?} after start",
             inner.s.members.len(),
             inner.s.quorum(),
-            inner.s.lease,
-            inner.s.lease
+            inner.s.lease(),
+            inner.s.lease()
         );
         LockManager { inner }
     }
 
     pub fn settings(&self) -> &Settings {
         &self.inner.s
+    }
+
+    /// Applies new timings from a configuration reload. Nothing in flight
+    /// is disturbed: held leases keep their deadlines, attempts and
+    /// renewal rounds already sent keep the lease they asked for, and the
+    /// next request, renewal and vote use the new values.
+    pub fn set_timings(&self, lease: Duration, wait: Duration, heartbeat: Duration) {
+        let inner = &self.inner;
+        inner.s.timing.lease.set(lease);
+        inner.s.timing.wait.set(wait);
+        inner.s.timing.heartbeat.set(heartbeat);
+        let mut st = lock(&inner.st);
+        st.voter
+            .set_provisional_ttl(inner.s.provisional_ttl().as_millis() as u64);
+        inner.retime.store(true, Ordering::SeqCst);
+        drop(st);
+        inner.cv.notify_all();
     }
 
     /// Turns on lock handoff (mount nodes, once replication runs).
@@ -545,7 +602,7 @@ impl Inner {
     }
 
     fn lease_ms(&self) -> u64 {
-        ms(self.s.lease)
+        ms(self.s.lease())
     }
 
     fn broadcast(&self, q: &mut Queue, mut f: impl FnMut(NodeId) -> Message) {
@@ -781,13 +838,13 @@ impl Inner {
             }
             Message::LockRenewed { req, .. } => {
                 let quorum = self.s.quorum();
-                let extend = self.s.lease.saturating_sub(self.s.margin());
                 for (key, h) in st.held.iter_mut() {
                     let Some(r) = h.renewal.as_mut().filter(|r| r.req == req) else {
                         continue;
                     };
                     r.acks.insert(from);
                     if r.acks.len() >= quorum {
+                        let extend = r.lease.saturating_sub(margin_for(r.lease));
                         h.valid_until = h.valid_until.max(r.sent + extend);
                         audit::record(Event::Renew, self.s.me, key, h.ballot, Some(h.valid_until));
                         h.renewal = None;
@@ -848,7 +905,7 @@ impl Inner {
                     req,
                     key: p.key.as_bytes().to_vec(),
                     ballot: p.attempt.ballot,
-                    lease_ms: self.lease_ms(),
+                    lease_ms: ms(p.lease),
                     version,
                 },
             ));
@@ -866,7 +923,7 @@ impl Inner {
         fail_on_held: bool,
         mut file: Option<FileCtx>,
     ) -> Result<Acquired, LockError> {
-        let deadline = Instant::now() + self.s.wait;
+        let deadline = Instant::now() + self.s.wait();
         let mut st = lock(&self.st);
         // Re-acquiring a lapsed lock continues its session and version.
         let mut reuse = None;
@@ -1059,6 +1116,7 @@ impl Inner {
                     key: key.clone(),
                     attempt,
                     confirm_sent: None,
+                    lease: self.s.lease(),
                     file,
                     known: Vec::new(),
                     after: BTreeMap::new(),
@@ -1107,7 +1165,7 @@ impl Inner {
             let p = st.pending.remove(&req).expect("pending attempt");
             if p.attempt.phase == Phase::Acquired {
                 let sent = p.confirm_sent.expect("confirmed attempts sent confirms");
-                let valid = sent + self.s.lease.saturating_sub(self.s.margin());
+                let valid = sent + p.lease.saturating_sub(margin_for(p.lease));
                 let after = p.after.into_iter().collect();
                 return (st, Ok((req, valid, p.known, p.announce, after)));
             }
@@ -1245,9 +1303,11 @@ impl Inner {
                 st.counters.lapsed += 1;
             }
             let h = st.held.get_mut(&key).expect("held");
+            let lease = self.s.lease();
             h.renewal = Some(Renewal {
                 req,
                 sent: now,
+                lease,
                 acks: BTreeSet::new(),
             });
             let ballot = h.ballot;
@@ -1255,7 +1315,7 @@ impl Inner {
                 req,
                 key: key.as_bytes().to_vec(),
                 ballot,
-                lease_ms: ms(self.s.lease),
+                lease_ms: ms(lease),
             });
         }
         let out = self.pump(&mut st, q);
@@ -1298,8 +1358,8 @@ impl Inner {
             .collect();
         json!({
             "implemented": true,
-            "lease_timeout": humantime::format_duration(self.s.lease).to_string(),
-            "lock_wait": humantime::format_duration(self.s.wait).to_string(),
+            "lease_timeout": humantime::format_duration(self.s.lease()).to_string(),
+            "lock_wait": humantime::format_duration(self.s.wait()).to_string(),
             "quorum": self.s.quorum(),
             "members": self.s.members,
             "grants_after_ms": st.voter.quarantine_until().saturating_sub(now_ms),
@@ -1321,6 +1381,11 @@ fn renew_loop(weak: Weak<Inner>) {
         if inner.stop.load(Ordering::SeqCst) {
             return;
         }
+        if inner.retime.swap(false, Ordering::SeqCst) {
+            // A reload changed the lease: renew no later than the new
+            // schedule asks for.
+            next_renew = next_renew.min(Instant::now() + inner.s.renew_every());
+        }
         if Instant::now() >= next_renew {
             inner.renew_all();
             next_renew = Instant::now() + inner.s.renew_every();
@@ -1328,15 +1393,15 @@ fn renew_loop(weak: Weak<Inner>) {
         // During the start-up grace, probe for a cold start every heartbeat.
         let quarantined = inner.probe_fresh();
         let every = if quarantined {
-            inner.s.heartbeat.min(inner.s.renew_every())
+            inner.s.heartbeat().min(inner.s.renew_every())
         } else {
             next_renew.saturating_duration_since(Instant::now())
         };
         // Wait for the next round, waking early on shutdown.
         let st = lock(&inner.st);
-        let _ = inner
-            .cv
-            .wait_timeout_while(st, every, |_| !inner.stop.load(Ordering::SeqCst));
+        let _ = inner.cv.wait_timeout_while(st, every, |_| {
+            !inner.stop.load(Ordering::SeqCst) && !inner.retime.load(Ordering::SeqCst)
+        });
     }
 }
 

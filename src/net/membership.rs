@@ -38,7 +38,7 @@ use serde_json::json;
 
 use super::handshake::{self, HandshakeError, Identity};
 use super::wire::{self, Heartbeat, Lane, Message, Role, Welcome, MAX_FRAME_LEN};
-use crate::config::{Config, NodeId};
+use crate::config::{Config, LiveDuration, NodeId};
 use crate::status::{FnProvider, Provider};
 
 /// A peer silent for this many heartbeat intervals is considered down.
@@ -164,8 +164,9 @@ struct Slot {
 struct Shared {
     me: Identity,
     self_address: String,
-    heartbeat: Duration,
-    down_after: Duration,
+    /// `heartbeat_interval`; a reload can change it
+    /// ([`Network::set_heartbeat`]).
+    heartbeat: LiveDuration,
     quorum: usize,
     cluster_size: usize,
     /// Other members, sorted by id.
@@ -252,8 +253,7 @@ impl Network {
         let shared = Arc::new(Shared {
             me,
             self_address,
-            heartbeat,
-            down_after: heartbeat * DOWN_AFTER_HEARTBEATS,
+            heartbeat: LiveDuration::new(heartbeat),
             quorum: cfg.quorum(),
             cluster_size: cfg.cluster_size(),
             slots,
@@ -386,7 +386,7 @@ impl Network {
                 return false;
             }
             // Wake on changes, and at least every heartbeat (ages move).
-            let wait = (deadline - now).min(self.shared.heartbeat);
+            let wait = (deadline - now).min(self.shared.heartbeat.get());
             epoch = self
                 .shared
                 .changed
@@ -403,6 +403,26 @@ impl Network {
     }
 
     /// Says goodbye to every peer and stops reconnecting.
+    /// Applies a new `heartbeat_interval` from a configuration reload.
+    /// Connections stay up: every writer sends its next heartbeat on the
+    /// new schedule, and the read and write timeouts of open connections
+    /// (the down detection) move to the new value at once.
+    pub fn set_heartbeat(&self, heartbeat: Duration) {
+        let sh = &self.shared;
+        sh.heartbeat.set(heartbeat);
+        let down_after = Some(sh.down_after());
+        for slot in &sh.slots {
+            let i = lock(&slot.info);
+            for c in [&i.conn, &i.lane].into_iter().flatten() {
+                // The reader and writer share the socket, and with it its
+                // timeouts.
+                let _ = c.stream.set_read_timeout(down_after);
+                let _ = c.stream.set_write_timeout(down_after);
+            }
+        }
+        sh.notify();
+    }
+
     pub fn shutdown(&self) {
         let sh = &self.shared;
         if sh.stopping.swap(true, Ordering::SeqCst) {
@@ -460,8 +480,8 @@ impl Network {
                 "node_id": sh.me.node_id,
                 "protocol_version": wire::PROTOCOL_VERSION,
                 "listen": net.listen.map(|a| a.to_string()),
-                "heartbeat_ms": sh.heartbeat.as_millis() as u64,
-                "down_after_ms": sh.down_after.as_millis() as u64,
+                "heartbeat_ms": sh.heartbeat.get().as_millis() as u64,
+                "down_after_ms": sh.down_after().as_millis() as u64,
                 "cluster_size": snap.cluster_size,
                 "quorum": snap.quorum,
                 "reachable": snap.reachable,
@@ -475,6 +495,12 @@ impl Network {
 }
 
 impl Shared {
+    /// Silence after which a peer counts as down (the read timeout of
+    /// every connection).
+    fn down_after(&self) -> Duration {
+        self.heartbeat.get() * DOWN_AFTER_HEARTBEATS
+    }
+
     fn notify(&self) {
         *lock(&self.epoch) += 1;
         self.changed.notify_all();
@@ -685,10 +711,11 @@ fn connect_lane(
 
 fn dial_loop(sh: Arc<Shared>, index: usize) {
     let slot = &sh.slots[index];
-    let (initial, cap) = backoff_bounds(sh.heartbeat);
-    let mut backoff = initial;
+    let mut backoff = backoff_bounds(sh.heartbeat.get()).0;
     let mut rng = random_u64() | 1;
     while !sh.stopping() {
+        // Recomputed every round: a reload may change the heartbeat.
+        let (initial, cap) = backoff_bounds(sh.heartbeat.get());
         // `connecting` until the first attempt ends; afterwards retries keep
         // the down/rejected state (and its age) until one succeeds.
         if lock(&slot.info).state == PeerState::Unknown {
@@ -757,8 +784,8 @@ fn run_session(
     let (Ok(writer), Ok(handle)) = (stream.try_clone(), stream.try_clone()) else {
         return;
     };
-    let _ = stream.set_read_timeout(Some(sh.down_after));
-    let _ = writer.set_write_timeout(Some(sh.down_after));
+    let _ = stream.set_read_timeout(Some(sh.down_after()));
+    let _ = writer.set_write_timeout(Some(sh.down_after()));
     let (tx, rx) = mpsc::channel();
     let bulk = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let wbulk = Arc::clone(&bulk);
@@ -884,8 +911,8 @@ fn run_lane(sh: &Arc<Shared>, slot: &Slot, stream: TcpStream, session: u64) {
     let (Ok(writer), Ok(handle)) = (stream.try_clone(), stream.try_clone()) else {
         return;
     };
-    let _ = stream.set_read_timeout(Some(sh.down_after));
-    let _ = writer.set_write_timeout(Some(sh.down_after));
+    let _ = stream.set_read_timeout(Some(sh.down_after()));
+    let _ = writer.set_write_timeout(Some(sh.down_after()));
     let (tx, rx) = mpsc::channel();
     let bulk = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let lane_id = sh.next_session.fetch_add(1, Ordering::Relaxed);
@@ -989,7 +1016,7 @@ fn write_loop(
     loop {
         let now = Instant::now();
         let out = if now >= next_beat {
-            next_beat = now + sh.heartbeat;
+            next_beat = now + sh.heartbeat.get();
             seq += 1;
             Out::Msg(Message::Heartbeat(Heartbeat {
                 seq,

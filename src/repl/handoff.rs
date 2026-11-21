@@ -20,7 +20,7 @@ impl Repl {
     /// also when nobody connected has them (the holder is gone; the lock
     /// goes ahead without them, as the freshness check's fallback does).
     pub(crate) fn wait_applied(&self, after: &[(NodeId, u64)]) -> bool {
-        let deadline = Instant::now() + self.freshness_timeout;
+        let deadline = Instant::now() + self.freshness_timeout.get();
         let mut waited = false;
         let mut st = self.state();
         loop {

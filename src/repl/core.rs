@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::config::{Config, NodeId};
+use crate::config::{Config, LiveDuration, NodeId};
 use crate::fs::{AttrChange, Mutation};
 use crate::lock::LockManager;
 use crate::net::wire::{Entry, FileId, Message, Version};
@@ -164,7 +164,8 @@ pub struct Repl {
     pub(crate) disk: u64,
     pub(crate) block_size: u64,
     pub(crate) peers: Vec<NodeId>,
-    pub(crate) freshness_timeout: Duration,
+    /// A reload can change it ([`Repl::set_timings`]).
+    pub(crate) freshness_timeout: LiveDuration,
     pub(crate) backing: Backing,
     pub(crate) st: Mutex<State>,
     pub(crate) cv: Condvar,
@@ -195,7 +196,7 @@ pub struct Repl {
     pub(crate) gate: Mutex<super::rejoin::Gate>,
     /// A pause of this process longer than this (the peers' down timeout)
     /// makes changes wait (see `rejoin`).
-    pub(crate) pause_limit: Duration,
+    pub(crate) pause_limit: LiveDuration,
     pub(crate) rebuild: Mutex<super::rebuild::Rebuild>,
     this: std::sync::OnceLock<Weak<Repl>>,
     /// Drops the kernel's cached attributes and data of a backing file.
@@ -335,7 +336,7 @@ impl Repl {
             disk,
             block_size: cfg.block_size.0,
             peers,
-            freshness_timeout: cfg.freshness_timeout.get(),
+            freshness_timeout: LiveDuration::new(cfg.freshness_timeout.get()),
             backing: Backing::open(backing_dir)?,
             st: Mutex::new(State {
                 index,
@@ -376,8 +377,7 @@ impl Repl {
             ),
             reconcile_lock: Mutex::new(()),
             gate: Mutex::new(Default::default()),
-            pause_limit: cfg.heartbeat_interval.get()
-                * crate::net::membership::DOWN_AFTER_HEARTBEATS,
+            pause_limit: LiveDuration::new(pause_limit(cfg.heartbeat_interval.get())),
             rebuild: Mutex::new(super::rebuild::Rebuild {
                 cause: rebuild,
                 marker: rebuild.map(|_| super::marker::Marker {
@@ -441,10 +441,10 @@ impl Repl {
     /// started (the invalidations go through a thread of their own).
     pub fn wait_invalidated(&self) {
         if let Some(f) = self.inval_barrier.get() {
-            if !f(self.freshness_timeout) {
+            if !f(self.freshness_timeout.get()) {
                 log::warn!(
                     "replication: kernel cache invalidations still pending after {}",
-                    humantime::format_duration(self.freshness_timeout)
+                    humantime::format_duration(self.freshness_timeout.get())
                 );
             }
         }
@@ -1015,6 +1015,15 @@ impl Repl {
         }
     }
 
+    /// Applies new timings from a configuration reload: waits that start
+    /// from now on use the new `freshness_timeout`, and a gap in the
+    /// replication tick counts as a pause after the new number of
+    /// heartbeats. Waits already running keep their deadline.
+    pub fn set_timings(&self, freshness_timeout: Duration, heartbeat: Duration) {
+        self.freshness_timeout.set(freshness_timeout);
+        self.pause_limit.set(pause_limit(heartbeat));
+    }
+
     /// Stops the service after a final flush, marking a clean stop.
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -1114,7 +1123,7 @@ impl Repl {
             "rejoining": !self.rejoined.load(Ordering::Relaxed) || reconnect_wait,
             "rebuild": rebuild,
             "in_sync": st.dirty.files() == 0 && !lagging && st.sessions.is_empty(),
-            "freshness_timeout": humantime::format_duration(self.freshness_timeout).to_string(),
+            "freshness_timeout": humantime::format_duration(self.freshness_timeout.get()).to_string(),
             "store_commits": self.flusher.store().commits(),
             "store_failures": self.flusher.failures(),
             "versions": versions,
@@ -1132,4 +1141,10 @@ impl Repl {
             holders,
         });
     }
+}
+
+/// A gap in the replication tick longer than this means the process was
+/// paused long enough for its peers to call it down.
+fn pause_limit(heartbeat: Duration) -> Duration {
+    heartbeat * crate::net::membership::DOWN_AFTER_HEARTBEATS
 }

@@ -57,6 +57,11 @@ impl Voter {
         }
     }
 
+    /// Changes the lifetime of provisional grants made from now on.
+    pub fn set_provisional_ttl(&mut self, prov_ttl: u64) {
+        self.prov_ttl = prov_ttl;
+    }
+
     pub fn grants(&self) -> &[Grant] {
         &self.grants
     }

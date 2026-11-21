@@ -122,7 +122,7 @@ impl Repl {
     /// overdue counts: the ticker has not run since the pause).
     fn pause_since_pass(&self) -> Option<Instant> {
         let g = lock(&self.gate);
-        if g.tick.elapsed() > self.pause_limit {
+        if g.tick.elapsed() > self.pause_limit.get() {
             return Some(Instant::now());
         }
         g.paused.filter(|p| *p > g.passed_at)
@@ -131,7 +131,7 @@ impl Repl {
     /// Before a local change: waits as the module docs say.
     pub fn rejoin_gate(&self) {
         if !self.rejoined.load(Ordering::Acquire) {
-            if Instant::now() < self.started + self.freshness_timeout {
+            if Instant::now() < self.started + self.freshness_timeout.get() {
                 self.start_gate();
                 return;
             }
@@ -154,7 +154,8 @@ impl Repl {
                 g.noticed = None;
                 return;
             }
-            *g.noticed.get_or_insert_with(Instant::now) + RECONNECT_WAIT.min(self.freshness_timeout)
+            *g.noticed.get_or_insert_with(Instant::now)
+                + RECONNECT_WAIT.min(self.freshness_timeout.get())
         };
         let mut waited = false;
         loop {
@@ -197,8 +198,8 @@ impl Repl {
 
     /// The first change after the start (see the module docs).
     fn start_gate(&self) {
-        let deadline = (self.started + self.freshness_timeout)
-            .max(Instant::now() + RECONNECT_WAIT.min(self.freshness_timeout));
+        let deadline = (self.started + self.freshness_timeout.get())
+            .max(Instant::now() + RECONNECT_WAIT.min(self.freshness_timeout.get()));
         let mut waited = false;
         loop {
             let pause = self.pause_since_pass();
@@ -211,7 +212,7 @@ impl Repl {
             if Instant::now() >= deadline || self.stopping() {
                 log::warn!(
                     "rejoin: not caught up with any data peer within {}; taking changes anyway",
-                    humantime::format_duration(self.freshness_timeout)
+                    humantime::format_duration(self.freshness_timeout.get())
                 );
                 break;
             }
@@ -238,7 +239,7 @@ pub(crate) fn ticker(weak: Weak<Repl>) {
         }
         let now = Instant::now();
         let mut g = lock(&r.gate);
-        if now - g.tick > r.pause_limit {
+        if now - g.tick > r.pause_limit.get() {
             log::info!(
                 "rejoin: this process did not run for {} ms",
                 (now - g.tick).as_millis()

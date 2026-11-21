@@ -463,3 +463,54 @@ fn grants_carry_versions_and_sessions_announce_theirs() {
     nodes[2].locks.release(&k("f"));
     shutdown(&nodes);
 }
+
+/// A reload (`mount -o remount`, SIGHUP) changes the lock timings live:
+/// a lock held across the change stays held and keeps being renewed, the
+/// connections stay up, and new requests use the new values.
+#[test]
+fn live_timing_change_keeps_locks_and_connections() {
+    let nodes = cluster(3, "0s");
+    let (a, b) = (&nodes[0].locks, &nodes[1].locks);
+    a.acquire(&k("f")).unwrap();
+    let connects = |n: &Node| n.net.provider().render()["peers"].to_string();
+    let before: Vec<String> = nodes.iter().map(connects).collect();
+    for n in &nodes {
+        n.locks.set_timings(
+            Duration::from_secs(2),
+            Duration::from_millis(700),
+            Duration::from_millis(200),
+        );
+        n.net.set_heartbeat(Duration::from_millis(200));
+    }
+    let v = a.provider().render();
+    assert_eq!(v["lease_timeout"], "2s", "{v:#}");
+    assert_eq!(v["lock_wait"], "700ms", "{v:#}");
+    let p = nodes[0].net.provider().render();
+    assert_eq!(p["heartbeat_ms"], 200, "{p:#}");
+    assert_eq!(p["down_after_ms"], 600, "{p:#}");
+    // Held across several old and new leases: renewed, never lapsed.
+    std::thread::sleep(LEASE * 3);
+    assert!(a.is_valid(&k("f")));
+    assert_eq!(a.provider().render()["counters"]["lapsed"], 0);
+    // lock_wait went from 0 (fail at once) to 700 ms.
+    let t = Instant::now();
+    assert_eq!(b.acquire(&k("f")), Err(LockError::Busy(Some(1))));
+    let waited = t.elapsed();
+    assert!(waited >= Duration::from_millis(600), "waited {waited:?}");
+    // No connection was dropped and re-made.
+    for (n, was) in nodes.iter().zip(&before) {
+        let now = connects(n);
+        let strip = |s: &str| -> serde_json::Value {
+            let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+            for p in v.as_array_mut().unwrap() {
+                let o = p.as_object_mut().unwrap();
+                o.retain(|k, _| matches!(k.as_str(), "id" | "connects" | "state" | "incarnation"));
+            }
+            v
+        };
+        assert_eq!(strip(&now), strip(was));
+    }
+    a.release(&k("f"));
+    common::wait_until("b acquires f", || b.acquire(&k("f")).is_ok());
+    shutdown(&nodes);
+}
