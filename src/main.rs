@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use syncfs::cli::Cli;
 use syncfs::config::{self, Environment, Loaded, Mode};
-use syncfs::{helper, logging, mount, voter};
+use syncfs::{helper, logging, mount, reload, voter};
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
@@ -28,6 +28,10 @@ fn run_helper(argv: Vec<OsString>) -> anyhow::Result<ExitCode> {
     if h.verbose {
         eprintln!("mount.syncfs: {cli:?}");
     }
+    if let Some(target) = h.remount {
+        let options = helper::remount_options(&h.raw_options, &helper::kernel_options_of(&target));
+        return remount(&target, options, h.sloppy, h.fake);
+    }
     if h.fake {
         load(&cli, h.sloppy)?;
         return Ok(ExitCode::SUCCESS);
@@ -35,7 +39,31 @@ fn run_helper(argv: Vec<OsString>) -> anyhow::Result<ExitCode> {
     run(&cli, h.sloppy)
 }
 
-fn load(cli: &Cli, sloppy: bool) -> anyhow::Result<Loaded> {
+/// `mount -o remount`: checks the new options, then hands them to the
+/// daemon serving `target` and signals it to reload. The outcome is only in
+/// the daemon's log; this fails only when the request cannot be made.
+fn remount(
+    target: &std::path::Path,
+    options: Vec<String>,
+    sloppy: bool,
+    fake: bool,
+) -> anyhow::Result<ExitCode> {
+    let env = Environment::current()?;
+    let target = config::absolutize(target, &env.cwd);
+    config::parse_mount_options(options.iter().map(String::as_str), &env.cwd, sloppy)?;
+    if fake {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let req = reload::Request { options, sloppy };
+    let pid = reload::request(&target, &req)?;
+    eprintln!(
+        "syncfs: asked the daemon for {} (pid {pid}) to reload; the result is in its log",
+        target.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn load(cli: &Cli, sloppy: bool) -> anyhow::Result<(Loaded, reload::Base)> {
     let env = Environment::current()?;
     let mut sources = cli.sources(&env.cwd);
     sources.sloppy = sloppy;
@@ -43,11 +71,16 @@ fn load(cli: &Cli, sloppy: bool) -> anyhow::Result<Loaded> {
     for w in &loaded.resolved.warnings {
         eprintln!("syncfs: warning: {w}");
     }
-    Ok(loaded)
+    let base = reload::Base {
+        sources,
+        env,
+        kernel_flags: loaded.kernel_flags.clone(),
+    };
+    Ok((loaded, base))
 }
 
 fn run(cli: &Cli, sloppy: bool) -> anyhow::Result<ExitCode> {
-    let loaded = load(cli, sloppy)?;
+    let (loaded, base) = load(cli, sloppy)?;
     if cli.print_config {
         print!("{}", render(&loaded)?);
         return Ok(ExitCode::SUCCESS);
@@ -56,11 +89,11 @@ fn run(cli: &Cli, sloppy: bool) -> anyhow::Result<ExitCode> {
     logging::init(cfg.log_level);
     match cfg.mode {
         Mode::Mount => {
-            mount::run(cfg, &loaded.kernel_flags)?;
+            mount::run(cfg, &loaded.kernel_flags, base)?;
             Ok(ExitCode::SUCCESS)
         }
         Mode::Daemon => {
-            voter::run(cfg)?;
+            voter::run(cfg, base)?;
             Ok(ExitCode::SUCCESS)
         }
     }

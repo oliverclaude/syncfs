@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use super::{FnProvider, Provider, Registry};
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -59,20 +59,23 @@ pub fn node(info: NodeInfo) -> Arc<dyn Provider> {
     }))
 }
 
-/// `config`: the effective configuration.
-pub fn config(config: Config) -> Arc<dyn Provider> {
-    let v = serde_json::to_value(&config).unwrap_or(Value::Null);
-    Arc::new(FnProvider::new("config", move || v.clone()))
+/// `config`: the effective configuration, as last (re)loaded.
+pub fn config(config: SharedConfig) -> Arc<dyn Provider> {
+    Arc::new(FnProvider::new("config", move || {
+        let c = config.read().unwrap_or_else(|e| e.into_inner());
+        serde_json::to_value(&*c).unwrap_or(Value::Null)
+    }))
 }
 
 /// `locks`: the whole-file lock table (step 5).
 /// `locks` on a standalone node, which takes no locks.
-pub fn locks(config: Config) -> Arc<dyn Provider> {
+pub fn locks(config: SharedConfig) -> Arc<dyn Provider> {
     Arc::new(FnProvider::new("locks", move || {
+        let c = config.read().unwrap_or_else(|e| e.into_inner());
         json!({
             "implemented": true,
             "standalone": true,
-            "lease_timeout": config.lock_lease_timeout.to_string(),
+            "lease_timeout": c.lock_lease_timeout.to_string(),
             "held": 0,
             "locks": [],
         })
@@ -97,6 +100,7 @@ pub fn replication(config: Config) -> Arc<dyn Provider> {
 
 /// Registers the built-in providers in file order. `stats` comes from the
 /// filesystem (absent in daemon mode) and `peers` from the network.
+/// Returns the configuration shown in `config`, for reloads to update.
 pub fn register_builtin(
     registry: &Registry,
     info: NodeInfo,
@@ -104,14 +108,16 @@ pub fn register_builtin(
     peers: Arc<dyn Provider>,
     locks_provider: Option<Arc<dyn Provider>>,
     replication_provider: Option<Arc<dyn Provider>>,
-) {
+) -> SharedConfig {
     let cfg = info.config.clone();
+    let shown: SharedConfig = Arc::new(std::sync::RwLock::new(cfg.clone()));
     registry.register(node(info));
-    registry.register(config(cfg.clone()));
+    registry.register(config(Arc::clone(&shown)));
     if let Some(stats) = stats {
         registry.register(stats);
     }
     registry.register(peers);
-    registry.register(locks_provider.unwrap_or_else(|| locks(cfg.clone())));
+    registry.register(locks_provider.unwrap_or_else(|| locks(Arc::clone(&shown))));
     registry.register(replication_provider.unwrap_or_else(|| replication(cfg)));
+    shown
 }

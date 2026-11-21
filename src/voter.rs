@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::lock::{LockManager, Settings};
 use crate::net::Network;
 use crate::process;
+use crate::reload::{self, Registration, Reloader};
 use crate::repl::store::{Flusher, Store};
 use crate::repl::version;
 use crate::status::{providers, FnProvider, Registry};
@@ -28,7 +29,9 @@ pub fn status_path(cfg: &Config) -> PathBuf {
     cfg.state_dir.join("status.json")
 }
 
-pub fn run(cfg: &Config) -> anyhow::Result<()> {
+/// Runs the voter until SIGINT or SIGTERM; SIGHUP reloads the
+/// configuration (see [`crate::reload`]).
+pub fn run(cfg: &Config, base: reload::Base) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("creating state_dir {}", cfg.state_dir.display()))?;
     if cfg.peers.is_empty() {
@@ -40,6 +43,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
         LockManager,
         Arc<Flusher>,
         std::thread::JoinHandle<()>,
+        Reloader,
     );
     let start = || -> anyhow::Result<Running> {
         let store = Store::open(&cfg.state_dir)
@@ -56,7 +60,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
             mount_options: Vec::new(),
             shadowed_backing_entry: false,
         };
-        providers::register_builtin(
+        let shown = providers::register_builtin(
             &status,
             info,
             None,
@@ -71,15 +75,26 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
             }))),
         );
         log::info!("voter node {} running", cfg.node_id);
-        Ok((net, status, locks, flusher, flush_thread))
+        let reloader = Reloader::new(
+            base,
+            cfg.clone(),
+            reload::Targets {
+                net: Some(net.clone()),
+                locks: Some(locks.clone()),
+                repl: None,
+                shown: Some(shown),
+            },
+        );
+        Ok((net, status, locks, flusher, flush_thread, reloader))
     };
     let path = status_path(cfg);
-    let every = cfg.heartbeat_interval.get() * 5;
     process::run(
         cfg.foreground,
         start,
-        move |(net, status, locks, flusher, flush_thread), signals| {
-            let res = serve(&net, &status, &path, every, signals);
+        move |(net, status, locks, flusher, flush_thread, reloader), signals| {
+            let registration = Registration::new(cfg);
+            let res = serve(&net, &status, &path, reloader, signals);
+            drop(registration);
             locks.shutdown();
             flusher.stop();
             let _ = flush_thread.join();
@@ -101,7 +116,7 @@ fn serve(
     net: &Network,
     status: &Arc<Registry>,
     path: &Path,
-    every: std::time::Duration,
+    mut reloader: Reloader,
     mut signals: Signals,
 ) -> anyhow::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -117,12 +132,19 @@ fn serve(
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     write_status(&status, &path);
-                    net.wait_change(every);
+                    // Every 5 heartbeats, as they are now (a reload may
+                    // change them).
+                    net.wait_change(net.heartbeat() * 5);
                 }
             })?
     };
-    if let Some(sig) = signals.forever().next() {
+    for sig in signals.forever() {
+        if sig == signal_hook::consts::SIGHUP {
+            reloader.reload();
+            continue;
+        }
         log::info!("signal {sig}: shutting down");
+        break;
     }
     stop.store(true, Ordering::SeqCst);
     net.shutdown();

@@ -17,7 +17,13 @@ use crate::config::{
     version,
     about = "Replicating FUSE filesystem",
     after_help = "Precedence: built-in defaults < YAML config file < -o options < command-line flags.\n\
-                  Example: syncfs /srv/data /mnt/data -o node_id=2,allow_other --print-config"
+                  Example: syncfs /srv/data /mnt/data -o node_id=2,allow_other --print-config\n\
+                  \n\
+                  Signals: SIGINT and SIGTERM unmount (or stop a daemon); SIGHUP reloads the\n\
+                  configuration in place (systemctl reload). `mount -o remount,OPTIONS MOUNTPOINT`\n\
+                  reloads with new -o options. Only log_level, lock_wait, freshness_timeout,\n\
+                  lock_lease_timeout and heartbeat_interval can change (the last two on every node);\n\
+                  a reload changing any other setting is refused. The outcome is in the log."
 )]
 pub struct Cli {
     /// Local backing directory (this node's source of truth). Mount mode only.

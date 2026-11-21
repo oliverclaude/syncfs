@@ -34,6 +34,34 @@ pub struct PartialConfig {
 }
 
 impl PartialConfig {
+    /// The names of the settings this layer sets, in field order.
+    pub fn set_fields(&self) -> Vec<&'static str> {
+        let set = [
+            ("cluster_name", self.cluster_name.is_some()),
+            ("node_id", self.node_id.is_some()),
+            ("mode", self.mode.is_some()),
+            ("listen", self.listen.is_some()),
+            ("peers", self.peers.is_some()),
+            ("backing_dir", self.backing_dir.is_some()),
+            ("mountpoint", self.mountpoint.is_some()),
+            ("state_dir", self.state_dir.is_some()),
+            ("lock_lease_timeout", self.lock_lease_timeout.is_some()),
+            ("lock_wait", self.lock_wait.is_some()),
+            ("freshness_timeout", self.freshness_timeout.is_some()),
+            ("heartbeat_interval", self.heartbeat_interval.is_some()),
+            ("block_size", self.block_size.is_some()),
+            ("debug", self.debug.is_some()),
+            ("allow_other", self.allow_other.is_some()),
+            ("allow_root", self.allow_root.is_some()),
+            ("log_level", self.log_level.is_some()),
+            ("foreground", self.foreground.is_some()),
+        ];
+        set.into_iter()
+            .filter(|(_, s)| *s)
+            .map(|(n, _)| n)
+            .collect()
+    }
+
     /// Returns `self` with every field that `upper` sets replaced by
     /// `upper`'s value. Lists (`peers`) are replaced as a whole, not merged.
     #[must_use]

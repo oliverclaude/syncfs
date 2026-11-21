@@ -5,8 +5,27 @@
 //! backing directory; a SOURCE without a `/` (e.g. `syncfs`) is just a label
 //! and the backing directory comes from the config file or `-o
 //! backing_dir=`.
+//!
+//! `mount -o remount[,OPTIONS] MOUNTPOINT` runs the helper with `remount`
+//! among the options; it then asks the running daemon to reload (see
+//! [`crate::reload`]) instead of mounting. util-linux 2.41 (Debian 13)
+//! passes:
+//! - with an fstab entry: `mount.syncfs SOURCE MOUNTPOINT -o
+//!   rw,FSTAB_OPTIONS,remount,NEW_OPTIONS`;
+//! - without one: `mount.fuse.syncfs SOURCE MOUNTPOINT -o
+//!   KERNEL_OPTIONS,remount,NEW_OPTIONS`, where KERNEL_OPTIONS is the
+//!   kernel's view of the mount (`rw,nosuid,nodev,relatime,user_id=0,
+//!   group_id=0,default_permissions,allow_other`);
+//!
+//! plus `-f` for `mount -f` and `-s` for `mount -s`. Options before
+//! `remount` that the kernel already shows for the mount are dropped
+//! ([`remount_options`]): they describe it as it is, and FUSE's own
+//! (`user_id=` ...) mean nothing to syncfs. A remount never calls mount(2),
+//! so the kernel mount is left exactly as it is.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use anyhow::bail;
 
@@ -21,6 +40,10 @@ pub struct HelperArgs {
     pub fake: bool,
     /// `-v`.
     pub verbose: bool,
+    /// `remount` was among the options: the mountpoint to reload.
+    pub remount: Option<PathBuf>,
+    /// All `-o` groups as given (for [`remount_options`]).
+    pub raw_options: Vec<String>,
 }
 
 /// Parses the helper command line (without argv0).
@@ -63,6 +86,18 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> anyhow::Result<HelperA
             p.len()
         )
     })?;
+    out.raw_options = options
+        .iter()
+        .map(|o| o.to_string_lossy().into_owned())
+        .collect();
+    if out
+        .raw_options
+        .iter()
+        .flat_map(|g| g.split(','))
+        .any(|o| o.trim() == "remount")
+    {
+        out.remount = Some(PathBuf::from(&mountpoint));
+    }
     if source.as_encoded_bytes().contains(&b'/') {
         out.args.push(source);
         out.args.push(mountpoint);
@@ -75,6 +110,80 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> anyhow::Result<HelperA
         out.args.push(o);
     }
     Ok(out)
+}
+
+/// The options a remount asks for: everything after `remount`, and the
+/// options before it that `current` (the kernel's options for the mount)
+/// does not show. Returned as one comma-separated group (empty if none).
+pub fn remount_options(groups: &[String], current: &HashSet<String>) -> Vec<String> {
+    let mut seen = false;
+    let mut keep = Vec::new();
+    for o in groups.iter().flat_map(|g| g.split(',')).map(str::trim) {
+        if o.is_empty() {
+            continue;
+        }
+        if o == "remount" {
+            seen = true;
+            continue;
+        }
+        if seen || !current.contains(o) {
+            keep.push(o);
+        }
+    }
+    if keep.is_empty() {
+        Vec::new()
+    } else {
+        vec![keep.join(",")]
+    }
+}
+
+/// The kernel's options for the mount at `mountpoint` (per-mount and
+/// superblock options, from `/proc/self/mountinfo`), empty if it is not
+/// mounted.
+pub fn kernel_options_of(mountpoint: &Path) -> HashSet<String> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    kernel_options_in(&info, mountpoint)
+}
+
+fn kernel_options_in(mountinfo: &str, mountpoint: &Path) -> HashSet<String> {
+    let want = mountpoint.to_string_lossy();
+    let mut found = HashSet::new();
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.len() < 6 || unescape(fields[4]) != want {
+            continue;
+        }
+        // The last match is the top of any stack of mounts.
+        found.clear();
+        found.extend(fields[5].split(',').map(String::from));
+        if let Some(sep) = fields.iter().position(|f| *f == "-") {
+            if let Some(sup) = fields.get(sep + 3) {
+                found.extend(sup.split(',').map(String::from));
+            }
+        }
+    }
+    found
+}
+
+/// Undoes mountinfo's octal escapes (`\040` for a space).
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b.get(i + 1..i + 4).filter(|d| {
+            d.iter()
+                .all(|c| (b'0'..=b'3').contains(&d[0]) && (b'0'..=b'7').contains(c))
+        });
+        if let (b'\\', Some(d)) = (b[i], octal) {
+            out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// True if the program was invoked as a mount helper.
@@ -143,6 +252,76 @@ mod tests {
             strs(&h),
             ["--mountpoint", "/mnt/sync", "-o", "config=/etc/x.yaml"]
         );
+    }
+
+    #[test]
+    fn remount_is_detected() {
+        let h = p(&["/srv/data", "/mnt/sync", "-o", "rw,remount,lock_wait=5s"]).unwrap();
+        assert_eq!(h.remount, Some(PathBuf::from("/mnt/sync")));
+        assert_eq!(h.raw_options, ["rw,remount,lock_wait=5s"]);
+        let h = p(&["/srv/data", "/mnt/sync", "-o", "rw,lock_wait=5s"]).unwrap();
+        assert_eq!(h.remount, None);
+    }
+
+    fn set(s: &[&str]) -> HashSet<String> {
+        s.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn remount_options_drop_the_kernel_view_before_remount() {
+        let kernel = set(&[
+            "rw",
+            "nosuid",
+            "nodev",
+            "relatime",
+            "user_id=0",
+            "group_id=0",
+            "default_permissions",
+            "allow_other",
+        ]);
+        // No fstab entry: the kernel's options, then remount, then new.
+        let groups = ["rw,nosuid,nodev,relatime,user_id=0,group_id=0,\
+                       default_permissions,allow_other,remount,lock_wait=20s"
+            .replace(' ', "")];
+        assert_eq!(remount_options(&groups, &kernel), ["lock_wait=20s"]);
+        // An fstab entry: its options, then remount, then new.
+        let groups = [
+            "rw,state_dir=/s,lock_wait=5s,allow_other,_netdev,remount,lock_wait=20s".to_string(),
+        ];
+        assert_eq!(
+            remount_options(&groups, &kernel),
+            ["state_dir=/s,lock_wait=5s,_netdev,lock_wait=20s"]
+        );
+        // Asked for explicitly after remount: kept (and judged by the
+        // daemon).
+        let groups = ["rw,remount,allow_other".to_string()];
+        assert_eq!(remount_options(&groups, &kernel), ["allow_other"]);
+        let groups = ["rw,nosuid,remount".to_string()];
+        assert!(remount_options(&groups, &kernel).is_empty());
+    }
+
+    #[test]
+    fn kernel_options_from_mountinfo() {
+        let info = "\
+36 25 0:32 / /mnt/a rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 25 0:45 / /mnt/my\\040sync rw,nosuid,nodev,relatime shared:2 - fuse.syncfs /srv/b rw,user_id=0,group_id=0,default_permissions,allow_other
+41 25 0:46 / /mnt/other rw shared:3 - tmpfs tmpfs rw
+";
+        let got = kernel_options_in(info, Path::new("/mnt/my sync"));
+        assert_eq!(
+            got,
+            set(&[
+                "rw",
+                "nosuid",
+                "nodev",
+                "relatime",
+                "user_id=0",
+                "group_id=0",
+                "default_permissions",
+                "allow_other"
+            ])
+        );
+        assert!(kernel_options_in(info, Path::new("/mnt/none")).is_empty());
     }
 
     #[test]

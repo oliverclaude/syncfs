@@ -1744,3 +1744,256 @@ fn daemon_upgraded_to_mount_rebuilds_from_peers() {
         std::fs::write(m3.join("new"), b"x")
     });
 }
+
+// ---------------------------------------------------------------------
+// Reloading the configuration in place (#21): `mount -o remount` and
+// SIGHUP.
+
+/// A started lock cluster whose timings come from a YAML file per node
+/// (`<dir>/syncfs.yaml`), so that `-o` options of a remount can override
+/// them (command-line flags would win over `-o`). Every node registers in
+/// `<dir>/run`.
+fn reload_cluster(kinds: &[Kind]) -> Cluster {
+    let mut c = Cluster::build(kinds, &[]);
+    for n in &mut c.nodes {
+        let yaml = n.dir.join("syncfs.yaml");
+        write_reload_yaml(&yaml, "1s");
+        let i = n.args.iter().position(|a| a == "/dev/null").unwrap();
+        n.args[i] = yaml.display().to_string();
+        n.env.push((
+            "XDG_RUNTIME_DIR".into(),
+            n.dir.join("run").display().to_string(),
+        ));
+    }
+    c.start_all();
+    c.converge("start");
+    // Voters grant nothing during their first lease.
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    c
+}
+
+fn write_reload_yaml(path: &std::path::Path, lease: &str) {
+    std::fs::write(
+        path,
+        format!("lock_lease_timeout: {lease}\nlock_wait: 0s\nfreshness_timeout: 2s\n"),
+    )
+    .unwrap();
+}
+
+impl Node {
+    /// Runs `mount.fuse.syncfs` the way mount(8) does for `mount -o
+    /// remount,OPTIONS MOUNTPOINT` without an fstab entry: the kernel's
+    /// options for the mount, `remount`, then the new ones.
+    fn remount(&self, options: &str) -> std::process::Output {
+        let helper = self.dir.join("mount.fuse.syncfs");
+        if !helper.exists() {
+            std::os::unix::fs::symlink(BIN, &helper).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        Command::new(&helper)
+            .arg(self.backing())
+            .arg(self.mnt())
+            .arg("-o")
+            .arg(format!(
+                "rw,nosuid,nodev,relatime,user_id={uid},group_id={gid},remount,{options}"
+            ))
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .output()
+            .unwrap()
+    }
+
+    fn log_text(&self) -> String {
+        std::fs::read_to_string(self.dir.join("log")).unwrap_or_default()
+    }
+
+    /// Waits until the node's log has `n` reload outcomes.
+    fn wait_reloads(&self, n: usize) -> String {
+        wait_for(&format!("node {} reload {n}", self.id), || {
+            let log = self.log_text();
+            let done = log.matches("reload: done").count()
+                + log.matches("reload refused").count()
+                + log.matches("reload failed").count()
+                + log.matches("reload: configuration unchanged").count();
+            (done >= n).then_some(log)
+        })
+    }
+}
+
+#[test]
+fn reload_remount_changes_settings_live_keeping_open_files_and_locks() {
+    require_fuse!();
+    use std::io::{Read, Seek, Write};
+    use Kind::{Daemon, Mount};
+    let mut c = reload_cluster(&[Mount, Mount, Daemon]);
+    std::fs::write(c.node(1).mnt().join("f"), b"one\n").unwrap();
+    let f1 = c.node(1).mnt().join("f");
+    let f2 = c.node(2).mnt().join("f");
+    // Node 1 holds the lock on f through an open file.
+    let mut w = open_rw(&f1).unwrap();
+    w.seek(std::io::SeekFrom::End(0)).unwrap();
+    w.write_all(b"two\n").unwrap();
+    let lock_before = c.node(1).status("locks").unwrap();
+    assert_eq!(lock_before["held"], 1, "{lock_before:#}");
+    // lock_wait 0: node 2 fails at once.
+    let t = Instant::now();
+    assert_eq!(errno(open_rw(&f2)), Some(libc::EBUSY));
+    assert!(t.elapsed() < Duration::from_millis(500));
+
+    for id in [1, 2] {
+        let out = c.node(id).remount("lock_wait=1500ms,log_level=debug");
+        assert!(out.status.success(), "{out:?}");
+        let msg = String::from_utf8_lossy(&out.stderr);
+        assert!(msg.contains("to reload"), "{msg}");
+        let log = c.node(id).wait_reloads(1);
+        assert!(log.contains("reload: lock_wait: 0s -> 1s 500ms"), "{log}");
+        assert!(log.contains("reload: log_level: info -> debug"), "{log}");
+    }
+    let n1 = c.node(1);
+    assert!(is_mounted(&n1.mnt()));
+    let cfg = n1.status("config").unwrap();
+    assert_eq!(cfg["lock_wait"], "1s 500ms", "{cfg:#}");
+    assert_eq!(cfg["log_level"], "debug", "{cfg:#}");
+    // Settings not given in the remount are still the YAML's.
+    assert_eq!(cfg["freshness_timeout"], "2s", "{cfg:#}");
+    let locks = n1.status("locks").unwrap();
+    assert_eq!(locks["lock_wait"], "1s 500ms", "{locks:#}");
+    // The same lock session, never lapsed: the remount did not touch it.
+    assert_eq!(locks["held"], 1, "{locks:#}");
+    assert_eq!(locks["locks"][0]["path"], "/f");
+    assert_eq!(
+        locks["locks"][0]["ballot"],
+        lock_before["locks"][0]["ballot"]
+    );
+    assert_eq!(locks["counters"]["lapsed"], 0, "{locks:#}");
+    // Node 2 now waits lock_wait before giving up.
+    let t = Instant::now();
+    assert_eq!(errno(open_rw(&f2)), Some(libc::EBUSY));
+    let waited = t.elapsed();
+    assert!(waited >= Duration::from_millis(1300), "waited {waited:?}");
+    // The open file still works, and closing it releases the lock.
+    w.write_all(b"three\n").unwrap();
+    drop(w);
+    let mut r = String::new();
+    std::fs::File::open(&f1)
+        .unwrap()
+        .read_to_string(&mut r)
+        .unwrap();
+    assert_eq!(r, "one\ntwo\nthree\n");
+    let w2 = eventually("node 2 opens after release", || open_rw(&f2));
+    drop(w2);
+    assert_eq!(std::fs::read(&f2).unwrap(), b"one\ntwo\nthree\n");
+    c.converge("end");
+}
+
+#[test]
+fn reload_refused_change_keeps_the_config() {
+    require_fuse!();
+    let mut c = reload_cluster(&[Kind::Mount, Kind::Mount, Kind::Daemon]);
+    let n1 = c.node(1);
+    // Mixed with an allowed change: all or nothing.
+    let out = n1.remount("lock_wait=3s,block_size=128K");
+    // The helper only hands the request over; the refusal is in the log.
+    assert!(out.status.success(), "{out:?}");
+    let log = n1.wait_reloads(1);
+    assert!(log.contains("reload refused, nothing changed"), "{log}");
+    assert!(log.contains("block_size: 64KiB -> 128KiB"), "{log}");
+    assert!(!log.contains("reload: lock_wait"), "{log}");
+    let cfg = n1.status("config").unwrap();
+    assert_eq!(cfg["block_size"], "64KiB", "{cfg:#}");
+    assert_eq!(cfg["lock_wait"], "0s", "{cfg:#}");
+    // cluster_name was given as a command-line flag, which wins over -o:
+    // the remount cannot change it, and says so.
+    let out = n1.remount("cluster_name=other");
+    assert!(out.status.success(), "{out:?}");
+    let log = n1.wait_reloads(2);
+    assert!(
+        log.contains("cluster_name from mount -o cannot take effect"),
+        "{log}"
+    );
+    assert_eq!(n1.status("config").unwrap()["cluster_name"], "test");
+    // A refused remount is not remembered: a plain SIGHUP afterwards
+    // changes nothing.
+    n1.signal(libc::SIGHUP);
+    let log = n1.wait_reloads(3);
+    assert!(log.contains("reload: configuration unchanged"), "{log}");
+    // Bad option syntax fails in the helper, before the daemon is asked.
+    let out = n1.remount("lock_wait=soon");
+    assert!(!out.status.success(), "{out:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        n1.log_text().matches("reload: ").count(),
+        log.matches("reload: ").count()
+    );
+    // No daemon at that mountpoint: the helper fails.
+    let mut out = Command::new(n1.dir.join("mount.fuse.syncfs"))
+        .arg("syncfs")
+        .arg(n1.dir.join("backing"))
+        .args(["-o", "remount,lock_wait=1s"])
+        .envs(n1.env.iter().map(|(k, v)| (k, v)))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    out.stderr.truncate(400);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no running syncfs daemon"),
+        "{out:?}"
+    );
+    assert!(is_mounted(&n1.mnt()));
+    c.converge("end");
+}
+
+/// SIGHUP (`systemctl reload`) re-reads the YAML file on mounts and voters
+/// alike, and unmounts nothing. lock_lease_timeout is cluster-wide: it
+/// changes live, with a warning, and a lock held across the change stays.
+#[test]
+fn reload_sighup_rereads_yaml_without_unmounting() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = reload_cluster(&[Mount, Mount, Daemon]);
+    std::fs::write(c.node(1).mnt().join("f"), b"x").unwrap();
+    let w = open_rw(&c.node(1).mnt().join("f")).unwrap();
+    for id in [1, 2, 3] {
+        write_reload_yaml(&c.node(id).dir.join("syncfs.yaml"), "2s");
+        c.node(id).signal(libc::SIGHUP);
+    }
+    for id in [1, 2, 3] {
+        let log = c.node(id).wait_reloads(1);
+        assert!(
+            log.contains("re-reading the configuration (SIGHUP)"),
+            "{log}"
+        );
+        assert!(
+            log.contains("reload: lock_lease_timeout: 1s -> 2s"),
+            "{log}"
+        );
+        assert!(log.contains("is cluster-wide"), "{log}");
+        assert!(!log.contains("unmounting"), "{log}");
+        assert!(c
+            .node(id)
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
+    }
+    for id in [1, 2] {
+        assert!(is_mounted(&c.node(id).mnt()));
+    }
+    // The voter shows it in status.json (written every 5 heartbeats).
+    wait_for("voter shows the new lease", || {
+        let v = c.node(3).status("locks")?;
+        (v["lease_timeout"] == "2s").then_some(())
+    });
+    // Held across the change and renewed with the new lease.
+    std::thread::sleep(Duration::from_secs(3));
+    let locks = c.node(1).status("locks").unwrap();
+    assert_eq!(locks["lease_timeout"], "2s", "{locks:#}");
+    assert_eq!(locks["locks"][0]["valid"], true, "{locks:#}");
+    assert_eq!(locks["counters"]["lapsed"], 0, "{locks:#}");
+    drop(w);
+    // SIGTERM still unmounts.
+    c.node(2).stop();
+    assert!(!is_mounted(&c.node(2).mnt()));
+}

@@ -14,6 +14,7 @@ use crate::fs::{LocalOnly, SyncFs, WriteHooks};
 use crate::lock::{ClusterHooks, LockManager, Settings};
 use crate::net::Network;
 use crate::process;
+use crate::reload::{self, Registration, Reloader};
 use crate::repl::core::Repl;
 use crate::repl::store::{Flusher, Store};
 use crate::repl::{marker, rebuild, version};
@@ -123,7 +124,7 @@ fn register_status(
     repl: Option<&Arc<Repl>>,
     cfg: &Config,
     fc: &fuser::Config,
-) {
+) -> crate::config::SharedConfig {
     let mut mount_options: Vec<String> = fc.mount_options.iter().map(option_name).collect();
     match fc.acl {
         SessionACL::All => mount_options.push("allow_other".into()),
@@ -142,7 +143,7 @@ fn register_status(
         net.provider(),
         locks.map(LockManager::provider),
         repl.map(Repl::provider),
-    );
+    )
 }
 
 fn check_dir(what: &str, p: &Path) -> anyhow::Result<()> {
@@ -173,7 +174,10 @@ fn raise_nofile_limit() {
 /// `cfg.foreground`, returns in the calling process as soon as the mount
 /// is up (or failed) and keeps serving from a detached child, as mount(8)
 /// expects from a helper.
-pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
+///
+/// SIGHUP reloads the configuration (see [`crate::reload`]); SIGINT and
+/// SIGTERM unmount.
+pub fn run(cfg: &Config, kernel_flags: &[String], base: reload::Base) -> anyhow::Result<()> {
     let (Some(backing), Some(mountpoint)) = (&cfg.backing_dir, &cfg.mountpoint) else {
         bail!("mount mode needs backing_dir and mountpoint");
     };
@@ -225,7 +229,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         if let Some(r) = &repl {
             r.set_stats(Arc::clone(fs.stats()));
         }
-        register_status(
+        let shown = register_status(
             &status,
             &fs,
             &net,
@@ -233,6 +237,16 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
             repl.as_ref(),
             cfg,
             &fuse_cfg,
+        );
+        let reloader = Reloader::new(
+            base,
+            cfg.clone(),
+            reload::Targets {
+                net: Some(net.clone()),
+                locks: locks.clone(),
+                repl: repl.clone(),
+                shown: Some(shown),
+            },
         );
         let mounted = if rustix::process::geteuid().is_root() {
             mount_direct(fs, backing, mountpoint, &fuse_cfg, kernel_flags)
@@ -244,6 +258,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
                     direct: None,
                     net: None,
                     cluster: None,
+                    reloader: None,
                 })
                 .map_err(Into::into)
         };
@@ -345,6 +360,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String]) -> anyhow::Result<()> {
         };
         served.net = Some(net);
         served.cluster = cluster;
+        served.reloader = Some(reloader);
         log::info!("serving {} at {}", backing.display(), mountpoint.display());
         Ok(served)
     };
@@ -359,6 +375,7 @@ struct Served {
     direct: Option<PathBuf>,
     net: Option<Network>,
     cluster: Option<Cluster>,
+    reloader: Option<Reloader>,
 }
 
 /// The cluster services of a mount node.
@@ -530,6 +547,7 @@ fn mount_direct(
             direct: Some(mountpoint.to_path_buf()),
             net: None,
             cluster: None,
+            reloader: None,
         }),
         Err(e) => {
             // SAFETY: valid path string.
@@ -570,7 +588,8 @@ fn fusermount_lazy(p: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Runs the session until unmounted; `signals` unmount cleanly.
+/// Runs the session until unmounted; SIGINT and SIGTERM unmount cleanly,
+/// SIGHUP reloads the configuration.
 fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
     let Served {
         mut session,
@@ -578,7 +597,10 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         direct,
         net,
         cluster,
+        reloader,
     } = served;
+    let mut reloader = reloader.expect("set once mounted");
+    let registration = Registration::new(reloader.current());
     let mut unmounter = session.unmount_callable();
     let unmounting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&unmounting);
@@ -586,7 +608,14 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         // The first signal unmounts; if the mount is busy, it keeps serving
         // and a later signal detaches it lazily (it then goes away when the
         // last open file is closed, like `umount -l`).
-        for (i, sig) in signals.forever().enumerate() {
+        let stops = signals.forever().filter(|&sig| {
+            if sig == signal_hook::consts::SIGHUP {
+                reloader.reload();
+                return false;
+            }
+            true
+        });
+        for (i, sig) in stops.enumerate() {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             let res = if i == 0 {
                 log::info!("signal {sig}: unmounting");
@@ -629,6 +658,7 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
             }
         }
     }
+    drop(registration);
     res?;
     log::info!("unmounted");
     Ok(())

@@ -1,4 +1,4 @@
-//! Process plumbing shared by mount and daemon mode: stop signals and
+//! Process plumbing shared by mount and daemon mode: signals and
 //! daemonizing.
 
 use std::io::{Read, Write};
@@ -8,9 +8,10 @@ use signal_hook::iterator::Signals;
 
 use crate::logging;
 
-/// Catches SIGINT, SIGTERM and SIGHUP. Install before the service becomes
-/// visible (mounted, listening) so an early signal is not fatal: it stays
-/// pending until the service handles it.
+/// Catches SIGINT and SIGTERM (stop) and SIGHUP (reload the configuration,
+/// see [`crate::reload`]). Install before the service becomes visible
+/// (mounted, listening) so an early signal is not fatal: it stays pending
+/// until the service handles it.
 pub fn stop_signals() -> std::io::Result<Signals> {
     Signals::new([
         signal_hook::consts::SIGINT,

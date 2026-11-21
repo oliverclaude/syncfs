@@ -403,6 +403,11 @@ impl Network {
     }
 
     /// Says goodbye to every peer and stops reconnecting.
+    /// The heartbeat interval in effect.
+    pub fn heartbeat(&self) -> Duration {
+        self.shared.heartbeat.get()
+    }
+
     /// Applies a new `heartbeat_interval` from a configuration reload.
     /// Connections stay up: every writer sends its next heartbeat on the
     /// new schedule, and the read and write timeouts of open connections
