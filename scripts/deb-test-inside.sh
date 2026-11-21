@@ -49,7 +49,7 @@ sleep 1
 grep -q '^cluster_name: syncfs' /mnt/b/.syncfs/config || fail "refused remount was applied"
 mkdir -p /srv/c /mnt/c
 mount -t syncfs /srv/c /mnt/c -o state_dir=/var/lib/syncfs/c
-mount -o remount,lock_wait=9s /mnt/c || fail "remount without an fstab entry (mount.fuse.syncfs)"
+mount -v -o remount,lock_wait=9s /mnt/c || fail "remount without an fstab entry (mount.fuse.syncfs)"
 waitfor '^lock_wait: 9s' /mnt/c/.syncfs/config || fail "remount /mnt/c not applied"
 mount -o remount,lock_wait=soon /mnt/c 2>/dev/null && fail "bad remount option accepted"
 findmnt /mnt/c >/dev/null || fail "remount unmounted /mnt/c"

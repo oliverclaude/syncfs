@@ -60,7 +60,7 @@ Version: $full
 Architecture: $arch
 Maintainer: syncfs maintainers <syncfs@users.noreply.github.com>
 Installed-Size: $size
-Depends: libc6 (>= $libc), fuse3
+Depends: libc6 (>= $libc), fuse3, procps
 Section: utils
 Priority: optional
 Homepage: https://github.com/oliverclaude/syncfs

@@ -30,6 +30,14 @@ fn run_helper(argv: Vec<OsString>) -> anyhow::Result<ExitCode> {
     }
     if let Some(target) = h.remount {
         let options = helper::remount_options(&h.raw_options, &helper::kernel_options_of(&target));
+        if h.verbose {
+            eprintln!(
+                "mount.syncfs: remount {}: -o {:?} asks for {:?}",
+                target.display(),
+                h.raw_options,
+                options
+            );
+        }
         return remount(&target, options, h.sloppy, h.fake);
     }
     if h.fake {

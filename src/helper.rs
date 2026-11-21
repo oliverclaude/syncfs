@@ -17,11 +17,12 @@
 //!   kernel's view of the mount (`rw,nosuid,nodev,relatime,user_id=0,
 //!   group_id=0,default_permissions,allow_other`);
 //!
-//! plus `-f` for `mount -f` and `-s` for `mount -s`. Options before
-//! `remount` that the kernel already shows for the mount are dropped
-//! ([`remount_options`]): they describe it as it is, and FUSE's own
-//! (`user_id=` ...) mean nothing to syncfs. A remount never calls mount(2),
-//! so the kernel mount is left exactly as it is.
+//! plus `-f` for `mount -f` and `-s` for `mount -s` (util-linux 2.38,
+//! Debian 12, passes the same). Options the kernel already shows for the
+//! mount, and FUSE's own (`user_id=` ...), are dropped
+//! ([`remount_options`]): they describe the mount as it is and mean
+//! nothing to syncfs. A remount never calls mount(2), so the kernel mount
+//! is left exactly as it is.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -112,23 +113,35 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> anyhow::Result<HelperA
     Ok(out)
 }
 
-/// The options a remount asks for: everything after `remount`, and the
-/// options before it that `current` (the kernel's options for the mount)
-/// does not show. Returned as one comma-separated group (empty if none).
+/// Options of the kernel's FUSE mount itself, which mount(8) may pass back
+/// on a remount.
+const FUSE_KERNEL_OPTIONS: &[&str] = &[
+    "user_id=",
+    "group_id=",
+    "rootmode=",
+    "fd=",
+    "max_read=",
+    "blksize=",
+    "default_permissions",
+];
+
+/// The options a remount asks for: all but `remount` itself, the options
+/// that `current` (the kernel's options for the mount) shows, and FUSE's
+/// own. Returned as one comma-separated group (empty if none).
+///
+/// The kernel's view is dropped wherever it appears, as mount(8) versions
+/// differ in where they put it; asking for what the mount already has
+/// changes nothing anyway.
 pub fn remount_options(groups: &[String], current: &HashSet<String>) -> Vec<String> {
-    let mut seen = false;
     let mut keep = Vec::new();
     for o in groups.iter().flat_map(|g| g.split(',')).map(str::trim) {
-        if o.is_empty() {
+        let fuse_own = FUSE_KERNEL_OPTIONS
+            .iter()
+            .any(|f| o == *f || (f.ends_with('=') && o.starts_with(f)));
+        if o.is_empty() || o == "remount" || fuse_own || current.contains(o) {
             continue;
         }
-        if o == "remount" {
-            seen = true;
-            continue;
-        }
-        if seen || !current.contains(o) {
-            keep.push(o);
-        }
+        keep.push(o);
     }
     if keep.is_empty() {
         Vec::new()
@@ -268,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn remount_options_drop_the_kernel_view_before_remount() {
+    fn remount_options_drop_the_kernel_view() {
         let kernel = set(&[
             "rw",
             "nosuid",
@@ -292,10 +305,19 @@ mod tests {
             remount_options(&groups, &kernel),
             ["state_dir=/s,lock_wait=5s,_netdev,lock_wait=20s"]
         );
-        // Asked for explicitly after remount: kept (and judged by the
+        // The kernel's view after remount, or not found in mountinfo at
+        // all: FUSE's own options still go.
+        let groups =
+            ["remount,lock_wait=1s,rw,user_id=0,group_id=0,default_permissions".to_string()];
+        assert_eq!(remount_options(&groups, &kernel), ["lock_wait=1s"]);
+        assert_eq!(
+            remount_options(&groups, &HashSet::new()),
+            ["lock_wait=1s,rw"]
+        );
+        // What the mount does not have yet is kept (and judged by the
         // daemon).
-        let groups = ["rw,remount,allow_other".to_string()];
-        assert_eq!(remount_options(&groups, &kernel), ["allow_other"]);
+        let groups = ["rw,remount,allow_root,noexec".to_string()];
+        assert_eq!(remount_options(&groups, &kernel), ["allow_root,noexec"]);
         let groups = ["rw,nosuid,remount".to_string()];
         assert!(remount_options(&groups, &kernel).is_empty());
     }

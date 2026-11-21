@@ -23,7 +23,7 @@ package for your suite (`+deb12` or `+deb13`) and architecture, then
 sudo apt install ./syncfs_0.1.0.pre-1+deb13_amd64.deb
 ```
 
-It depends on `fuse3` and installs:
+It depends on `fuse3` and `procps` (`kill`, for `systemctl reload`) and installs:
 
 | Path | What |
 | --- | --- |
@@ -268,8 +268,9 @@ directory. Every daemon also writes `<state_dir>/syncfs.pid`; both are
 removed on exit. util-linux runs `mount.syncfs` with the fstab entry's
 options, or, for a mount with no fstab entry, `mount.fuse.syncfs` with
 the kernel's options for the mount (`rw,nosuid,...,user_id=0,...`), then
-`remount`, then the new options; the helper drops the options before
-`remount` that only describe the mount as the kernel shows it. It never
+`remount`, then the new options (util-linux 2.38 in Debian 12 and 2.41
+in Debian 13 alike); the helper drops the options that only describe the
+mount as the kernel shows it, and FUSE's own (`user_id=` ...). It never
 calls mount(2) for a remount: the kernel's FUSE mount accepts no changes
 (`mount -i -o remount`, which skips the helper, fails with "No changes
 allowed in reconfigure"). `mount -f -o remount` checks the options and
