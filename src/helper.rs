@@ -17,8 +17,11 @@
 //!   kernel's view of the mount (`rw,nosuid,nodev,relatime,user_id=0,
 //!   group_id=0,default_permissions,allow_other`);
 //!
-//! plus `-f` for `mount -f` and `-s` for `mount -s` (util-linux 2.38,
-//! Debian 12, passes the same). Options the kernel already shows for the
+//! plus `-f` for `mount -f` and `-s` for `mount -s`. util-linux 2.38
+//! (Debian 12) passes the same, except that without an fstab entry it can
+//! put `remount` between the per-mount options and FUSE's
+//! (`rw,nosuid,nodev,relatime,remount,user_id=0,...,NEW`). Options the
+//! kernel already shows for the
 //! mount, and FUSE's own (`user_id=` ...), are dropped
 //! ([`remount_options`]): they describe the mount as it is and mean
 //! nothing to syncfs. A remount never calls mount(2), so the kernel mount

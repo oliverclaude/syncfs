@@ -268,9 +268,11 @@ directory. Every daemon also writes `<state_dir>/syncfs.pid`; both are
 removed on exit. util-linux runs `mount.syncfs` with the fstab entry's
 options, or, for a mount with no fstab entry, `mount.fuse.syncfs` with
 the kernel's options for the mount (`rw,nosuid,...,user_id=0,...`), then
-`remount`, then the new options (util-linux 2.38 in Debian 12 and 2.41
-in Debian 13 alike); the helper drops the options that only describe the
-mount as the kernel shows it, and FUSE's own (`user_id=` ...). It never
+`remount`, then the new options (util-linux 2.38 in Debian 12 can put
+`remount` between the per-mount options and FUSE's:
+`rw,nosuid,nodev,relatime,remount,user_id=0,...,NEW`); the helper drops
+the options that only describe the mount as the kernel shows it, and
+FUSE's own (`user_id=` ...), wherever they are. It never
 calls mount(2) for a remount: the kernel's FUSE mount accepts no changes
 (`mount -i -o remount`, which skips the helper, fails with "No changes
 allowed in reconfigure"). `mount -f -o remount` checks the options and
