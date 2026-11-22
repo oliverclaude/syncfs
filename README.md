@@ -1006,8 +1006,12 @@ version, ms since the last interim entry), `window`, `suspects`, `unclean_start`
 `fresh_checks`, `fresh_pulls`, `fresh_waits`, `fresh_fallbacks`,
 `suspects_resolved`, `entries_relayed` (applied from a forwarder),
 `entries_forwarded` (sent for another origin), `conflict_copies`,
-`reconcile_sent`, `reconcile_restored`), and `relay_entries` (kept
-for forwarding). Daemons show their version table in `status.json`.
+`reconcile_sent`, `reconcile_restored`, `deleted_changes` (writes,
+truncates and the like through a handle whose file was deleted or
+replaced by a rename while open: nothing to replicate, logged at debug
+level), `unrecorded_changes` (any other local change that could not be
+recorded, so peers never get it: a bug, logged as a warning)), and
+`relay_entries` (kept for forwarding). Daemons show their version table in `status.json`.
 
 ### Limits
 
