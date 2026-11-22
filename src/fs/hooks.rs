@@ -67,6 +67,13 @@ impl<'a> NodeRef<'a> {
         )?)
     }
 
+    /// Whether the file has no links left: it was deleted (or replaced by
+    /// a rename) while this inode was still open, so no other node can see
+    /// it and a change to it has nothing to replicate.
+    pub fn deleted(&self) -> bool {
+        self.stat().is_ok_and(|st| st.st_nlink == 0)
+    }
+
     /// Attributes of `name` in this directory (not following a symlink).
     pub fn stat_child(&self, name: &std::ffi::OsStr) -> io::Result<rustix::fs::Stat> {
         Ok(rustix::fs::statat(
@@ -162,6 +169,25 @@ pub enum Mutation<'a> {
         name: &'a OsStr,
         removed: bool,
     },
+}
+
+impl<'a> Mutation<'a> {
+    /// Every file or directory the change names.
+    pub fn nodes(&self) -> Vec<NodeRef<'a>> {
+        match *self {
+            Mutation::Create { parent, .. } | Mutation::Remove { parent, .. } => vec![parent],
+            Mutation::Link {
+                node, new_parent, ..
+            } => vec![node, new_parent],
+            Mutation::Rename {
+                parent, new_parent, ..
+            } => vec![parent, new_parent],
+            Mutation::SetAttr { node, .. }
+            | Mutation::Write { node, .. }
+            | Mutation::Allocate { node, .. }
+            | Mutation::Xattr { node, .. } => vec![node],
+        }
+    }
 }
 
 /// Returned by [`WriteHooks::before`]; dropped once the operation is
