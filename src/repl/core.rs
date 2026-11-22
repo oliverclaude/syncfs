@@ -67,6 +67,14 @@ pub(crate) struct Counters {
     /// `handoff_refused`).
     pub handoff_waits: u64,
     pub handoff_gaps: u64,
+    /// Local changes not replicated because their file had been deleted
+    /// meanwhile (written through a handle still open after an unlink or
+    /// a rename over it): nobody else can see the file.
+    pub deleted_changes: u64,
+    /// Local changes that could not be recorded for any other reason (a
+    /// file that still has links but no path, say): a bug, since peers
+    /// never get the change. Logged as a warning.
+    pub unrecorded_changes: u64,
 }
 
 pub(crate) struct State {
@@ -668,9 +676,18 @@ impl Repl {
 
     /// Records a change that was applied locally.
     pub fn record(&self, op: &Mutation<'_>) {
-        if let Err(e) = self.try_record(op) {
-            log::warn!("replication: cannot record {op:?}: {e}");
+        let Err(e) = self.try_record(op) else {
+            return;
+        };
+        // A file deleted while still open has no path, and nothing to
+        // replicate: no other node can reach it any more.
+        if e.kind() == std::io::ErrorKind::NotFound && op.nodes().iter().any(|n| n.deleted()) {
+            log::debug!("replication: not recording {op:?}: the file was deleted");
+            self.state().counters.deleted_changes += 1;
+            return;
         }
+        log::warn!("replication: cannot record {op:?}: {e}");
+        self.state().counters.unrecorded_changes += 1;
     }
 
     fn try_record(&self, op: &Mutation<'_>) -> std::io::Result<()> {

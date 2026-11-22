@@ -1180,6 +1180,52 @@ fn replicates_changes_between_mounts() {
     assert_eq!(files(&mut c), want);
 }
 
+/// Writes, truncates and allocations through a handle whose file was
+/// deleted meanwhile (unlinked, or replaced by a rename) have nothing to
+/// replicate: they are counted, not warned about (#10).
+#[test]
+fn changes_to_a_deleted_open_file_are_not_warnings() {
+    require_fuse!();
+    use std::io::Write;
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &[]);
+    let m1 = c.node(1).mnt();
+    let m2 = c.node(2).mnt();
+
+    // Unlinked while open.
+    let mut f = std::fs::File::create(m1.join("gone")).unwrap();
+    f.write_all(b"before\n").unwrap();
+    std::fs::remove_file(m1.join("gone")).unwrap();
+    f.write_all(b"after the unlink\n").unwrap();
+    f.set_len(3).unwrap();
+    drop(f);
+
+    // Replaced by a rename while open.
+    std::fs::write(m1.join("old"), b"old\n").unwrap();
+    std::fs::write(m1.join("new"), b"new\n").unwrap();
+    let mut f = open_rw(&m1.join("old")).unwrap();
+    std::fs::rename(m1.join("new"), m1.join("old")).unwrap();
+    f.write_all(b"after the rename\n").unwrap();
+    drop(f);
+
+    c.converge("end");
+    wait_same_tree(&c, 1, 2);
+    assert!(!m2.join("gone").exists());
+    assert_eq!(std::fs::read(m2.join("old")).unwrap(), b"new\n");
+    let log = std::fs::read_to_string(c.node(1).dir.join("log")).unwrap();
+    let warned: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("cannot record"))
+        .collect();
+    assert!(warned.is_empty(), "{warned:#?}");
+    let counters = c.node(1).status("replication").unwrap()["counters"].clone();
+    assert!(
+        counters["deleted_changes"].as_u64().unwrap_or(0) >= 3,
+        "{counters}"
+    );
+    assert_eq!(counters["unrecorded_changes"], 0, "{counters}");
+}
+
 #[test]
 fn pre_existing_hard_links_stay_one_file() {
     require_fuse!();

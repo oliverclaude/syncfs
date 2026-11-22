@@ -1606,9 +1606,30 @@ fn soak(kinds: &[Kind]) {
             count("freshness: no node with version") + count("answered without it"),
             count("this node's copy is kept as"),
         );
+        // Changes to files deleted while open are not replicated, which is
+        // right (nobody else can see them); any other change that could not
+        // be recorded never reaches the peers (#10).
+        let deleted = n
+            .status("replication")
+            .and_then(|r| r["counters"]["deleted_changes"].as_u64())
+            .unwrap_or(0);
+        let unrecorded = count("replication: cannot record");
+        eprintln!(
+            "  node {}: {deleted} changes to deleted files (since its last start), \
+             {unrecorded} unrecorded changes",
+            n.id,
+        );
         if count("panicked") > 0 {
             bad.push(format!(
                 "node {} panicked: see {}",
+                n.id,
+                n.dir.join("log").display()
+            ));
+        }
+        if unrecorded > 0 {
+            bad.push(format!(
+                "node {}: {unrecorded} local changes could not be recorded for \
+                 replication (\"cannot record\" in {})",
                 n.id,
                 n.dir.join("log").display()
             ));
