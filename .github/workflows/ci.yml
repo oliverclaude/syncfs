@@ -12,6 +12,9 @@ jobs:
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Successful runs take 10-13 min; this stops a hung step long before
+    # GitHub's 6 h default (issue #25).
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -19,9 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install FUSE
+        # Usually 10-20 s. Retries and a short network timeout make apt fail
+        # fast instead of hanging (issue #25).
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fuse3
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $apt update
+          sudo apt-get $apt install -y fuse3
           echo user_allow_other | sudo tee -a /etc/fuse.conf
           ls -l /dev/fuse
       - uses: dtolnay/rust-toolchain@stable
