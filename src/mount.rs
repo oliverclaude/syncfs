@@ -22,15 +22,18 @@ use crate::status::{providers, Registry};
 
 /// `SYNCFS_TEST_HOLD_INVAL` is a path. While that file exists, queued
 /// kernel cache invalidations wait. Tests use it to observe a dentry the
-/// kernel still holds. Unset, this does nothing.
+/// kernel still holds. Unset, this does nothing. The variable is read once,
+/// so it has to be set before the daemon starts.
 fn wait_test_inval() {
-    let Some(p) = std::env::var_os("SYNCFS_TEST_HOLD_INVAL") else {
+    static HOLD: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let hold = HOLD.get_or_init(|| {
+        std::env::var_os("SYNCFS_TEST_HOLD_INVAL")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(path) = hold else {
         return;
     };
-    if p.is_empty() {
-        return;
-    }
-    let path = std::path::PathBuf::from(p);
     while path.exists() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
