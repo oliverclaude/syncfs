@@ -18,6 +18,7 @@ use crate::reload::{self, Registration, Reloader};
 use crate::repl::core::Repl;
 use crate::repl::store::{Flusher, Store};
 use crate::repl::{marker, rebuild, version};
+use crate::status::{providers, Registry};
 
 /// `SYNCFS_TEST_HOLD_INVAL` is a path. While that file exists, queued
 /// kernel cache invalidations wait. Tests use it to observe a dentry the
@@ -34,7 +35,6 @@ fn wait_test_inval() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
-use crate::status::{providers, Registry};
 
 /// FUSE session settings for `cfg`. `kernel_flags` are the generic mount
 /// flags (`nosuid`, `noexec`, ...) from `-o`.
