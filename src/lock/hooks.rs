@@ -72,6 +72,14 @@ fn child(parent: NodeRef<'_>, name: &OsStr) -> Result<Option<Key>, Errno> {
     Ok(key_of(parent)?.map(|p| p.child(name)))
 }
 
+/// `(st_dev, st_ino)` of `name` in `parent`, or `None` if it is not there.
+fn file_identity(parent: NodeRef<'_>, name: &OsStr) -> Option<(u64, u64)> {
+    parent
+        .stat_child(name)
+        .ok()
+        .map(|st| (st.st_dev, st.st_ino))
+}
+
 impl ClusterHooks {
     pub fn new(locks: LockManager, repl: Arc<Repl>) -> ClusterHooks {
         ClusterHooks {
@@ -352,11 +360,28 @@ impl WriteHooks for ClusterHooks {
                 name,
                 new_parent,
                 new_name,
-                ..
-            } => self.op_lock_with(
-                vec![child(parent, name)?, child(new_parent, new_name)?],
-                true,
-            ),
+                flags,
+            } => {
+                // The kernel already looked the names up. If the handoff
+                // puts a different file there, renameat would move that
+                // file while the kernel moves its cached dentry for the
+                // old one. ESTALE makes it look the names up again.
+                let source = file_identity(parent, name);
+                let exchange = (flags & libc::RENAME_EXCHANGE) != 0;
+                let target = exchange.then(|| file_identity(new_parent, new_name));
+                let guard = self.op_lock_with(
+                    vec![child(parent, name)?, child(new_parent, new_name)?],
+                    true,
+                )?;
+                let changed = file_identity(parent, name) != source
+                    || target.is_some_and(|id| file_identity(new_parent, new_name) != id);
+                if changed {
+                    drop(guard);
+                    log::debug!("locks: rename source changed during the lock wait (ESTALE)");
+                    return Err(Errno::ESTALE);
+                }
+                Ok(guard)
+            }
         }
     }
 

@@ -800,6 +800,16 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
             Self::guard(newparent, newname)?;
             let p = self.inode(parent)?;
             let np = self.inode(newparent)?;
+            // As in unlink: the kernel's entry may still name the file a
+            // peer renamed away. Also after a lock wait, if the handoff
+            // replaced the source (see `ClusterHooks::before`).
+            if self.inodes.take_moved_from(p.ino, name)
+                || ((flags.bits() & libc::RENAME_EXCHANGE) != 0
+                    && self.inodes.take_moved_from(np.ino, newname))
+            {
+                log::debug!("rename: {name:?} was renamed away by a peer (ESTALE)");
+                return Err(Errno::ESTALE);
+            }
             let op = Mutation::Rename {
                 parent: self.node(&p),
                 name,

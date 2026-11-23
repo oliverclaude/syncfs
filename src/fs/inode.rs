@@ -186,7 +186,8 @@ impl InodeTable {
     /// Replication renamed the file `file` (if the kernel knows it) away
     /// from `name` in the directory `dir`. The kernel may still have the old
     /// name cached (its invalidation is asynchronous), so the next open of
-    /// the file and the next unlink of the name get `ESTALE`
+    /// the file, the next unlink of the name, and the next rename of the
+    /// name get `ESTALE`
     /// ([`InodeTable::take_moved`], [`InodeTable::take_moved_from`]).
     pub fn mark_moved(&self, file: Option<&Stat>, dir: &Stat, name: &std::ffi::OsStr) {
         let mut inner = self.lock();

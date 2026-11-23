@@ -820,15 +820,17 @@ created, giving two files at one path). So:
 - A create that finds the name taken in the meantime (a peer's create
   applied during the wait) opens the existing file instead, unless the
   application asked for `O_EXCL`.
-- An open, truncate or unlink whose file the wait removed or moved away
-  from the path (e.g. a peer renamed another file onto it) fails with
-  `ESTALE`; the kernel then looks the path up again and retries once, so
-  the application opens or removes the file that is there now.
+- An open, truncate, unlink or rename whose file the wait removed or
+  moved away from the path (e.g. a peer renamed another file onto it)
+  fails with `ESTALE`; the kernel then looks the path up again and retries
+  once, so the application opens, removes or renames the file that is
+  there now.
 - The same holds without a wait: the kernel may still have a name cached
   for a moment after a peer's rename applied here (its cache is
   invalidated asynchronously). The first open of a file replication
-  renamed (or replaced), and the first unlink of a name it renamed a file
-  away from, fail with `ESTALE` until the kernel looks the name up again,
+  renamed (or replaced), the first unlink of a name it renamed a file
+  away from, and the first rename of that name, fail with `ESTALE` until
+  the kernel looks the name up again,
   so the retry reaches whatever is at the name now, not the renamed file.
   This costs at most one extra lookup per renamed file.
 - Unlinking a file's last link does not fetch its newest content first:

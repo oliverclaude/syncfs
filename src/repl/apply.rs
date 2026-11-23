@@ -200,7 +200,7 @@ impl Repl {
                 self.invalidate_entry(from);
                 self.invalidate_entry(to);
                 // The kernel may still reach both files under their old
-                // names; the next open or unlink there gets ESTALE.
+                // names; the next open, unlink or rename there gets ESTALE.
                 self.note_moved(from, moved.as_ref());
                 self.note_moved(to, replaced.as_ref());
                 let mut st = self.state();
