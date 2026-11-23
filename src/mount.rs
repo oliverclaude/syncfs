@@ -18,6 +18,22 @@ use crate::reload::{self, Registration, Reloader};
 use crate::repl::core::Repl;
 use crate::repl::store::{Flusher, Store};
 use crate::repl::{marker, rebuild, version};
+
+/// `SYNCFS_TEST_HOLD_INVAL` is a path. While that file exists, queued
+/// kernel cache invalidations wait. Tests use it to observe a dentry the
+/// kernel still holds. Unset, this does nothing.
+fn wait_test_inval() {
+    let Some(p) = std::env::var_os("SYNCFS_TEST_HOLD_INVAL") else {
+        return;
+    };
+    if p.is_empty() {
+        return;
+    }
+    let path = std::path::PathBuf::from(p);
+    while path.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 use crate::status::{providers, Registry};
 
 /// FUSE session settings for `cfg`. `kernel_flags` are the generic mount
@@ -286,6 +302,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String], base: reload::Base) -> anyhow:
                     .name("syncfs-inval-e".into())
                     .spawn(move || {
                         for (ino, name) in entries_rx {
+                            wait_test_inval();
                             if let Err(e) = notifier.inval_entry(fuser::INodeNo(ino), &name) {
                                 log::debug!("invalidating entry {name:?} of inode {ino}: {e}");
                             }
@@ -298,6 +315,7 @@ pub fn run(cfg: &Config, kernel_flags: &[String], base: reload::Base) -> anyhow:
                         .name("syncfs-inval-i".into())
                         .spawn(move || {
                             for ino in inodes_rx {
+                                wait_test_inval();
                                 if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, 0) {
                                     log::debug!("invalidating inode {ino}: {e}");
                                 }

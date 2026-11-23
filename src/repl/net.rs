@@ -735,6 +735,16 @@ pub(crate) enum ApplyError {
 /// An entry retried this long is reported (once) as stuck.
 const STUCK_AFTER: Duration = Duration::from_secs(10);
 
+/// `SYNCFS_TEST_HOLD_APPLY` is a path. While that file exists, peer journal
+/// entries are received but not applied. Tests use it to hold a lock
+/// handoff open. Unset, this does nothing.
+fn test_apply_held() -> bool {
+    match std::env::var_os("SYNCFS_TEST_HOLD_APPLY") {
+        Some(p) if !p.is_empty() => std::path::Path::new(&p).exists(),
+        _ => false,
+    }
+}
+
 fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
     let mut backoff = Duration::from_millis(50);
     // The entry being retried: (seq, since, reported).
@@ -748,6 +758,13 @@ fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
             // The tree is being made; its positions say where to go on.
             let st = r.state();
             let _ = r.cv.wait_timeout(st, Duration::from_millis(200));
+            continue;
+        }
+        if test_apply_held() {
+            // A test is holding apply open so a lock handoff can be caught
+            // mid-wait. Entries stay in the inbox until the file is removed.
+            let st = r.state();
+            let _ = r.cv.wait_timeout(st, Duration::from_millis(20));
             continue;
         }
         // The next entry to apply, if it and its dependencies are here.

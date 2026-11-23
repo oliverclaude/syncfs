@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -708,6 +709,114 @@ fn locks_unlink_of_a_file_replaced_while_waiting_removes_the_new_file() {
     });
     assert_eq!(c.node(1).status("stats").unwrap()["conflict_copies"], 0);
     assert_eq!(c.node(2).status("stats").unwrap()["conflict_copies"], 0);
+}
+
+/// A rename whose source a peer replaced while this node waited for the
+/// lock must move the file that is there now, not the kernel's cached
+/// dentry for the old one (issue #4). Apply on node 2 is held until the
+/// rename is inside the handoff wait, so the replacement lands during
+/// that wait and not before the syscall.
+#[test]
+fn locks_rename_replaced_during_handoff_moves_the_file_that_is_there() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "10s",
+            "--freshness-timeout",
+            "15s",
+        ],
+    );
+    let gate = c.node(2).dir.join("hold-apply");
+    let inval = c.node(2).dir.join("hold-inval");
+    // The files are created only after node 2 has caught up, so the hold
+    // covers the replacement and not the start-up rejoin.
+    c.node(2)
+        .env
+        .push(("SYNCFS_TEST_HOLD_APPLY".into(), gate.display().to_string()));
+    c.node(2)
+        .env
+        .push(("SYNCFS_TEST_HOLD_INVAL".into(), inval.display().to_string()));
+    for n in &c.nodes {
+        if n.kind == Kind::Mount {
+            std::fs::create_dir_all(n.backing().join("c")).unwrap();
+            std::fs::write(n.backing().join("f"), b"old\n").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+
+    let m1 = c.node(1).mnt();
+    let m2 = c.node(2).mnt();
+    // A first change lets node 2 pass its start-up rejoin before the hold.
+    std::fs::write(m2.join("ready"), b"1").unwrap();
+    c.converge("node 2 rejoined");
+    std::fs::write(&gate, b"1").unwrap();
+    std::fs::write(&inval, b"1").unwrap();
+    // The kernel caches the old file. Later reads must not follow it.
+    assert_eq!(std::fs::read(m2.join("f")).unwrap(), b"old\n");
+    let old_ino = std::fs::metadata(m2.join("f")).unwrap().ino();
+    std::fs::rename(m1.join("f"), m1.join("gone")).unwrap();
+    std::fs::write(m1.join("f"), b"new\n").unwrap();
+    // LockRelease is sent before these return; give the voters a moment
+    // to record the heads, or the rename acquires with nothing to wait for.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let src = m2.join("f");
+    let dest = m2.join("c/f");
+    let renamer = std::thread::spawn(move || std::fs::rename(&src, &dest));
+    eventually("node 2 is inside the handoff wait", || {
+        let v = c
+            .node(2)
+            .status("replication")
+            .ok_or_else(|| std::io::Error::other("no replication status"))?;
+        let waits = v["counters"]["handoff_waits"].as_u64().unwrap_or(0);
+        (waits > 0)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("handoff_waits {waits}")))
+    });
+    std::fs::remove_file(&gate).unwrap();
+    renamer
+        .join()
+        .expect("rename thread")
+        .expect("rename should retry after ESTALE and move the file that is there");
+
+    let b2 = c.node(2).backing();
+    let m2_end = c.node(2).mnt();
+    // Invalidation is still held, so this is the kernel's dentry from the
+    // rename, not a lookup after the cache was dropped.
+    let new_ino = std::fs::metadata(m2_end.join("c/f")).unwrap().ino();
+    let through_mount = std::fs::read(m2_end.join("c/f")).unwrap();
+    std::fs::remove_file(&inval).unwrap();
+    let through_backing = std::fs::read(b2.join("c/f")).unwrap();
+    assert_ne!(
+        new_ino,
+        old_ino,
+        "kernel kept the old dentry at c/f (ino {old_ino}); mount {:?} backing {:?}",
+        String::from_utf8_lossy(&through_mount),
+        String::from_utf8_lossy(&through_backing)
+    );
+    assert_eq!(
+        through_backing,
+        b"new\n",
+        "backing rename moved the wrong file: {:?}",
+        String::from_utf8_lossy(&through_backing)
+    );
+    assert_eq!(
+        through_mount,
+        b"new\n",
+        "kernel moved its cached dentry for the old file (mount {:?}, backing {:?})",
+        String::from_utf8_lossy(&through_mount),
+        String::from_utf8_lossy(&through_backing)
+    );
+    assert_eq!(std::fs::read(b2.join("gone")).unwrap(), b"old\n");
+    assert!(!b2.join("f").exists());
+    c.converge("end");
 }
 
 /// Writers on every mount contend for one file; their critical sections
