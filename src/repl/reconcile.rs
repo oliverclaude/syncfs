@@ -5,6 +5,8 @@
 //! both have applied exactly the same entries (and the peer has every
 //! entry of this node's journal), and compares:
 //!
+//! - a path on both sides whose size or version differs is restored from
+//!   the peer (an empty file must not count as caught up);
 //! - a path only here is a change of this node's that was not recorded:
 //!   it is sent as a new file (`Create`, and its data);
 //! - a path only there was removed or renamed away here without a record:
@@ -61,6 +63,9 @@ impl Repl {
         let mut restored = 0;
         for (p, n) in &theirs {
             if self.backing.exists(p) {
+                if self.repair_content(source, n)? {
+                    restored += 1;
+                }
                 continue;
             }
             match self.restore(source, n) {
@@ -182,6 +187,43 @@ impl Repl {
             self.copy_from(n.id, source, Copy::Rebuild)?;
         }
         Ok(())
+    }
+
+    /// Same path on both sides after an unclean stop, but the bytes (or the
+    /// version) differ. A path-only comparison would leave an empty file in
+    /// place and the node would still report itself in sync (issue #2).
+    fn repair_content(&self, source: NodeId, n: &TreeNode) -> io::Result<bool> {
+        if n.kind != NodeKind::File {
+            return Ok(false);
+        }
+        let stat = self.backing.stat(&n.path)?;
+        let size = stat.st_size as u64;
+        let local = self.state().index.version(&n.id);
+        let peer_newer = match (local, n.version) {
+            (None, Some(_)) => true,
+            (Some(l), Some(p)) => p > l,
+            _ => false,
+        };
+        let same_version_wrong_size = local.is_some() && local == n.version && size != n.meta.size;
+        if !peer_newer && !same_version_wrong_size {
+            return Ok(false);
+        }
+        log::warn!(
+            "reconcile: {} differs from node {source} (local {size} bytes, {local:?}; peer {} bytes, {:?}); restoring",
+            String::from_utf8_lossy(&n.path),
+            n.meta.size,
+            n.version
+        );
+        let _g = self.hold(n.id);
+        // Equal versions still need a byte compare: Rebuild would keep the
+        // local copy. Relayed copies when the peer is not strictly older.
+        let how = if same_version_wrong_size {
+            Copy::Relayed
+        } else {
+            Copy::Rebuild
+        };
+        self.copy_from(n.id, source, how)?;
+        Ok(true)
     }
 }
 

@@ -1445,6 +1445,32 @@ fn crash_while_writing_resends_after_restart() {
     assert_eq!(r["unclean_start"], false, "{r:#}");
 }
 
+/// A killed node can come back with a file still in the index but empty on
+/// disk. The peer has the bytes. A path-only comparison reports nothing to
+/// restore and the node stays in sync with the empty file (issue #2).
+#[test]
+fn restarted_node_repairs_an_empty_file_a_peer_still_has() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let body = b"content that must survive\n";
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    std::fs::write(c.node(1).mnt().join("f"), body).unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has the write", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(body)).then_some(())
+    });
+    c.node(2).kill();
+    // Crash window: the path is still there, the bytes are not.
+    std::fs::write(b2.join("f"), b"").unwrap();
+    c.node(2).start();
+    c.converge("node 2 back");
+    wait_for("node 2 restored the content", || {
+        (std::fs::read(c.node(2).backing().join("f")).ok().as_deref() == Some(body)).then_some(())
+    });
+    let r = in_sync(&c, 2);
+    assert_eq!(r["in_sync"], true, "{r:#}");
+}
+
 /// A change reaches a node whose origin went away before it could send it:
 /// a third mount forwards it, ordered and once.
 #[test]

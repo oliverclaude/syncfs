@@ -335,8 +335,12 @@ impl Repl {
                 .map_err(ApplyError::Retry)?;
             restart = false;
             if !pulled.found {
-                // Gone at the origin; a later entry says what happened.
-                return Ok(false);
+                // The origin has no path for it (removed, or renamed away
+                // and this node asked before that landed). Another data
+                // peer may still have the bytes. Do not record the version
+                // until one of them does: an empty local file must not
+                // count as that version (issue #2).
+                return self.fetch_elsewhere(origin, id, version);
             }
             if !pulled.more {
                 break pulled.size;
@@ -349,5 +353,22 @@ impl Repl {
         self.record_version(id, &path, version, lineage);
         self.invalidate(&path);
         Ok(true)
+    }
+
+    /// A data peer other than `skip` that has at least `version` of `id`.
+    /// `Ok(false)`: nobody connected has it (a later entry may remove it).
+    fn fetch_elsewhere(&self, skip: NodeId, id: FileId, version: Version) -> Applied {
+        for p in self.data_peers_up() {
+            if p == skip {
+                continue;
+            }
+            match self.copy_from(id, p, super::fresh::Copy::Relayed) {
+                Ok(Some(v)) if v >= version => return Ok(true),
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(ApplyError::Retry(e)),
+            }
+        }
+        Ok(false)
     }
 }
