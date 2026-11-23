@@ -737,12 +737,17 @@ const STUCK_AFTER: Duration = Duration::from_secs(10);
 
 /// `SYNCFS_TEST_HOLD_APPLY` is a path. While that file exists, peer journal
 /// entries are received but not applied. Tests use it to hold a lock
-/// handoff open. Unset, this does nothing.
+/// handoff open. Unset, this does nothing. The variable is read once, so
+/// it has to be set before the daemon starts.
 fn test_apply_held() -> bool {
-    match std::env::var_os("SYNCFS_TEST_HOLD_APPLY") {
-        Some(p) if !p.is_empty() => std::path::Path::new(&p).exists(),
-        _ => false,
-    }
+    static HOLD: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOLD.get_or_init(|| {
+        std::env::var_os("SYNCFS_TEST_HOLD_APPLY")
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_ref()
+    .is_some_and(|p| p.exists())
 }
 
 fn apply_loop(weak: Weak<Repl>, origin: NodeId) {
