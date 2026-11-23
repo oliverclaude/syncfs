@@ -30,6 +30,7 @@ jobs:
   # The version suffix, and whether a nightly has anything new to build.
   version:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       # 0.2.0 + "pre" -> 0.2.0~pre (deb) / 0.2.0-pre (tarball); nightly:
       # 0.2.0~nightly.YYYYMMDD, below the 0.2.0 release and rising per day.
@@ -75,6 +76,8 @@ jobs:
     needs: version
     if: needs.version.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
+    # Successful builds take about 2 min (issue #25).
+    timeout-minutes: 20
     env:
       SYNCFS_PRE: ${{ needs.version.outputs.pre }}
     strategy:
@@ -109,6 +112,8 @@ jobs:
     needs: version
     if: needs.version.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
+    # Successful builds take about 2 min (issue #25).
+    timeout-minutes: 20
     env:
       SYNCFS_PRE: ${{ needs.version.outputs.pre }}
     strategy:
@@ -118,9 +123,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install musl and FUSE
+        # Usually under 35 s. Retries and a short network timeout make apt
+        # fail fast instead of hanging (issue #25).
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools fuse3
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $apt update
+          sudo apt-get $apt install -y musl-tools fuse3
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: scripts/build-musl.sh dist
@@ -150,6 +159,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [deb, musl]
     runs-on: ubuntu-24.04
+    # Publishing takes under 1 min; the headroom keeps a slow upload from
+    # being cut off mid-publish (issue #25).
+    timeout-minutes: 20
     permissions:
       contents: write
       actions: read
@@ -176,6 +188,9 @@ jobs:
     if: needs.version.outputs.nightly == 'true' && needs.version.outputs.skip != 'true'
     needs: [version, deb, musl]
     runs-on: ubuntu-24.04
+    # Publishing and pruning take under 1 min; the headroom keeps a slow
+    # upload from being cut off mid-publish (issue #25).
+    timeout-minutes: 20
     permissions:
       contents: write
       actions: read
