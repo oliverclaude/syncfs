@@ -945,11 +945,19 @@ fn locks_rename_of_locked_paths_is_busy() {
     // Renaming onto d/moved is busy whether or not node 2 has seen the
     // rename yet (the lock is on the path, not on a local file).
     assert_eq!(busy("other", "d/moved"), Some(libc::EBUSY));
-    // Once the rename has replicated, the old path is free again.
+    // Once the rename has replicated, the old path is free again. Node 2
+    // sees the new name as soon as the rename is applied, but its kernel
+    // may serve the cached entry of the old name until the invalidation
+    // (sent from a thread of its own) is delivered, or the entry TTL ends.
     eventually("d/moved on node 2", || {
         std::fs::metadata(m2.join("d/moved"))
     });
-    assert!(!m2.join("d/f").exists());
+    eventually("d/f gone on node 2", || {
+        match m2.join("d/f").try_exists()? {
+            true => Err(std::io::Error::other("still there")),
+            false => Ok(()),
+        }
+    });
     eventually("create d/f on node 2", || {
         std::fs::write(m2.join("d/f"), b"new")
     });
