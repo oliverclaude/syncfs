@@ -32,6 +32,16 @@ pub(crate) enum Copy {
     Rebuild,
 }
 
+/// How a session's local copy was made fresh.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fresh {
+    /// It has the newest version the grants report.
+    Current,
+    /// The fallback: nobody reachable had the newest version, which `origin`
+    /// announced; the session goes on from an older one.
+    Fallback { origin: NodeId },
+}
+
 /// Why a session must not write.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotFresh {
@@ -117,7 +127,7 @@ impl Repl {
     /// than a committed version and no holder of it answers), the session
     /// must not write: `Err(Stale)`. A node that removed the file at a
     /// newer version: the removal is applied here, `Err(Removed)`.
-    pub fn ensure_fresh(&self, id: FileId, known: &[VersionInfo]) -> Result<(), NotFresh> {
+    pub fn ensure_fresh(&self, id: FileId, known: &[VersionInfo]) -> Result<Fresh, NotFresh> {
         self.resolve_suspect(id, true);
         {
             let st = self.state();
@@ -130,7 +140,7 @@ impl Repl {
         }
         let t = version::target(known);
         if t.satisfied_by(self.local_version(&id)) {
-            return Ok(());
+            return Ok(Fresh::Current);
         }
         let newest = t.newest.expect("unsatisfied targets have a version");
         if newest.node == self.me && newest.disk == self.disk && t.sources == [self.me] {
@@ -142,7 +152,7 @@ impl Repl {
                 "freshness: version {} of {id} was announced here but never written",
                 newest.seq
             );
-            return Ok(());
+            return Ok(Fresh::Current);
         }
         self.state().counters.fresh_checks += 1;
         let deadline = Instant::now() + self.freshness_timeout.get();
@@ -153,7 +163,7 @@ impl Repl {
                     continue;
                 }
                 match self.catch_up(id, s) {
-                    Ok(v) if v.is_some_and(|v| v >= newest) => return Ok(()),
+                    Ok(v) if v.is_some_and(|v| v >= newest) => return Ok(Fresh::Current),
                     Ok(v) => log::debug!("freshness: node {s} has {v:?} of {id}, not {newest:?}"),
                     Err(e) if is_removed(&e) => return Err(NotFresh::Removed),
                     Err(e) => log::debug!("freshness: {id} from node {s}: {e}"),
@@ -174,6 +184,9 @@ impl Repl {
             std::thread::sleep(POLL);
         }
         self.state().counters.fresh_fallbacks += 1;
+        let fallback = Fresh::Fallback {
+            origin: newest.node,
+        };
         // The newest copy any reachable node has (holders of the committed
         // version first: the voters may not know every holder).
         let mut order: Vec<NodeId> = t.committed.iter().flat_map(|(_, h)| h.clone()).collect();
@@ -208,7 +221,7 @@ impl Repl {
                     local.map(|l| l.seq),
                     cv.seq
                 );
-                return Ok(());
+                return Ok(fallback);
             }
             if t.committed
                 .as_ref()
@@ -220,7 +233,7 @@ impl Repl {
                     cv.seq,
                     local.map(|l| l.seq)
                 );
-                return Ok(());
+                return Ok(fallback);
             }
             log::warn!(
                 "freshness: the local copy of {id} is older than committed version {} and no \
@@ -235,7 +248,7 @@ impl Repl {
             newest.seq,
             local.map(|l| l.seq)
         );
-        Ok(())
+        Ok(fallback)
     }
 
     /// Makes the local copy of `id` equal to `source`'s. Returns the

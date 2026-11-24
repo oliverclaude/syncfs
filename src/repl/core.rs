@@ -434,7 +434,12 @@ impl Repl {
         let (head, wait) = (Arc::downgrade(&repl), Arc::downgrade(&repl));
         repl.locks.set_chain(crate::lock::manager::Chain {
             head: Box::new(move || head.upgrade().map_or(0, |r| r.journal_head())),
-            wait: Box::new(move |after| wait.upgrade().is_none_or(|r| r.wait_applied(after))),
+            wait: Box::new(move |after| {
+                wait.upgrade()
+                    .map_or(crate::lock::manager::Applied::All, |r| {
+                        r.wait_applied(after)
+                    })
+            }),
         });
         Ok(repl)
     }

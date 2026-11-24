@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::core::Repl;
 use crate::config::NodeId;
+use crate::lock::manager::Applied;
 
 impl Repl {
     /// This node's journal head, sent with its lock releases.
@@ -15,11 +16,11 @@ impl Repl {
     /// Waits until this node has applied each `(origin, head)` of `after`,
     /// at most `freshness_timeout`, and only while someone that can provide
     /// the entries is connected: the origin, or a data peer that has
-    /// applied them. Returns false if they were reachable but did not
-    /// arrive in time (the caller refuses the operation); true otherwise,
-    /// also when nobody connected has them (the holder is gone; the lock
+    /// applied them. `TimedOut` if they were reachable but did not arrive
+    /// in time (the caller refuses the operation); `Without` the missing
+    /// origins when nobody connected has them (the holder is gone; the lock
     /// goes ahead without them, as the freshness check's fallback does).
-    pub(crate) fn wait_applied(&self, after: &[(NodeId, u64)]) -> bool {
+    pub(crate) fn wait_applied(&self, after: &[(NodeId, u64)]) -> Applied {
         let deadline = Instant::now() + self.freshness_timeout.get();
         let mut waited = false;
         let mut st = self.state();
@@ -30,7 +31,7 @@ impl Repl {
                 .filter(|(o, h)| st.applied.get(o).copied().unwrap_or(0) < *h)
                 .collect();
             if missing.is_empty() {
-                return true;
+                return Applied::All;
             }
             drop(st);
             let peers = self.data_peers_up();
@@ -46,7 +47,7 @@ impl Repl {
                      previous holders were not applied within freshness_timeout; refusing \
                      the operation (EBUSY)"
                 );
-                return false;
+                return Applied::TimedOut;
             }
             if !available || self.stopping() {
                 st.counters.handoff_gaps += 1;
@@ -55,7 +56,7 @@ impl Repl {
                     "lock handoff: continuing without the entries {missing:?} (origin, journal \
                      head) of the previous holders (nobody connected has them)"
                 );
-                return true;
+                return Applied::Without(missing.iter().map(|&(o, _)| o).collect());
             }
             if !waited {
                 waited = true;
