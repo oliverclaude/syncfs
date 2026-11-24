@@ -34,6 +34,7 @@ use fuser::Errno;
 
 use crate::fs::{Mutation, NodeRef, OpGuard, WriteHooks};
 use crate::repl::core::Repl;
+use crate::repl::fresh::{Fresh, NotFresh};
 
 use super::key::Key;
 use super::manager::{FileCtx, LockManager};
@@ -175,14 +176,17 @@ impl ClusterHooks {
             return Err(Errno::ESTALE);
         }
         self.repl.session_opened(f);
-        let fresh = self.repl.ensure_fresh(f, &acquired.known);
-        if let Err(e) = fresh {
-            release(&self.locks, &self.repl, key);
-            self.locks.ready(key);
-            return Err(match e {
-                crate::repl::fresh::NotFresh::Stale => Errno::EBUSY,
-                crate::repl::fresh::NotFresh::Removed => Errno::ENOENT,
-            });
+        match self.repl.ensure_fresh(f, &acquired.known) {
+            Ok(Fresh::Current) => {}
+            Ok(Fresh::Fallback { origin }) => super::audit::fallback(self.repl.me, key, &[origin]),
+            Err(e) => {
+                release(&self.locks, &self.repl, key);
+                self.locks.ready(key);
+                return Err(match e {
+                    NotFresh::Stale => Errno::EBUSY,
+                    NotFresh::Removed => Errno::ENOENT,
+                });
+            }
         }
         self.repl.wait_invalidated();
         self.locks.ready(key);

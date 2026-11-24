@@ -281,9 +281,20 @@ pub struct Chain {
 }
 
 /// Waits until this node applied each `(origin, head)`'s journal up to it.
-/// False: they did not arrive within `freshness_timeout`; the lock must
-/// not be used.
-pub type WaitFn = dyn Fn(&[(NodeId, u64)]) -> bool + Send + Sync;
+pub type WaitFn = dyn Fn(&[(NodeId, u64)]) -> Applied + Send + Sync;
+
+/// What [`WaitFn`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// Everything was applied.
+    All,
+    /// Nobody connected has the entries of these origins: the lock goes
+    /// ahead without them.
+    Without(Vec<NodeId>),
+    /// They were reachable but did not arrive within `freshness_timeout`;
+    /// the lock must not be used.
+    TimedOut,
+}
 
 /// (from, to, message); `to == me` is handled in-process.
 type Queue = VecDeque<(NodeId, NodeId, Message)>;
@@ -1034,7 +1045,15 @@ impl Inner {
         self.cv.notify_all();
         handoff.retain(|(n, _)| *n != self.s.me);
         if let (Ok(_), Some(c)) = (&res, self.chain.get()) {
-            if !handoff.is_empty() && !(c.wait)(&handoff) {
+            let applied = if handoff.is_empty() {
+                Applied::All
+            } else {
+                (c.wait)(&handoff)
+            };
+            if let Applied::Without(origins) = &applied {
+                audit::fallback(self.s.me, key, origins);
+            }
+            if applied == Applied::TimedOut {
                 // Acting on a namespace without the previous holder's
                 // changes could diverge: give the lock back.
                 let mut st = lock(&self.st);
