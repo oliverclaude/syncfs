@@ -897,6 +897,10 @@ fn locks_rename_of_locked_paths_is_busy() {
         &[Mount, Mount, Daemon],
         &["--lock-lease-timeout", "1s", "--lock-wait", "10s"],
     );
+    let inval = c.node(2).dir.join("hold-inval");
+    c.node(2)
+        .env
+        .push(("SYNCFS_TEST_HOLD_INVAL".into(), inval.display().to_string()));
     for n in &c.nodes {
         std::fs::create_dir_all(n.backing().join("d")).unwrap();
         for f in files {
@@ -929,6 +933,10 @@ fn locks_rename_of_locked_paths_is_busy() {
     std::fs::rename(m2.join("free"), m2.join("free2")).unwrap();
     std::fs::rename(m2.join("d/g"), m2.join("d/g2")).unwrap();
     // The holder renames its own open file: the lock moves with it.
+    // Node 2's kernel invalidations are held back across the rename, so
+    // its kernel keeps the cached entry of the old name after the new one
+    // shows, as it does by chance when the invalidation thread lags.
+    std::fs::write(&inval, b"1").unwrap();
     std::fs::rename(m1.join("d/f"), m1.join("d/moved")).unwrap();
     eventually("lock moved to /d/moved", || {
         let l = c.node(1).status("locks").unwrap();
@@ -952,6 +960,7 @@ fn locks_rename_of_locked_paths_is_busy() {
     eventually("d/moved on node 2", || {
         std::fs::metadata(m2.join("d/moved"))
     });
+    std::fs::remove_file(&inval).unwrap();
     eventually("d/f gone on node 2", || {
         match m2.join("d/f").try_exists()? {
             true => Err(std::io::Error::other("still there")),
