@@ -1115,6 +1115,9 @@ recorded, so peers never get it: a bug, logged as a warning)), and
   restarted with a lost disk or a new store. After healing it checks that
   no two nodes held conflicting locks at once (from the lock audit log,
   `SYNCFS_TEST_LOCK_LOG`), that no committed write was lost or torn, that
+  a read under the lock sees the last write before it (unless the reader
+  logged taking the lock without the writer's changes, the documented
+  handoff or freshness fallback; such reads are counted as excused), that
   conflict copies only appear for a node that was cut off or restarted, and
   that all trees converge. The schedule comes from `SYNCFS_SOAK_SEED`;
   `SYNCFS_SOAK_SECS` sets the length (see the file for the other knobs).
