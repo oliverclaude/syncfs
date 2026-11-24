@@ -897,6 +897,10 @@ fn locks_rename_of_locked_paths_is_busy() {
         &[Mount, Mount, Daemon],
         &["--lock-lease-timeout", "1s", "--lock-wait", "10s"],
     );
+    let inval = c.node(2).dir.join("hold-inval");
+    c.node(2)
+        .env
+        .push(("SYNCFS_TEST_HOLD_INVAL".into(), inval.display().to_string()));
     for n in &c.nodes {
         std::fs::create_dir_all(n.backing().join("d")).unwrap();
         for f in files {
@@ -929,6 +933,10 @@ fn locks_rename_of_locked_paths_is_busy() {
     std::fs::rename(m2.join("free"), m2.join("free2")).unwrap();
     std::fs::rename(m2.join("d/g"), m2.join("d/g2")).unwrap();
     // The holder renames its own open file: the lock moves with it.
+    // Node 2's kernel invalidations are held back across the rename, so
+    // its kernel keeps the cached entry of the old name after the new one
+    // shows, as it does by chance when the invalidation thread lags.
+    std::fs::write(&inval, b"1").unwrap();
     std::fs::rename(m1.join("d/f"), m1.join("d/moved")).unwrap();
     eventually("lock moved to /d/moved", || {
         let l = c.node(1).status("locks").unwrap();
@@ -945,11 +953,20 @@ fn locks_rename_of_locked_paths_is_busy() {
     // Renaming onto d/moved is busy whether or not node 2 has seen the
     // rename yet (the lock is on the path, not on a local file).
     assert_eq!(busy("other", "d/moved"), Some(libc::EBUSY));
-    // Once the rename has replicated, the old path is free again.
+    // Once the rename has replicated, the old path is free again. Node 2
+    // sees the new name as soon as the rename is applied, but its kernel
+    // may serve the cached entry of the old name until the invalidation
+    // (sent from a thread of its own) is delivered, or the entry TTL ends.
     eventually("d/moved on node 2", || {
         std::fs::metadata(m2.join("d/moved"))
     });
-    assert!(!m2.join("d/f").exists());
+    std::fs::remove_file(&inval).unwrap();
+    eventually("d/f gone on node 2", || {
+        match m2.join("d/f").try_exists()? {
+            true => Err(std::io::Error::other("still there")),
+            false => Ok(()),
+        }
+    });
     eventually("create d/f on node 2", || {
         std::fs::write(m2.join("d/f"), b"new")
     });
