@@ -1561,6 +1561,49 @@ fn diverged_change_is_kept_as_a_conflict_copy() {
     in_sync(&c, 2);
 }
 
+/// Taking a lock without the previous holder's changes (the handoff or
+/// freshness fallback) is in the lock audit log, which the soak test uses to
+/// excuse reads that miss those changes (#5).
+#[test]
+fn lock_fallbacks_are_in_the_lock_log() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let log = c.node(2).dir.join("locks.log");
+    c.node(2).stop();
+    c.node(2)
+        .env
+        .push(("SYNCFS_TEST_LOCK_LOG".into(), log.display().to_string()));
+    c.node(2).start();
+    c.converge("node 2 back");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    // Node 1 writes while node 2 is frozen, and dies before node 2 gets it.
+    c.node(2).signal(libc::SIGSTOP);
+    std::fs::write(c.node(1).mnt().join("f"), b"from node 1\n").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    c.node(1).kill();
+    c.node(2).signal(libc::SIGCONT);
+    let m2 = c.node(2).mnt();
+    let f = eventually("lock on node 2 without node 1", || open_rw(&m2.join("f")));
+    let read = std::fs::read(m2.join("f")).unwrap();
+    drop(f);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let fell_back: Vec<&str> = text.lines().filter(|l| l.starts_with("F\t")).collect();
+    if read == b"from node 1\n" {
+        // The entry got through before node 2 froze.
+        eprintln!("node 2 had the write already: {fell_back:?}");
+        return;
+    }
+    assert_eq!(read, b"initial\n");
+    assert!(
+        fell_back.iter().any(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            f[1] == "2" && f[3].split(',').any(|o| o == "1") && f[6] == "/f"
+        }),
+        "no fallback without node 1 on /f in {text}"
+    );
+}
+
 /// Removing a file leaves a versioned tombstone: a node with a stale copy
 /// cannot write it back to life unless the remover is unreachable; a write
 /// made after the fallback wins over the remove when the remover returns.
