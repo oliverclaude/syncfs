@@ -8,7 +8,9 @@
 //!   locks at the same moment;
 //! - no lost committed writes: a path whose last operation (clearly after
 //!   all others) succeeded ends with that operation's result, and a read
-//!   under the write lock sees the last write before it;
+//!   under the write lock sees the last write before it, unless the reader
+//!   logged a lock fallback without the writer's changes while taking the
+//!   lock (README, "Lock handoff"; counted as excused);
 //! - no corruption: every file holds exactly what one write wrote;
 //! - conflict copies only where expected: each holds a write of the node it
 //!   names, and that node was cut off or restarted after the write;
@@ -1201,6 +1203,8 @@ fn holds(log: &Path) -> Vec<Hold> {
         );
         let k = (pid, ballot.clone(), key.clone());
         match f[0] {
+            // A fallback, not a change to what is held (see `fallbacks`).
+            "F" => {}
             "H" => {
                 by.insert(
                     k,
@@ -1228,6 +1232,35 @@ fn holds(log: &Path) -> Vec<Hold> {
         }
     }
     by.into_values().collect()
+}
+
+/// Node `node` took `key` at `t` without the changes `origins` made under
+/// it: nobody connected had them (the lock handoff or freshness fallback).
+#[derive(Debug, PartialEq)]
+struct Fallback {
+    node: u16,
+    t: u64,
+    key: String,
+    origins: Vec<u16>,
+}
+
+/// The `F` lines of a lock audit log.
+fn fallbacks(log: &Path) -> Vec<Fallback> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.splitn(7, '\t').collect();
+            if f.len() != 7 || f[0] != "F" {
+                return None;
+            }
+            Some(Fallback {
+                node: f[1].parse().unwrap(),
+                t: f[4].parse().unwrap(),
+                key: f[6].to_string(),
+                origins: f[3].split(',').filter_map(|o| o.parse().ok()).collect(),
+            })
+        })
+        .collect()
 }
 
 /// Lock keys conflict when one is the other or an ancestor of it.
@@ -1271,7 +1304,19 @@ fn check_holders(all: &mut [Hold], bad: &mut Vec<String>) -> usize {
 struct Checker<'a> {
     ops: &'a [Op],
     events: &'a [Event],
+    fallbacks: &'a [Fallback],
     by_id: HashMap<u64, &'a Op>,
+}
+
+/// What [`Checker::locked_read`] made of a read.
+#[derive(Debug, PartialEq)]
+enum LockedRead {
+    /// Not a read whose expected content is known.
+    Unchecked,
+    Checked,
+    /// It missed the last write, but its node took the lock without the
+    /// writer's changes (a documented fallback).
+    Excused,
 }
 
 impl<'a> Checker<'a> {
@@ -1331,16 +1376,30 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// Node `r.node`, while `r` took its lock after `w`, went on without
+    /// `w`'s node's changes under a key covering `r.path`.
+    fn fell_back(&self, r: &Op, w: &Op) -> bool {
+        self.fallbacks.iter().any(|f| {
+            f.node == r.node
+                && f.t > w.end
+                && f.t <= r.end
+                && f.origins.contains(&w.node)
+                && keys_conflict(&f.key, &r.path)
+        })
+    }
+
     /// A read under the write lock sees the last write before it.
-    fn locked_read(&self, r: &Op, bad: &mut Vec<String>) -> bool {
-        let Some(seen) = r.seen else { return false };
+    fn locked_read(&self, r: &Op, bad: &mut Vec<String>) -> LockedRead {
+        let Some(seen) = r.seen else {
+            return LockedRead::Unchecked;
+        };
         let ops: Vec<&Op> = self
             .on(&r.path)
             .into_iter()
             .filter(|o| o.id != r.id)
             .collect();
         let Some(w) = ops.iter().filter(|o| o.end < r.start).max_by_key(|o| o.end) else {
-            return false;
+            return LockedRead::Unchecked;
         };
         // Only when nothing else touched the path until the read ended: the
         // lock is taken some time after the operation started (it may wait
@@ -1352,16 +1411,19 @@ impl<'a> Checker<'a> {
                 .any(|o| o.id != w.id && o.end >= w.start && o.start <= r.end)
             || self.excused(w)
         {
-            return false;
+            return LockedRead::Unchecked;
         }
         if seen != Seen::Write(w.id) {
+            if self.fell_back(r, w) {
+                return LockedRead::Excused;
+            }
             bad.push(format!(
                 "stale read under lock: node {} read {} ({:016x}) and saw {seen:?}, but the last \
                  write before was {:016x} by node {}",
                 r.node, r.path, r.id, w.id, w.node
             ));
         }
-        true
+        LockedRead::Checked
     }
 
     /// Every file holds one write's full content, unless a write that may
@@ -1534,26 +1596,32 @@ fn soak(kinds: &[Kind]) {
     let converge_time = t.elapsed();
 
     let mut bad: Vec<String> = HUNG.lock().unwrap().drain(..).collect();
-    let mut holds_all = Vec::new();
+    let (mut holds_all, mut fallbacks_all) = (Vec::new(), Vec::new());
     for n in &s.nodes {
         holds_all.extend(holds(&n.dir.join("locks.log")));
+        fallbacks_all.extend(fallbacks(&n.dir.join("locks.log")));
     }
     let nholds = holds_all.len();
     let overlaps = check_holders(&mut holds_all, &mut bad);
-    let (mut finals, mut locked_reads, mut copies) = (0, 0, 0);
+    let (mut finals, mut locked_reads, mut excused_reads, mut copies) = (0, 0, 0, 0);
     match &converged {
         None => bad.push(format!("no convergence within 120 s after healing:\n{why}")),
         Some(fin) => {
             let c = Checker {
                 ops: &ops,
                 events: &s.events,
+                fallbacks: &fallbacks_all,
                 by_id: ops.iter().map(|o| (o.id, o)).collect(),
             };
             for p in paths() {
                 finals += usize::from(c.final_state(&p, fin, &mut bad));
             }
             for r in ops.iter().filter(|o| o.kind == OpKind::Rmw) {
-                locked_reads += usize::from(c.locked_read(r, &mut bad));
+                match c.locked_read(r, &mut bad) {
+                    LockedRead::Unchecked => {}
+                    LockedRead::Checked => locked_reads += 1,
+                    LockedRead::Excused => excused_reads += 1,
+                }
             }
             for (p, d) in fin {
                 c.intact(p, d, &mut bad);
@@ -1582,7 +1650,7 @@ fn soak(kinds: &[Kind]) {
     eprintln!(
         "soak: seed {seed:#x}: {} ops, {} faults, {nholds} lock holds ({overlaps} overlapping), \
          converged in {converge_time:?}; checked {finals} final states, {locked_reads} locked \
-         reads; {copies} conflict copies; {torn_reads} unlocked reads saw a file mid-update",
+         reads ({excused_reads} more excused by lock fallbacks); {copies} conflict copies; {torn_reads} unlocked reads saw a file mid-update",
         ops.len(),
         s.events
             .iter()
@@ -1598,12 +1666,14 @@ fn soak(kinds: &[Kind]) {
         let log = std::fs::read_to_string(n.dir.join("log")).unwrap_or_default();
         let count = |pat: &str| log.lines().filter(|l| l.contains(pat)).count();
         eprintln!(
-            "  node {}: {} warnings, {} errors, {} panics, {} freshness fallbacks, {} conflict copies",
+            "  node {}: {} warnings, {} errors, {} panics, {} freshness fallbacks, {} handoff \
+             gaps, {} conflict copies",
             n.id,
             count(" WARN: "),
             count(" ERROR: "),
             count("panicked"),
             count("freshness: no node with version") + count("answered without it"),
+            count("lock handoff: continuing without"),
             count("this node's copy is kept as"),
         );
         // Changes to files deleted while open are not replicated, which is
@@ -1687,4 +1757,110 @@ fn soak_five_nodes_with_daemons() {
         Kind::Daemon,
         Kind::Daemon,
     ]);
+}
+
+// ------------------------------------------------------------ checker tests
+
+/// Node 1 writes `a/f2`; node 3 then reads it under the lock and sees
+/// nothing (#5).
+fn missed_write() -> Vec<Op> {
+    let op = |id, node, kind, start, end, seen| Op {
+        id,
+        node,
+        kind,
+        path: "a/f2".into(),
+        path2: String::new(),
+        start,
+        end,
+        outcome: Outcome::Ok,
+        seen,
+    };
+    vec![
+        op(0x0100_0000_0000_061c, 1, OpKind::Write, 100, 200, None),
+        op(
+            0x0301_0000_0000_061e,
+            3,
+            OpKind::Rmw,
+            300,
+            400,
+            Some(Seen::Empty),
+        ),
+    ]
+}
+
+fn check_read(ops: &[Op], fallbacks: &[Fallback]) -> (LockedRead, Vec<String>) {
+    let c = Checker {
+        ops,
+        events: &[],
+        fallbacks,
+        by_id: ops.iter().map(|o| (o.id, o)).collect(),
+    };
+    let mut bad = Vec::new();
+    (c.locked_read(&ops[1], &mut bad), bad)
+}
+
+fn fallback(node: u16, t: u64, key: &str, origins: &[u16]) -> Fallback {
+    Fallback {
+        node,
+        t,
+        key: key.into(),
+        origins: origins.to_vec(),
+    }
+}
+
+#[test]
+fn checker_reports_a_locked_read_that_missed_the_last_write() {
+    let (got, bad) = check_read(&missed_write(), &[]);
+    assert_eq!(got, LockedRead::Checked);
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert!(
+        bad[0].starts_with("stale read under lock: node 3 read a/f2"),
+        "{bad:?}"
+    );
+}
+
+#[test]
+fn checker_excuses_a_locked_read_after_a_fallback_without_the_writer() {
+    // On the file's key or an ancestor's (a handoff on a directory).
+    for key in ["/a/f2", "/a", "/"] {
+        let (got, bad) = check_read(&missed_write(), &[fallback(3, 350, key, &[1])]);
+        assert_eq!(got, LockedRead::Excused, "{key}");
+        assert!(bad.is_empty(), "{key}: {bad:?}");
+    }
+}
+
+#[test]
+fn checker_excuses_only_a_matching_fallback() {
+    for f in [
+        // Another node fell back.
+        fallback(2, 350, "/a/f2", &[1]),
+        // Without another node's changes.
+        fallback(3, 350, "/a/f2", &[2]),
+        // On another file.
+        fallback(3, 350, "/a/f1", &[1]),
+        // Before the write ended, or after the read.
+        fallback(3, 150, "/a/f2", &[1]),
+        fallback(3, 450, "/a/f2", &[1]),
+    ] {
+        let (got, bad) = check_read(&missed_write(), std::slice::from_ref(&f));
+        assert_eq!(got, LockedRead::Checked, "{f:?}");
+        assert_eq!(bad.len(), 1, "{f:?}: {bad:?}");
+    }
+}
+
+#[test]
+fn checker_reads_fallbacks_from_the_lock_log_without_ending_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("locks.log");
+    std::fs::write(
+        &log,
+        "H\t3\t42\t7.3\t100\t900\t/a/f2\n\
+         F\t3\t42\t1,2\t150\t0\t/a/f2\n\
+         X\t3\t42\t7.3\t200\t0\t/a/f2\n",
+    )
+    .unwrap();
+    assert_eq!(fallbacks(&log), vec![fallback(3, 150, "/a/f2", &[1, 2])]);
+    let h = holds(&log);
+    assert_eq!(h.len(), 1);
+    assert_eq!((h[0].start, h[0].end()), (100, 200));
 }
