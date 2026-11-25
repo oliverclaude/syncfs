@@ -695,6 +695,61 @@ impl Repl {
         self.state().counters.unrecorded_changes += 1;
     }
 
+    /// If `path` is the last link of a live file, bury it and append a
+    /// Remove/tombstone so a peer applying an earlier Data for that
+    /// FileId can skip instead of stalling when the bytes are gone
+    /// (issue #2). Other links stay; `insert` / `rename` drop only this
+    /// path. No-op when the path is free or is one of several links.
+    fn displace_last_link(&self, st: &mut State, path: &[u8]) {
+        let Some(id) = st.index.get(path) else {
+            return;
+        };
+        let Some(rec) = st.index.rec(&id) else {
+            return;
+        };
+        if rec.paths.len() != 1 {
+            return;
+        }
+        let version = st.sessions.get(&id).map(|s| s.version).or(rec.version);
+        let superseded = st.sessions.get(&id).and_then(|s| s.superseded);
+        if let Some(version) = version {
+            st.index.bury(id, version);
+            if let Some(v) = superseded.filter(|v| *v < version) {
+                st.index.note_lineage(id, v);
+            }
+            st.dirty.forget(id);
+            st.sessions.remove(&id);
+            st.window_drop.insert(id);
+            let lineage = st.index.lineage(&id);
+            let seq = self.append(
+                st,
+                Entry::Remove {
+                    id: Some(id),
+                    path: path.to_vec(),
+                    dir: false,
+                    version: Some(version),
+                    lineage,
+                },
+            );
+            st.awaiting.insert(seq, (id, version));
+            st.holders.entry((id, version)).or_default().insert(self.me);
+        } else {
+            let id = st.index.remove_path(path).unwrap_or(id);
+            st.dirty.forget(id);
+            st.sessions.remove(&id);
+            self.append(
+                st,
+                Entry::Remove {
+                    id: Some(id),
+                    path: path.to_vec(),
+                    dir: false,
+                    version: None,
+                    lineage: Vec::new(),
+                },
+            );
+        }
+    }
+
     fn try_record(&self, op: &Mutation<'_>) -> std::io::Result<()> {
         match *op {
             Mutation::Create { parent, name, .. } => {
@@ -708,6 +763,7 @@ impl Repl {
                 };
                 let id = FileId::random();
                 let mut s = self.state();
+                self.displace_last_link(&mut s, &path);
                 s.index.insert(&path, id);
                 self.append(
                     &mut s,
@@ -720,6 +776,8 @@ impl Repl {
                         target,
                     },
                 );
+                drop(s);
+                self.cv.notify_all();
             }
             Mutation::Link {
                 node,
@@ -820,6 +878,13 @@ impl Repl {
                 if flags & libc::RENAME_EXCHANGE != 0 {
                     s.index.exchange(&from, &to);
                 } else {
+                    // POSIX unlinks the destination first. A last link
+                    // needs a tombstone in the journal before the Rename
+                    // so a peer can skip earlier Data for that FileId.
+                    // RENAME_EXCHANGE swaps two paths; nothing is dropped.
+                    if replaced.filter(|r| Some(*r) != id).is_some() {
+                        self.displace_last_link(&mut s, &to);
+                    }
                     s.index.rename(&from, &to);
                     if let Some(r) = replaced.filter(|r| Some(*r) != id) {
                         if s.index.rec(&r).is_none() {
@@ -837,6 +902,8 @@ impl Repl {
                         flags,
                     },
                 );
+                drop(s);
+                self.cv.notify_all();
             }
             Mutation::SetAttr { node, change } => {
                 let path = path_bytes(&node.path()?);
