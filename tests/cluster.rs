@@ -522,22 +522,20 @@ fn locks_conflicting_open_is_busy_and_reads_stay_local() {
         Some(libc::EBUSY)
     );
     std::fs::write(c.node(2).mnt().join("other"), b"ok").unwrap();
-    // .syncfs/locks on the holder and the voter's view of it.
+    // .syncfs/locks on the holder, including its own vote: this node
+    // confirms its lease locally, and a mount renders status live. Waiting
+    // on the daemon voter (node 3) flakes: quorum is 2 of 3, so that node
+    // may only have a short provisional grant, and it rewrites status.json
+    // only every 5 heartbeats (issue #11).
     let held = c.node(1).status("locks").unwrap();
     assert_eq!(held["held"], 1, "{held:#}");
     assert_eq!(held["locks"][0]["path"], "/f");
     assert_eq!(held["locks"][0]["valid"], true);
-    // The voter writes status.json every 5 heartbeats.
-    eventually("voter shows the lease", || {
-        let v = c.node(3).status("locks").unwrap_or_default();
-        let leased = v["votes"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|g| g["path"] == "/f" && g["holder"] == 1 && g["state"] == "leased")
-        });
-        leased
-            .then_some(())
-            .ok_or_else(|| std::io::Error::other(format!("{v:#}")))
+    let leased = held["votes"].as_array().is_some_and(|a| {
+        a.iter()
+            .any(|g| g["path"] == "/f" && g["holder"] == 1 && g["state"] == "leased")
     });
+    assert!(leased, "{held:#}");
     // Closing releases.
     drop(w);
     let mut w2 = eventually("node 2 opens after release", || open_rw(&f2));
