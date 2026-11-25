@@ -480,6 +480,81 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
     assert!(err.contains("DEBUG"), "{err}");
 }
 
+/// An old daemon must not fusermount a newer filesystem already mounted at
+/// the same path when its Session is dropped (#26).
+#[test]
+fn exiting_daemon_does_not_unmount_a_newer_mount_at_the_same_path() {
+    require_fuse!();
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, mnt) = (tmp.path().join("b"), tmp.path().join("m"));
+    fs::create_dir(&b).unwrap();
+    fs::create_dir(&mnt).unwrap();
+    let state1 = tmp.path().join("state1");
+    let state2 = tmp.path().join("state2");
+
+    let out = Command::new(BIN)
+        .args([&b, &mnt])
+        .args(["--config", "/dev/null", "--state-dir"])
+        .arg(&state1)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(is_mounted(&mnt));
+    let daemon_pid: u32 = fs::read_to_string(state1.join("syncfs.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("daemon pid file");
+
+    // Stop the old daemon before unmounting so its Session drop is delayed
+    // until after the remount, deterministically. A regular umount waits
+    // for the daemon and hangs if it is stopped, so detach lazily.
+    let rc = unsafe { libc::kill(daemon_pid as i32, libc::SIGSTOP) };
+    assert_eq!(rc, 0, "SIGSTOP: {}", std::io::Error::last_os_error());
+    unmount_lazy(&mnt);
+    wait_until_for("unmount", MOUNT_WAIT, || !is_mounted(&mnt));
+
+    let mut child = Command::new(BIN)
+        .args([&b, &mnt])
+        .args(["--config", "/dev/null", "-o", "debug", "--state-dir"])
+        .arg(&state2)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut s).unwrap();
+        s
+    });
+    let drain = wait_for_debug_mount(&mut child, drain, &mnt);
+    fs::write(mnt.join("marker"), b"new").unwrap();
+
+    let rc = unsafe { libc::kill(daemon_pid as i32, libc::SIGCONT) };
+    assert_eq!(rc, 0, "SIGCONT: {}", std::io::Error::last_os_error());
+    wait_until_for("old daemon exit", MOUNT_WAIT, || {
+        !process_exists(daemon_pid)
+    });
+
+    let new_status = child.try_wait().unwrap();
+    if !is_mounted(&mnt) || new_status.is_some() {
+        if new_status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let err = drain.join().unwrap();
+        panic!("old daemon unmounted the new filesystem; new process status={new_status:?}: {err}");
+    }
+    assert_eq!(fs::read(mnt.join("marker")).unwrap(), b"new");
+    unmount(&mnt);
+    assert!(child.wait().unwrap().success());
+    let _ = drain.join();
+}
+
 #[test]
 fn sigterm_unmounts_cleanly() {
     require_fuse!();
@@ -618,6 +693,26 @@ fn multi_user_as_root() {
 
 fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Detaches the mount without waiting for the daemon (which may be stopped).
+fn unmount_lazy(mountpoint: &Path) {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let out = if is_root {
+        Command::new("umount").arg("-l").arg(mountpoint).output()
+    } else {
+        Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(mountpoint)
+            .output()
+    }
+    .unwrap();
+    assert!(
+        out.status.success() || !is_mounted(mountpoint),
+        "lazy unmount {}: {}",
+        mountpoint.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Waits until `mnt` is mounted. On timeout or if the child exits first,
