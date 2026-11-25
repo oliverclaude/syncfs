@@ -428,13 +428,19 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
     assert!(is_mounted(&mnt));
     fs::write(mnt.join("f"), b"daemon").unwrap();
     assert_eq!(fs::read(b.join("f")).unwrap(), b"daemon");
+    let daemon_pid: u32 = fs::read_to_string(state.join("syncfs.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("daemon pid file");
     unmount(&mnt);
     wait_until_for("unmount", MOUNT_WAIT, || !is_mounted(&mnt));
-    // The daemon still closes its store after the unmount; the next mount
-    // with the same state directory can only open it after that.
-    wait_until_for("daemon exit", MOUNT_WAIT, || {
-        store_free(&state.join("store.redb"))
-    });
+    // After an external unmount the daemon still drops its fuser Session,
+    // which calls fusermount on the path. Remounting the same mountpoint
+    // before that process exits can unmount the new filesystem (#22).
+    // store.redb is never opened for a standalone mount, so a lock on it
+    // is not a valid wait.
+    wait_until_for("daemon exit", MOUNT_WAIT, || !process_exists(daemon_pid));
 
     // A failing mount reports the error and a non-zero status.
     let out = Command::new(BIN)
@@ -462,7 +468,7 @@ fn daemonizes_by_default_and_debug_stays_in_foreground() {
         std::io::Read::read_to_string(&mut stderr, &mut s).unwrap();
         s
     });
-    wait_until_for("debug mount", MOUNT_WAIT, || is_mounted(&mnt));
+    let drain = wait_for_debug_mount(&mut child, drain, &mnt);
     let _ = fs::read_dir(&mnt).unwrap().count();
     assert!(
         child.try_wait().unwrap().is_none(),
@@ -610,17 +616,38 @@ fn multi_user_as_root() {
     m.finish();
 }
 
-/// Whether no process holds the store's lock (redb takes an exclusive
-/// `flock` while open).
-fn store_free(p: &std::path::Path) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(f) = fs::File::open(p) else {
-        return true;
-    };
-    let fd = f.as_raw_fd();
-    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return false;
+fn process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Waits until `mnt` is mounted. On timeout or if the child exits first,
+/// joins the stderr drain (killing the child if it is still running) and
+/// panics with that output so the failure says why.
+fn wait_for_debug_mount(
+    child: &mut std::process::Child,
+    drain: std::thread::JoinHandle<String>,
+    mnt: &Path,
+) -> std::thread::JoinHandle<String> {
+    let timeout = common::wait_floor(MOUNT_WAIT);
+    let start = std::time::Instant::now();
+    loop {
+        if is_mounted(mnt) {
+            return drain;
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_some() || start.elapsed() >= timeout {
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let err = drain.join().unwrap();
+            match status {
+                Some(status) => {
+                    panic!("debug mount exited before the mount appeared ({status}): {err}")
+                }
+                None => panic!("timed out waiting for debug mount: {err}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
-    true
 }
