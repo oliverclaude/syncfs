@@ -1460,6 +1460,87 @@ fn crash_while_writing_resends_after_restart() {
     assert_eq!(r["unclean_start"], false, "{r:#}");
 }
 
+/// A killed node can come back with a file still in the index but empty on
+/// disk. The peer has the bytes. A path-only comparison reports nothing to
+/// restore and the node stays in sync with the empty file (issue #2).
+#[test]
+fn restarted_node_repairs_an_empty_file_a_peer_still_has() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let body = b"content that must survive\n";
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    std::fs::write(c.node(1).mnt().join("f"), body).unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has the write", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&body[..])).then_some(())
+    });
+    c.node(2).kill();
+    // Crash window: the path is still there, the bytes are not.
+    std::fs::write(b2.join("f"), b"").unwrap();
+    c.node(2).start();
+    c.converge("node 2 back");
+    wait_for("node 2 restored the content", || {
+        (std::fs::read(c.node(2).backing().join("f")).ok().as_deref() == Some(&body[..]))
+            .then_some(())
+    });
+    let r = in_sync(&c, 2);
+    assert_eq!(r["in_sync"], true, "{r:#}");
+}
+
+/// Node 3 is behind. The origin journals a write, a peer has the bytes, then
+/// the origin's backing file is gone so a pull from the origin returns
+/// found=false. Applying that as "gone; a later entry will say" leaves node 3
+/// empty and in sync (issue #2).
+#[test]
+fn data_gone_at_the_origin_is_fetched_from_another_peer() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "5s",
+            "--freshness-timeout",
+            "2s",
+        ],
+    );
+    let gate = c.node(3).dir.join("hold-apply");
+    c.node(3)
+        .env
+        .push(("SYNCFS_TEST_HOLD_APPLY".into(), gate.display().to_string()));
+    for n in &c.nodes {
+        if n.kind == Kind::Mount {
+            std::fs::write(n.backing().join("f"), b"initial\n").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    // A first change lets node 3 pass start-up rejoin before the hold.
+    std::fs::write(c.node(1).mnt().join("ready"), b"1").unwrap();
+    wait_for("node 3 has ready", || {
+        c.node(3).backing().join("ready").exists().then_some(())
+    });
+    std::fs::write(&gate, b"1").unwrap();
+    let body = b"bytes still on a peer\n";
+    std::fs::write(c.node(1).mnt().join("f"), body).unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has the write", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&body[..])).then_some(())
+    });
+    // Origin index still names the file, but a pull finds nothing there.
+    std::fs::remove_file(c.node(1).backing().join("f")).unwrap();
+    std::fs::remove_file(&gate).unwrap();
+    wait_for("node 3 fetched the content from a peer", || {
+        (std::fs::read(c.node(3).backing().join("f")).ok().as_deref() == Some(&body[..]))
+            .then_some(())
+    });
+    let r = in_sync(&c, 3);
+    assert_eq!(r["in_sync"], true, "{r:#}");
+}
+
 /// A change reaches a node whose origin went away before it could send it:
 /// a third mount forwards it, ordered and once.
 #[test]
