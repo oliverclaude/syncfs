@@ -66,11 +66,14 @@ impl Repl {
     fn copy_whole(&self, source: NodeId, id: FileId, version: Version) -> Applied {
         match self.copy_from(id, source, super::fresh::Copy::Relayed) {
             Ok(Some(v)) if v >= version => Ok(true),
-            Ok(v) => Err(ApplyError::Retry(io::Error::other(format!(
-                "node {source} has {v:?} of {id}, not {version:?}"
-            )))),
-            // Gone there; a later entry says what happened.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            // Gone there, rebuilding, or still on an older copy: another
+            // data peer may have the bytes (issue #2).
+            Ok(_) => self.fetch_elsewhere(source, id, version),
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                self.fetch_elsewhere(source, id, version)
+            }
             Err(e) => Err(ApplyError::Retry(e)),
         }
     }
@@ -335,8 +338,10 @@ impl Repl {
                 .map_err(ApplyError::Retry)?;
             restart = false;
             if !pulled.found {
-                // Gone at the origin; a later entry says what happened.
-                return Ok(false);
+                // Gone at the origin (removed, or the path cannot be
+                // opened). Another data peer may still have the bytes.
+                self.bind(id, &path);
+                return self.fetch_elsewhere(origin, id, version);
             }
             if !pulled.more {
                 break pulled.size;
@@ -349,5 +354,57 @@ impl Repl {
         self.record_version(id, &path, version, lineage);
         self.invalidate(&path);
         Ok(true)
+    }
+
+    /// The origin (or relay) of this data has no bytes for `id`. Try every
+    /// other connected data peer. If none have at least `version`, skip
+    /// only when a later Remove or newer Data for `id` is already queued;
+    /// otherwise retry, so the entry is not marked applied (issue #2).
+    fn fetch_elsewhere(&self, skip: NodeId, id: FileId, version: Version) -> Applied {
+        for p in self.data_peers_up() {
+            if p == skip {
+                continue;
+            }
+            match self.copy_from(id, p, super::fresh::Copy::Relayed) {
+                Ok(Some(v)) if v >= version => {
+                    log::info!(
+                        "replication: {id} version {version:?} was gone at node {skip};                          fetched from node {p}"
+                    );
+                    return Ok(true);
+                }
+                Ok(_) => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(ApplyError::Retry(e)),
+            }
+        }
+        if self.later_replace_known(id, version) {
+            return Ok(false);
+        }
+        Err(ApplyError::Retry(io::Error::other(format!(
+            "no connected node has version {version:?} of {id}"
+        ))))
+    }
+
+    /// A later Remove or a newer Data for `id` is already in the inbox.
+    /// The current entry has been popped; anything still queued comes
+    /// after it, or is from another origin.
+    fn later_replace_known(&self, id: FileId, version: Version) -> bool {
+        let inbox = super::core::lock(&self.inbox);
+        inbox.values().any(|ib| {
+            ib.queue.values().any(|q| match &q.entry {
+                Entry::Remove { id: Some(fid), .. } if *fid == id => true,
+                Entry::Data {
+                    id: fid,
+                    version: v,
+                    ..
+                } if *fid == id && *v > version => true,
+                _ => false,
+            })
+        })
     }
 }
