@@ -251,6 +251,22 @@ impl Repl {
         Ok(fallback)
     }
 
+    /// Whether the local file at `path` has different block hashes from
+    /// `source`'s copy of `id`.
+    pub(crate) fn content_differs(
+        &self,
+        id: FileId,
+        path: &[u8],
+        source: NodeId,
+    ) -> io::Result<bool> {
+        let remote = self.remote_hashes(source, id)?;
+        if remote.removed {
+            return Ok(false);
+        }
+        let (diff, _) = self.differing(path, &remote)?;
+        Ok(!diff.is_empty())
+    }
+
     /// Makes the local copy of `id` equal to `source`'s. Returns the
     /// version it then has.
     pub(crate) fn catch_up(&self, id: FileId, source: NodeId) -> io::Result<Option<Version>> {
