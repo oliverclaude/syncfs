@@ -1541,6 +1541,70 @@ fn data_gone_at_the_origin_is_fetched_from_another_peer() {
     assert_eq!(r["in_sync"], true, "{r:#}");
 }
 
+/// The origin writes a file, then replaces it by renaming another file
+/// over the path, which drops the old FileId's last link and leaves the
+/// origin without those bytes. A peer still holding the earlier Data
+/// must not stall on `found: false` (issue #2, path replace).
+#[test]
+fn data_replaced_by_rename_over_does_not_stall_a_peer() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "5s",
+            "--freshness-timeout",
+            "2s",
+        ],
+    );
+    let gate = c.node(3).dir.join("hold-apply");
+    c.node(3)
+        .env
+        .push(("SYNCFS_TEST_HOLD_APPLY".into(), gate.display().to_string()));
+    for n in &c.nodes {
+        if n.kind == Kind::Mount {
+            std::fs::write(n.backing().join("f"), b"initial\n").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    std::fs::write(c.node(1).mnt().join("ready"), b"1").unwrap();
+    wait_for("node 3 has ready", || {
+        c.node(3).backing().join("ready").exists().then_some(())
+    });
+    std::fs::write(&gate, b"1").unwrap();
+    let old = b"bytes that will be replaced\n";
+    std::fs::write(c.node(1).mnt().join("f"), old).unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has the first write", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&old[..])).then_some(())
+    });
+    let new = b"replacement content\n";
+    std::fs::write(c.node(1).mnt().join("g"), new).unwrap();
+    std::fs::rename(c.node(1).mnt().join("g"), c.node(1).mnt().join("f")).unwrap();
+    wait_for("node 2 has the replacement", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&new[..]) && !b2.join("g").exists())
+            .then_some(())
+    });
+    std::fs::remove_file(&gate).unwrap();
+    wait_for("node 3 applied the replacement without stalling", || {
+        (std::fs::read(c.node(3).backing().join("f")).ok().as_deref() == Some(&new[..])
+            && !c.node(3).backing().join("g").exists())
+        .then_some(())
+    });
+    let r = in_sync(&c, 3);
+    assert_eq!(r["in_sync"], true, "{r:#}");
+    let log = std::fs::read_to_string(c.node(3).dir.join("log")).unwrap_or_default();
+    assert!(
+        !log.contains("no connected node has version"),
+        "peer stalled on the replaced Data:\n{log}"
+    );
+}
+
 /// A change reaches a node whose origin went away before it could send it:
 /// a third mount forwards it, ordered and once.
 #[test]
