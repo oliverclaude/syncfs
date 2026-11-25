@@ -1,7 +1,7 @@
 //! Mounting: turns a [`Config`] into a running FUSE session, in the
 //! foreground or as a daemon.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -594,6 +594,34 @@ fn umount(p: &Path, flags: libc::c_int) -> std::io::Result<()> {
     }
 }
 
+/// Whether this process's /dev/fuse connection is still mounted. After an
+/// external unmount the fd reports POLLERR (or POLLHUP); a later filesystem
+/// at the same path is a different connection, so this does not confuse it
+/// with ours. Mount IDs and FUSE device numbers can be reused immediately.
+fn fuse_connection_is_live(fd: impl AsFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_fd().as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: pfd points to one valid pollfd, timeout 0.
+        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            log::debug!("poll /dev/fuse: {err}");
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+        return pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0;
+    }
+}
+
 /// A lazy unmount for a non-root mount, through fusermount3.
 fn fusermount_lazy(p: &Path) -> std::io::Result<()> {
     // fuser's unmount may have detached it already.
@@ -618,7 +646,7 @@ fn fusermount_lazy(p: &Path) -> std::io::Result<()> {
 /// SIGHUP reloads the configuration.
 fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
     let Served {
-        mut session,
+        session,
         mountpoint,
         direct,
         net,
@@ -627,9 +655,22 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         registration,
     } = served;
     let mut reloader = reloader.expect("set once mounted");
-    let mut unmounter = session.unmount_callable();
+    // Session::run consumes the session and unmounts the path when it
+    // returns, even if a newer filesystem is already mounted there (#26).
+    // spawn() takes the Mount out first, so we can decide whether to
+    // unmount after the session has ended. The signal thread unmounts
+    // the path itself: SessionUnmounter would be empty after spawn().
+    // Mount IDs and FUSE device numbers are reused at once, so we check
+    // this connection's /dev/fuse fd, not the path, to see if the mount
+    // is still ours.
+    let fuse_fd = session
+        .as_fd()
+        .try_clone_to_owned()
+        .context("duplicating /dev/fuse")?;
+    let fuse_fd_signals = fuse_fd.try_clone().context("duplicating /dev/fuse")?;
     let unmounting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&unmounting);
+    let mp = mountpoint.clone();
     std::thread::spawn(move || {
         // The first signal unmounts; if the mount is busy, it keeps serving
         // and a later signal detaches it lazily (it then goes away when the
@@ -642,18 +683,22 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
             true
         });
         for (i, sig) in stops.enumerate() {
+            if !fuse_connection_is_live(&fuse_fd_signals) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             let res = if i == 0 {
                 log::info!("signal {sig}: unmounting");
                 match &direct {
-                    Some(p) => umount(p, 0),
-                    None => unmounter.unmount(),
+                    Some(_) => umount(&mp, 0),
+                    None => fusermount_unmount(&mp),
                 }
             } else {
                 log::warn!("signal {sig} again: detaching the mount lazily");
                 match &direct {
-                    Some(p) => umount(p, libc::MNT_DETACH),
-                    None => fusermount_lazy(&mountpoint),
+                    Some(_) => umount(&mp, libc::MNT_DETACH),
+                    None => fusermount_lazy(&mp),
                 }
             };
             match res {
@@ -665,16 +710,22 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
             }
         }
     });
-    let res = match session.run() {
+    let mut bg = session.spawn().context("starting FUSE session")?;
+    // Take the join handle without dropping `bg`, which still holds the
+    // Mount and would fusermount the path if dropped. The dummy is reaped
+    // when `bg` is dropped or forgotten.
+    let session_res = std::mem::replace(&mut bg.guard, std::thread::spawn(|| Ok(()))).join();
+    let res = match session_res {
         // After a lazy detach some kernels abort the connection when the
         // last file is closed instead of ending it: that is the unmount.
-        Err(e)
+        Ok(Err(e))
             if e.raw_os_error() == Some(libc::ECONNABORTED)
                 && unmounting.load(std::sync::atomic::Ordering::SeqCst) =>
         {
             Ok(())
         }
-        r => r.context("serving filesystem"),
+        Ok(r) => r.context("serving filesystem"),
+        Err(_) => bail!("FUSE session thread panicked"),
     };
     match cluster {
         Some(c) => c.stop(),
@@ -685,7 +736,32 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
         }
     }
     drop(registration);
+    // Dropping the background session fusermounts the path. Do that only
+    // when this connection is still mounted: otherwise we would unmount a
+    // newer filesystem at the same path (#26).
+    if !fuse_connection_is_live(&fuse_fd) {
+        log::debug!(
+            "not unmounting {}: this process's FUSE connection is already gone",
+            mountpoint.display()
+        );
+        if let Err(e) = &res {
+            log::debug!("session ended after the mount was replaced or removed: {e:#}");
+        }
+        std::mem::forget(bg);
+        log::info!("unmounted");
+        return Ok(());
+    }
     res?;
     log::info!("unmounted");
     Ok(())
+}
+
+/// A user-mount unmount, matching fuser's Session drop: umount(2), then a
+/// lazy fusermount3 when that is not permitted.
+fn fusermount_unmount(p: &Path) -> std::io::Result<()> {
+    match umount(p, 0) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) => fusermount_lazy(p),
+        Err(e) => Err(e),
+    }
 }
