@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -448,6 +450,28 @@ fn daemons_99_nodes() {
 // directory before the cluster starts.
 
 const LEASE: Duration = Duration::from_secs(1);
+
+fn cpath(p: &std::path::Path) -> CString {
+    CString::new(p.as_os_str().as_bytes()).unwrap()
+}
+
+fn rename_exchange(a: &std::path::Path, b: &std::path::Path) {
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            cpath(a).as_ptr(),
+            libc::AT_FDCWD,
+            cpath(b).as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "RENAME_EXCHANGE failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
 
 fn lock_cluster(kinds: &[Kind], lock_wait: &str, files: &[&str]) -> Cluster {
     lock_cluster_with(kinds, lock_wait, |backing| {
@@ -1605,7 +1629,139 @@ fn data_replaced_by_rename_over_does_not_stall_a_peer() {
     );
 }
 
-/// A change reaches a node whose origin went away before it could send it:
+/// Renaming over one of two hard links must not tombstone the FileId:
+/// the remaining link still has the bytes, and a peer can fetch them.
+#[test]
+fn rename_over_one_hard_link_keeps_the_other() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "5s",
+            "--freshness-timeout",
+            "2s",
+        ],
+    );
+    let gate = c.node(3).dir.join("hold-apply");
+    c.node(3)
+        .env
+        .push(("SYNCFS_TEST_HOLD_APPLY".into(), gate.display().to_string()));
+    for n in &c.nodes {
+        if n.kind == Kind::Mount {
+            std::fs::write(n.backing().join("f"), b"initial\n").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    std::fs::write(c.node(1).mnt().join("ready"), b"1").unwrap();
+    wait_for("node 3 has ready", || {
+        c.node(3).backing().join("ready").exists().then_some(())
+    });
+    std::fs::write(&gate, b"1").unwrap();
+    let old = b"kept on the other link\n";
+    std::fs::write(c.node(1).mnt().join("f"), old).unwrap();
+    std::fs::hard_link(c.node(1).mnt().join("f"), c.node(1).mnt().join("h")).unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has the file and the hard link", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&old[..])
+            && std::fs::read(b2.join("h")).ok().as_deref() == Some(&old[..]))
+        .then_some(())
+    });
+    let new = b"replacement at f\n";
+    std::fs::write(c.node(1).mnt().join("g"), new).unwrap();
+    std::fs::rename(c.node(1).mnt().join("g"), c.node(1).mnt().join("f")).unwrap();
+    wait_for("node 2 has f replaced and h unchanged", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&new[..])
+            && std::fs::read(b2.join("h")).ok().as_deref() == Some(&old[..]))
+        .then_some(())
+    });
+    std::fs::remove_file(&gate).unwrap();
+    wait_for("node 3 has f replaced and h unchanged", || {
+        (std::fs::read(c.node(3).backing().join("f")).ok().as_deref() == Some(&new[..])
+            && std::fs::read(c.node(3).backing().join("h")).ok().as_deref() == Some(&old[..]))
+        .then_some(())
+    });
+    let r = in_sync(&c, 3);
+    assert_eq!(r["in_sync"], true, "{r:#}");
+    let log = std::fs::read_to_string(c.node(3).dir.join("log")).unwrap_or_default();
+    assert!(
+        !log.contains("no connected node has version"),
+        "peer stalled fetching Data still present on a remaining link:\n{log}"
+    );
+}
+
+/// RENAME_EXCHANGE swaps two paths and drops neither FileId, so a peer
+/// applying earlier Data can still fetch the bytes from the origin.
+#[test]
+fn rename_exchange_does_not_drop_either_file() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "5s",
+            "--freshness-timeout",
+            "2s",
+        ],
+    );
+    let gate = c.node(3).dir.join("hold-apply");
+    c.node(3)
+        .env
+        .push(("SYNCFS_TEST_HOLD_APPLY".into(), gate.display().to_string()));
+    for n in &c.nodes {
+        if n.kind == Kind::Mount {
+            std::fs::write(n.backing().join("f"), b"initial-f\n").unwrap();
+            std::fs::write(n.backing().join("g"), b"initial-g\n").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    std::fs::write(c.node(1).mnt().join("ready"), b"1").unwrap();
+    wait_for("node 3 has ready", || {
+        c.node(3).backing().join("ready").exists().then_some(())
+    });
+    std::fs::write(&gate, b"1").unwrap();
+    let a = b"content of f\n";
+    let b = b"content of g\n";
+    std::fs::write(c.node(1).mnt().join("f"), a).unwrap();
+    std::fs::write(c.node(1).mnt().join("g"), b).unwrap();
+    let b2 = c.node(2).backing();
+    wait_for("node 2 has both writes", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&a[..])
+            && std::fs::read(b2.join("g")).ok().as_deref() == Some(&b[..]))
+        .then_some(())
+    });
+    rename_exchange(&c.node(1).mnt().join("f"), &c.node(1).mnt().join("g"));
+    wait_for("node 2 has the swap", || {
+        (std::fs::read(b2.join("f")).ok().as_deref() == Some(&b[..])
+            && std::fs::read(b2.join("g")).ok().as_deref() == Some(&a[..]))
+        .then_some(())
+    });
+    std::fs::remove_file(&gate).unwrap();
+    wait_for("node 3 has the swap", || {
+        (std::fs::read(c.node(3).backing().join("f")).ok().as_deref() == Some(&b[..])
+            && std::fs::read(c.node(3).backing().join("g")).ok().as_deref() == Some(&a[..]))
+        .then_some(())
+    });
+    let r = in_sync(&c, 3);
+    assert_eq!(r["in_sync"], true, "{r:#}");
+    let log = std::fs::read_to_string(c.node(3).dir.join("log")).unwrap_or_default();
+    assert!(
+        !log.contains("no connected node has version"),
+        "peer stalled after RENAME_EXCHANGE:\n{log}"
+    );
+}
+
+/// A change reaches whose origin went away before it could send it:
 /// a third mount forwards it, ordered and once.
 #[test]
 fn changes_are_forwarded_when_the_origin_is_down() {
