@@ -18,6 +18,103 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-26 — Replication: journal-first Create, Rename and Unlink (#2)
+
+**Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
+
+A SIGKILL after a successful `renameat` (or the same window on unlink
+and create) and before the journal record left the backing tree changed
+and the index and journal stale (soak 0x6 r1). Closing that window by
+journaling before the syscall raised three choices.
+
+**Journal rollback.** Options recorded then:
+
+1. Retract only while the entry is not yet durable: `append` in memory,
+   syscall, then flush; on syscall failure, drop the last in-memory seq
+   and revert the index (`next` goes back). Peers never saw it. Does
+   **not** close the 0x6 SIGKILL window (kill after a successful syscall
+   and before flush is the same hole).
+2. Flush (durable) before the syscall, but do not notify/send until the
+   syscall succeeds. On in-process syscall failure, drop the durable
+   entry from the store and the in-memory journal, and **do not reuse
+   its seq** (`next` stays). On crash between flush and syscall,
+   recovery must choose: redo the syscall (journal is truth) or cancel
+   the unsent durable entry (backing is truth). That recovery rule is a
+   further choice inside this option.
+3. Flush as today so the seq is durable, and on syscall failure append
+   a compensating journal entry (inverse Rename / undelete / drop the
+   Create) and revert the index. Never retract a seq. Peers that already
+   applied the first entry apply the compensate. Crash between durable
+   append and syscall still needs a recovery redo (or the compensate is
+   written on restart).
+
+**Choice.** 3. A not-yet-flushed in-memory entry may still be retracted
+if `flush_now` fails before the seq is committed (peers never saw it).
+
+**Unclean start.** After a crash between the durable append and the
+syscall, the journal and index already have the Create/Rename/Remove,
+backing does not, and a peer may already have applied the durable
+entry. Redo and compensate both end with every node agreeing, but they
+agree on opposite outcomes. Options recorded then:
+
+1. On unclean start, redo the syscall so backing matches the
+   already-durable journal and index. If redo fails (ENOSPC, dest
+   taken, `from` gone, …), then write the compensate and revert the
+   index, same as an in-process syscall failure. Peers that already
+   applied the first entry stay on that state when redo succeeds; they
+   only undo if redo cannot complete. User-visible: a published
+   operation is completed when possible.
+2. On unclean start, always write the compensate and revert the index
+   (treat the crash as a failed syscall). Backing is already in the
+   pre-op state, so the origin is consistent as soon as the index is
+   reverted. Peers that already applied the first entry apply the
+   inverse and undo. User-visible: a crash aborts the operation, even
+   if a peer already exposed the new tree. One recovery path; no redo
+   of a syscall that might now fail for a new reason.
+3. Redo if any peer has already acknowledged the durable entry (someone
+   applied it; completing it avoids an undo). Compensate if no peer has
+   acked it yet (the seq is still not reused; the first entry and the
+   compensate are both sent, or both sit durable until sent together).
+   Minimises user-visible undos when no one has seen the op, but the
+   ack set can be stale across a crash, and a peer may have received
+   the entry without acking yet, so this can still undo or still
+   complete in the opposite case.
+
+**Choice.** 3. If the redo fails, compensate. A crash after a successful
+syscall, with the inflight marker still set, is treated as already
+done, not compensated. A peer may have received the entry without
+acking yet, and the ack set can be stale across a crash, so this can
+still undo or still complete in the opposite case (the stale-ack
+caveat).
+
+**Create metadata.** `Entry::Create` cannot be filled from a post-syscall
+`stat` if the Create is journaled first: birth times do not exist until
+the inode is created, and `Mutation::Create` previously carried only
+`parent`, `name`, and `kind`. Options recorded then:
+
+1. Extend `Mutation::Create` with the intended metadata already known
+   from the FUSE request and the chown policy (mode after umask,
+   uid/gid, rdev, symlink target). Journal `Create` with those attrs
+   before the syscall. Times are default (zeros, or "now" when a peer
+   applies). After the local syscall, do not append a follow-up `Attr`
+   just to copy birth times. Peers may have a slightly different
+   mtime/atime than the origin.
+2. Same pre-syscall `Create` with intended mode, owner, kind, rdev, and
+   target, then after the syscall succeeds append an `Attr`/`SetAttr`
+   from the real `stat` so peers converge on the origin's times (and
+   any unexpected chown result). Every successful create becomes two
+   journal entries.
+3. Move only Rename and Unlink to journal-first, and keep recording
+   Create from `stat` after the syscall (today's shape). Leaves the 0x6
+   crash window open for create: a SIGKILL after `mknod`/`chown` and
+   before record still yields an unindexed backing file (the same adopt
+   hole, for creates). Incomplete against the brief, but splits the
+   work if Create metadata should stay post-syscall.
+
+**Choice.** 2.
+
+**Status.** Implemented on `bug/grokbot/#2`. Decided, not yet merged.
+
 ## 2026-11-26 — Replication: apply Rename after a B4 sideline (#2)
 
 **Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
