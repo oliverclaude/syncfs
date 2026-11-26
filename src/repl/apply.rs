@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::config::NodeId;
-use crate::net::wire::{Attrs, Entry, FileId, Message, NodeKind, PullMode, Version};
+use crate::net::wire::{Entry, FileId, Message, PullMode, Version};
 
 use super::core::Repl;
 use super::net::ApplyError;
@@ -123,7 +123,14 @@ impl Repl {
                         self.state().index.insert(path, *id);
                         return Ok(false);
                     }
-                    return Err(skip(io::Error::new(
+                    if *kind == crate::net::wire::NodeKind::File {
+                        // Two FileIds at one path: pick a winner, keep the
+                        // loser as a conflict copy. Never Skip (that still
+                        // advances applied; issue #2).
+                        return self
+                            .apply_create_at_taken_path(*id, path, *kind, attrs, *rdev, target);
+                    }
+                    return Err(ApplyError::Retry(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         "another file has this path here",
                     )));
@@ -485,6 +492,7 @@ mod tests {
 
     use crate::config::{resolve, Config, Environment, Mode, PartialConfig, Peer};
     use crate::lock::{LockManager, Settings};
+    use crate::net::wire::{Attrs, NodeKind};
     use crate::net::Network;
     use crate::repl::core::Repl;
     use crate::repl::store::{Flusher, Store};
