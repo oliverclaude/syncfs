@@ -18,7 +18,32 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-26 — Replication: winner rule when two file ids share a path (#2)
+
+**Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
+
+The 26 Nov choices for the remaining #2 fixes had left the winner
+rule open. Options recorded when implementing the two-FileId case:
+
+1. The greater `Version` wins the path (`Version` order: sequence,
+   then node, then disk). The loser is kept as a conflict copy that
+   is a normal replicating file and reaches every node.
+2. The greater `FileId` wins.
+3. The lower creator node id wins, with `FileId` as the last tie-break.
+
+**Choice.** 1. An existing rule (`diverged` / incoming-wins for the
+same FileId) does not apply to two different FileIds. The chosen
+order is the one `Version` already uses elsewhere. A missing version
+loses to any real version; `FileId` breaks a remaining tie.
+
+**Status of the 26 Nov #2 choices.** Stalls (apply-side `Remove` when a
+peer's Create or Rename drops a last link), same version with different
+bytes (verify the whole file on the session-final `Data` entry), and
+this winner rule are implemented on `bug/grokbot/#2`. Decided, not
+yet merged.
+
 ## 2026-11-26 — Replication: remaining #2 fixes
+
 
 **Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
 
