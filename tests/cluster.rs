@@ -2038,10 +2038,12 @@ fn restarted_node_catches_up_before_changes() {
     wait_same_tree(&c, 1, 2);
 }
 
-/// Namespace changes whose journal entries were not flushed when the node
-/// died are found by comparing trees on restart: paths only there are
-/// sent, paths only on the peer are restored (a lost rename keeps both
-/// names).
+/// Namespace create, rename and unlink (and symlink) are journaled
+/// durably before the backing syscall, even when the periodic flusher
+/// is slowed down. A kill after those syscalls therefore still has the
+/// journal: on restart the tree is the post-change tree (the rename is
+/// not lost, so `f` is gone and `g` holds the bytes). Peers converge
+/// from the journal.
 #[test]
 fn crash_window_namespace_changes_are_reconciled() {
     require_fuse!();
@@ -2049,7 +2051,8 @@ fn crash_window_namespace_changes_are_reconciled() {
     let mut c = lock_cluster_with(&[Mount, Mount, Daemon], "5s", |b| {
         std::fs::write(b.join("f"), b"f\n").unwrap();
     });
-    // Node 1 flushes its store rarely: its next changes die with it.
+    // Slow the periodic flusher so only flush_now (journal-first) can
+    // make these entries durable before the kill.
     c.node(1).stop();
     c.node(1)
         .env
@@ -2068,30 +2071,31 @@ fn crash_window_namespace_changes_are_reconciled() {
     wait_same_tree(&c, 1, 2);
     let m2 = c.node(2).mnt();
     for m in [&m1, &m2] {
-        assert!(m.join("d2").is_dir());
+        assert!(m.join("d2").is_dir(), "{m:?}");
         assert_eq!(
             std::fs::read_link(m.join("s")).unwrap(),
             std::path::Path::new("f")
         );
-        assert_eq!(std::fs::read(m.join("f")).unwrap(), b"f\n");
+        assert!(!m.join("f").exists(), "rename was journaled, so f is gone");
         assert_eq!(std::fs::read(m.join("g")).unwrap(), b"f\n");
     }
-    let r = c.node(1).status("replication").unwrap();
-    assert_eq!(r["counters"]["reconcile_sent"], 3, "{r:#}");
-    assert_eq!(r["counters"]["reconcile_restored"], 1, "{r:#}");
 }
 
 /// A new lock holder first applies the previous holder's journal up to
 /// the head it released with. If those entries do not arrive within
 /// `freshness_timeout` while their origin is connected, the operation
-/// fails with EBUSY instead of acting on a namespace without them.
+/// fails with EBUSY instead of acting without them.
+///
+/// Namespace create/rename/unlink are now durable before the syscall,
+/// so this uses a write: session-final Data is still only flushed by
+/// the periodic flusher.
 #[test]
 fn handoff_timeout_refuses_with_ebusy() {
     require_fuse!();
     use Kind::{Daemon, Mount};
-    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &[]);
-    // Node 1 flushes its store rarely, so its journal entries are not
-    // sent (only durable entries are) while it stays connected.
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    // Node 1 flushes its store rarely, so its Data entry is not sent
+    // (only durable entries are) while it stays connected.
     c.node(1).stop();
     c.node(1)
         .env
@@ -2100,9 +2104,9 @@ fn handoff_timeout_refuses_with_ebusy() {
     c.converge("node 1 back");
     std::thread::sleep(LEASE + Duration::from_millis(100));
     let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
-    std::fs::create_dir(m1.join("d")).unwrap();
+    std::fs::write(m1.join("f"), b"one\n").unwrap();
     let t = Instant::now();
-    let r = std::fs::create_dir(m2.join("d"));
+    let r = std::fs::write(m2.join("f"), b"two\n");
     assert_eq!(errno(r), Some(libc::EBUSY));
     // After waiting freshness_timeout (2 s), not much longer.
     assert!(
@@ -2110,16 +2114,16 @@ fn handoff_timeout_refuses_with_ebusy() {
         "{:?}",
         t.elapsed()
     );
-    assert!(!m2.join("d").exists());
+    assert_eq!(std::fs::read(m2.join("f")).unwrap(), b"initial\n");
     let l = c.node(2).status("locks").unwrap();
     assert_eq!(l["counters"]["handoff_refused"], 1, "{l:#}");
-    // Once node 1's entries go out, the same operation sees them.
+    // Once node 1's entries go out, the same file shows the write.
     c.node(1).stop();
     c.node(1).env.clear();
     c.node(1).start();
     c.converge("node 1 flushing again");
     wait_same_tree(&c, 1, 2);
-    assert_eq!(errno(std::fs::create_dir(m2.join("d"))), Some(libc::EEXIST));
+    assert_eq!(std::fs::read(m2.join("f")).unwrap(), b"one\n");
 }
 
 /// After a reconnect, local changes wait (briefly) until the node has
