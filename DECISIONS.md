@@ -18,6 +18,35 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-26 — Replication: apply Rename after a B4 sideline (#2)
+
+**Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
+
+After B4 relocates an incoming `Create` to a FileId conflict path, a
+later journaled `Rename` still named the original `from`. Apply looked
+up `index.get(from)`, returned `Ok(false)` when another FileId was
+there, and `applied` still advanced, so the file stayed at the conflict
+name on some nodes only. Following `path_of(id)` for the source is not
+enough: moving the file onto a dest that another live FileId holds would
+A1-bury that dest, while other nodes had kept it as a B4 conflict copy.
+Options recorded then:
+
+1. Rename follows `path_of(id)`; dest still A1-buried. The moved file
+   reaches the dest path, but the dest FileId is tombstoned there and
+   remains a conflict copy on nodes that sidelined it at `Create` —
+   trees still differ.
+2. Rename follows `path_of(id)`; if dest is a different live FileId,
+   always B4-sideline it (FileId name and a journaled `Rename`) instead
+   of burying. Converges the soak case. Changes rename-over: overwritten
+   files become conflict copies instead of disappearing.
+3. Rename follows `path_of(id)`; B4-sideline dest only when the source
+   currently sits at a conflict-copy path (completing a diverted
+   `Create`). Normal rename-over still A1-buries.
+
+**Choice.** 3.
+
+**Status.** Implemented on `bug/grokbot/#2`. Decided, not yet merged.
+
 ## 2026-11-26 — Replication: conflict-copy names when two file ids share a path (#2)
 
 **Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
