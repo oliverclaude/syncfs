@@ -1,5 +1,7 @@
 # Contributing
 
+Design choices are recorded in [DECISIONS.md](DECISIONS.md).
+
 ## Issue tracking
 
 Every issue and enhancement is scored on two axes when it is filed.
