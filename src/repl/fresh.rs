@@ -102,7 +102,7 @@ impl Repl {
 
     /// Blocks where the local file at `path` differs from `remote` (and
     /// local blocks past its end).
-    fn differing(&self, path: &[u8], remote: &RemoteFile) -> io::Result<(Ranges, u64)> {
+    pub(crate) fn differing(&self, path: &[u8], remote: &RemoteFile) -> io::Result<(Ranges, u64)> {
         let f = self.backing.open_read(path)?;
         let local_size = f.metadata()?.len();
         let mut diff = Ranges::default();

@@ -330,15 +330,16 @@ impl Repl {
             self.discard(origin, id, version);
             return Ok(false);
         };
-        if !self.has_base(&id, version, lineage) || self.session_data_is_final(origin, id, version)
-        {
-            // Interim Data stays on the dirty-block path below. The
-            // session-final entry must match the origin's whole file:
-            // a dirty pull only fetches blocks the origin rewrote, so a
-            // stale or torn prefix would otherwise be recorded as this
-            // version (issue #2).
+        let session_final = self.session_data_is_final(origin, id, version);
+        if !self.has_base(&id, version, lineage) {
             self.bind(id, &path);
-            return self.copy_whole(origin, id, version);
+            let r = self.copy_whole(origin, id, version);
+            if session_final {
+                // copy_whole uses range pulls, which do not take dirty
+                // marks; tell the origin to drop them.
+                self.discard(origin, id, version);
+            }
+            return r;
         }
         if !self.backing.exists(&path) && self.state().index.tombstone(&id).is_some() {
             // Removed here and written again at the origin.
@@ -374,9 +375,34 @@ impl Repl {
         out.sync_all().map_err(ApplyError::Retry)?;
         drop(out);
         self.backing.set_attrs(&path, attrs).map_err(skip)?;
+        if session_final {
+            // Dirty pull only fetched blocks the origin rewrote. A stale
+            // or torn prefix would be recorded as this version unless the
+            // whole file is checked (issue #2).
+            match self.whole_file_matches(origin, id, &path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let r = self.copy_whole(origin, id, version);
+                    self.discard(origin, id, version);
+                    return r;
+                }
+                Err(e) => return Err(ApplyError::Retry(e)),
+            }
+        }
         self.record_version(id, &path, version, lineage);
         self.invalidate(&path);
         Ok(true)
+    }
+
+    /// Whether the local bytes at `path` already match `source`'s whole
+    /// file for `id` (every block hash, and no extra trailing blocks).
+    fn whole_file_matches(&self, source: NodeId, id: FileId, path: &[u8]) -> io::Result<bool> {
+        let remote = self.remote_hashes(source, id)?;
+        if remote.removed {
+            return Ok(false);
+        }
+        let (diff, _) = self.differing(path, &remote)?;
+        Ok(diff.is_empty())
     }
 
     /// The origin (or relay) of this data has no bytes for `id`. Try every
