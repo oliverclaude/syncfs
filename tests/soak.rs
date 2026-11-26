@@ -1441,26 +1441,31 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A conflict copy holds a write by the node it names, and that node
-    /// was cut off, paused or restarted after the write.
+    /// A conflict copy holds a write by a node that was cut off, paused
+    /// or restarted after the write. UTC and Version names encode that
+    /// node (`path.syncfs-conflict-<node>-…`); FileId names
+    /// (`path.syncfs-conflict-<32-hex>`) do not, so the write the copy
+    /// holds names the node.
     fn conflict_copy(&self, path: &str, desc: &str, bad: &mut Vec<String>) {
-        let tail = path.split(".syncfs-conflict-").nth(1).unwrap_or_default();
-        let node: u16 = tail.split('-').next().unwrap_or("").parse().unwrap_or(0);
         let id = desc
             .strip_prefix("write ")
-            .and_then(|s| u64::from_str_radix(&s[..16], 16).ok());
+            .and_then(|s| u64::from_str_radix(s.get(..16)?, 16).ok());
         let Some(op) = id.and_then(|id| self.by_id.get(&id)) else {
             if !desc.starts_with("empty") && !desc.starts_with("torn") {
                 bad.push(format!("conflict copy {path} holds no known write: {desc}"));
             }
             return;
         };
-        if op.node != node {
-            bad.push(format!(
-                "conflict copy {path} names node {node} but holds a write by node {}",
-                op.node
-            ));
+        let named = conflict_copy_named_node(path);
+        if let Some(node) = named {
+            if op.node != node {
+                bad.push(format!(
+                    "conflict copy {path} names node {node} but holds a write by node {}",
+                    op.node
+                ));
+            }
         }
+        let node = named.unwrap_or(op.node);
         let cut_off = self
             .events
             .iter()
@@ -1472,6 +1477,17 @@ impl<'a> Checker<'a> {
             ));
         }
     }
+}
+
+/// The node encoded in a UTC or Version conflict-copy name, if any.
+/// FileId-hex names (`path.syncfs-conflict-<32 lowercase hex>`) do not
+/// encode a node.
+fn conflict_copy_named_node(path: &str) -> Option<u16> {
+    let tail = path.rsplit(".syncfs-conflict-").next().unwrap_or_default();
+    if tail.len() == 32 && tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    tail.split('-').next()?.parse().ok()
 }
 
 // ----------------------------------------------------------------- run
@@ -1863,4 +1879,99 @@ fn checker_reads_fallbacks_from_the_lock_log_without_ending_holds() {
     let h = holds(&log);
     assert_eq!(h.len(), 1);
     assert_eq!((h[0].start, h[0].end()), (100, 200));
+}
+
+fn write_for_conflict(id: u64, node: u16, start: u64) -> Op {
+    Op {
+        id,
+        node,
+        kind: OpKind::Write,
+        path: "b/f0".into(),
+        path2: String::new(),
+        start,
+        end: start + 50,
+        outcome: Outcome::Ok,
+        seen: None,
+    }
+}
+
+fn event_at(t: u64, node: u16) -> Event {
+    Event {
+        t,
+        what: "kill".into(),
+        nodes: vec![node],
+        lost_disk: false,
+    }
+}
+
+fn check_conflict(path: &str, desc: &str, ops: &[Op], events: &[Event]) -> Vec<String> {
+    let c = Checker {
+        ops,
+        events,
+        fallbacks: &[],
+        by_id: ops.iter().map(|o| (o.id, o)).collect(),
+    };
+    let mut bad = Vec::new();
+    c.conflict_copy(path, desc, &mut bad);
+    bad
+}
+
+#[test]
+fn checker_accepts_a_utc_conflict_copy_after_the_named_writer_is_cut_off() {
+    let ops = [write_for_conflict(0x0200_0000_0000_0001, 2, 100)];
+    let events = [event_at(200, 2)];
+    let bad = check_conflict(
+        "b/f0.syncfs-conflict-2-20261126T131000Z",
+        "write 0200000000000001",
+        &ops,
+        &events,
+    );
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+#[test]
+fn checker_accepts_a_fileid_conflict_copy_after_the_writer_is_cut_off() {
+    let ops = [write_for_conflict(0x0200_0000_0000_0001, 2, 100)];
+    let events = [event_at(200, 2)];
+    let bad = check_conflict(
+        "b/f0.syncfs-conflict-671201c3e5a3a994293bf91f959e1fea",
+        "write 0200000000000001",
+        &ops,
+        &events,
+    );
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+#[test]
+fn checker_rejects_a_fileid_conflict_copy_when_the_writer_was_not_cut_off() {
+    let ops = [write_for_conflict(0x0200_0000_0000_0001, 2, 100)];
+    let bad = check_conflict(
+        "b/f0.syncfs-conflict-671201c3e5a3a994293bf91f959e1fea",
+        "write 0200000000000001",
+        &ops,
+        &[],
+    );
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert!(
+        bad[0].contains("syncfs-conflict-671201c3e5a3a994293bf91f959e1fea")
+            && bad[0].contains("node 2 was not cut off or restarted"),
+        "{bad:?}"
+    );
+}
+
+#[test]
+fn checker_still_rejects_a_utc_conflict_copy_that_names_the_wrong_node() {
+    let ops = [write_for_conflict(0x0200_0000_0000_0001, 2, 100)];
+    let events = [event_at(200, 2)];
+    let bad = check_conflict(
+        "b/f0.syncfs-conflict-3-20261126T131000Z",
+        "write 0200000000000001",
+        &ops,
+        &events,
+    );
+    assert!(
+        bad.iter()
+            .any(|s| s.contains("names node 3 but holds a write by node 2")),
+        "{bad:?}"
+    );
 }
