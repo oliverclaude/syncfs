@@ -41,6 +41,8 @@ impl Repl {
     fn bind(&self, id: FileId, path: &[u8]) {
         let mut st = self.state();
         if st.index.path_of(&id).is_none() {
+            // insert may drop another FileId's last link at `path`.
+            self.displace_last_link(&mut st, path);
             st.index.insert(path, id);
         }
     }
@@ -129,7 +131,12 @@ impl Repl {
                 self.backing
                     .create(path, *kind, attrs, *rdev, target)
                     .map_err(skip)?;
-                self.state().index.insert(path, *id);
+                {
+                    let mut st = self.state();
+                    self.displace_last_link(&mut st, path);
+                    st.index.insert(path, *id);
+                }
+                self.cv.notify_all();
                 Ok(true)
             }
             Entry::Link { id, existing, path } => {
@@ -140,7 +147,12 @@ impl Repl {
                     return Ok(false);
                 }
                 self.backing.link(&src, path).map_err(skip)?;
-                self.state().index.insert(path, *id);
+                {
+                    let mut st = self.state();
+                    self.displace_last_link(&mut st, path);
+                    st.index.insert(path, *id);
+                }
+                self.cv.notify_all();
                 Ok(true)
             }
             Entry::Remove {
@@ -207,10 +219,17 @@ impl Repl {
                 self.note_moved(from, moved.as_ref());
                 self.note_moved(to, replaced.as_ref());
                 let mut st = self.state();
-                let replaced = st.index.get(to);
                 if *flags & libc::RENAME_EXCHANGE != 0 {
                     st.index.exchange(from, to);
                 } else {
+                    // After backing.rename succeeded: dest's last link is
+                    // already overwritten on disk. Journal a Remove so a
+                    // peer with an earlier Data for that FileId can skip
+                    // instead of stalling (issue #2). RENAME_EXCHANGE
+                    // keeps both files. displace holds only `&mut State`
+                    // (no re-lock).
+                    self.displace_last_link(&mut st, to);
+                    let replaced = st.index.get(to);
                     st.index.rename(from, to);
                     if let Some(r) = replaced.filter(|r| Some(*r) != known) {
                         if st.index.rec(&r).is_none() {
@@ -218,6 +237,7 @@ impl Repl {
                         }
                     }
                 }
+                self.cv.notify_all();
                 Ok(true)
             }
             Entry::Attr {

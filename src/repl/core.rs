@@ -700,7 +700,7 @@ impl Repl {
     /// FileId can skip instead of stalling when the bytes are gone
     /// (issue #2). Other links stay; `insert` / `rename` drop only this
     /// path. No-op when the path is free or is one of several links.
-    fn displace_last_link(&self, st: &mut State, path: &[u8]) {
+    pub(crate) fn displace_last_link(&self, st: &mut State, path: &[u8]) {
         let Some(id) = st.index.get(path) else {
             return;
         };
