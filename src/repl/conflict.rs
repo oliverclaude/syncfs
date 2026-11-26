@@ -36,6 +36,17 @@ pub fn versioned_conflict_name(path: &[u8], v: Version) -> Vec<u8> {
     out
 }
 
+/// A deterministic conflict path for a file set aside because two
+/// FileIds met at `path`. The name uses the loser's FileId (full
+/// 16-byte lowercase hex) so every node agrees even when the file
+/// has no version (issue #2).
+pub fn fileid_conflict_name(path: &[u8], id: FileId) -> Vec<u8> {
+    let mut out = path.to_vec();
+    let hex: String = id.0.iter().map(|b| format!("{b:02x}")).collect();
+    out.extend_from_slice(format!(".syncfs-conflict-{hex}").as_bytes());
+    out
+}
+
 /// A missing version is older than any real one (seq starts at 1).
 fn version_or_none(v: Option<Version>) -> Version {
     v.filter(|v| v.seq > 0).unwrap_or(Version {
@@ -306,6 +317,16 @@ mod tests {
                 },
             ),
             b"f.syncfs-conflict-2-1-7".to_vec()
+        );
+        assert_eq!(
+            fileid_conflict_name(
+                b"f",
+                FileId([
+                    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                    0x0e, 0x0f, 0x10
+                ])
+            ),
+            b"f.syncfs-conflict-0102030405060708090a0b0c0d0e0f10".to_vec()
         );
     }
 }

@@ -693,11 +693,30 @@ mod tests {
         }
     }
 
-    /// A Create at a path another FileId already has must not be skipped
-    /// (that would still advance applied). Without a version to compare,
-    /// apply retries (issue #2).
+    fn conflict(path: &[u8], id: FileId) -> Vec<u8> {
+        super::super::conflict::fileid_conflict_name(path, id)
+    }
+
+    fn journaled_rename(h: &Harness, id: FileId, from: &[u8], to: &[u8]) -> bool {
+        h.repl.state().journal.entries().any(|(_, rec)| {
+            matches!(
+                &rec.entry,
+                Entry::Rename {
+                    id: Some(fid),
+                    from: f,
+                    to: t,
+                    ..
+                } if *fid == id && f == from && t == to
+            )
+        })
+    }
+
+    /// A Create at a path another FileId already has must not Retry just
+    /// because the incoming file has no version: an unversioned file
+    /// loses to a real Version and is kept under the FileId conflict
+    /// name (issue #2).
     #[test]
-    fn apply_create_at_a_taken_path_retries_until_a_version_is_known() {
+    fn apply_create_at_a_taken_path_places_an_unversioned_incoming_file_as_a_conflict_copy() {
         let h = start();
         let x = FileId([0x41; 16]);
         let y = FileId([0x42; 16]);
@@ -708,10 +727,17 @@ mod tests {
             st.index.take_version(x, ver_at(1, 1, 1), &[]);
         }
         assert!(
-            matches!(h.repl.apply(2, 2, &create_y(y)), Err(ApplyError::Retry(_))),
-            "must retry, not skip, when the incoming version is unknown"
+            matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
+            "unversioned incoming must not Retry; it loses to a real Version"
         );
+        let name = conflict(b"f", y);
         assert_eq!(h.repl.state().index.get(b"f"), Some(x));
+        assert_eq!(h.repl.state().index.get(&name), Some(y));
+        assert!(h
+            .backing
+            .path()
+            .join(String::from_utf8_lossy(&name).as_ref())
+            .exists());
         assert_eq!(
             std::fs::read(h.backing.path().join("f")).unwrap(),
             b"local\n"
@@ -719,8 +745,8 @@ mod tests {
     }
 
     /// Two FileIds at one path: the greater Version wins the path, and
-    /// the loser is kept under a deterministic conflict name, same FileId
-    /// (issue #2).
+    /// the loser is kept under a FileId conflict name, same FileId, with
+    /// a journaled Rename so peers apply the same path (issue #2).
     #[test]
     fn apply_create_at_a_taken_path_keeps_the_loser_as_a_conflict_copy() {
         let h = start();
@@ -737,12 +763,17 @@ mod tests {
             matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
             "incoming greater Version must take the path, not skip"
         );
-        let conflict = h.backing.path().join("f.syncfs-conflict-1-1-1");
-        assert_eq!(std::fs::read(&conflict).unwrap(), b"older\n");
+        let name = conflict(b"f", x);
+        let conflict_path = h
+            .backing
+            .path()
+            .join(String::from_utf8_lossy(&name).as_ref());
+        assert_eq!(std::fs::read(&conflict_path).unwrap(), b"older\n");
         assert_eq!(h.repl.state().index.get(b"f"), Some(y));
-        assert_eq!(
-            h.repl.state().index.get(b"f.syncfs-conflict-1-1-1"),
-            Some(x)
+        assert_eq!(h.repl.state().index.get(&name), Some(x));
+        assert!(
+            journaled_rename(&h, x, b"f", &name),
+            "sideline must journal a Rename to the FileId conflict name"
         );
         // Idempotent: a second apply must not Skip or invent another copy.
         assert!(matches!(
@@ -751,11 +782,14 @@ mod tests {
         ));
         let st = h.repl.state();
         assert_eq!(st.index.get(b"f"), Some(y));
-        assert_eq!(st.index.get(b"f.syncfs-conflict-1-1-1"), Some(x));
+        assert_eq!(st.index.get(&name), Some(x));
+        assert!(!h.backing.path().join("f.syncfs-conflict-1-1-1").exists());
+        assert!(!h.backing.path().join("f.syncfs-conflict-0-0-0").exists());
     }
 
     /// The greater Version at the path stays there; the incoming FileId
-    /// is created at the conflict name so later Data can find it (issue #2).
+    /// is created at the FileId conflict name so later Data can find it
+    /// (issue #2).
     #[test]
     fn apply_create_at_a_taken_path_sidelines_a_lesser_incoming_file() {
         let h = start();
@@ -772,13 +806,134 @@ mod tests {
             matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
             "local greater Version keeps the path; incoming becomes a conflict copy"
         );
+        let name = conflict(b"f", y);
         assert_eq!(
             std::fs::read(h.backing.path().join("f")).unwrap(),
             b"newer\n"
         );
-        assert!(h.backing.path().join("f.syncfs-conflict-2-1-2").exists());
+        assert!(h
+            .backing
+            .path()
+            .join(String::from_utf8_lossy(&name).as_ref())
+            .exists());
         let st = h.repl.state();
         assert_eq!(st.index.get(b"f"), Some(x));
-        assert_eq!(st.index.get(b"f.syncfs-conflict-2-1-2"), Some(y));
+        assert_eq!(st.index.get(&name), Some(y));
+        assert!(!h.backing.path().join("f.syncfs-conflict-2-1-2").exists());
+    }
+
+    /// An unversioned local file loses to a real incoming Version and is
+    /// kept at the FileId conflict name, not …-0-0-0 (issue #2).
+    #[test]
+    fn apply_create_at_a_taken_path_sidelines_an_unversioned_local_file_by_fileid() {
+        let h = start();
+        let x = FileId([0x81; 16]);
+        let y = FileId([0x82; 16]);
+        std::fs::write(h.backing.path().join("f"), b"").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+        }
+        queue_data(&h, 2, 2, y, ver_at(1, 2, 2));
+        assert!(
+            matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
+            "unversioned local loses to a real Version"
+        );
+        let name = conflict(b"f", x);
+        assert_eq!(h.repl.state().index.get(b"f"), Some(y));
+        assert_eq!(h.repl.state().index.get(&name), Some(x));
+        assert!(journaled_rename(&h, x, b"f", &name));
+        assert!(!h.backing.path().join("f.syncfs-conflict-0-0-0").exists());
+    }
+
+    /// When neither file has a version, the greater FileId wins the path
+    /// (issue #2).
+    #[test]
+    fn apply_create_at_a_taken_path_breaks_an_unversioned_tie_by_fileid() {
+        let h = start();
+        let x = FileId([0x91; 16]);
+        let y = FileId([0x92; 16]);
+        std::fs::write(h.backing.path().join("f"), b"x\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+        }
+        assert!(
+            matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
+            "greater FileId wins when both are unversioned"
+        );
+        let name = conflict(b"f", x);
+        assert_eq!(h.repl.state().index.get(b"f"), Some(y));
+        assert_eq!(h.repl.state().index.get(&name), Some(x));
+        assert!(journaled_rename(&h, x, b"f", &name));
+    }
+
+    /// A peer applying the journaled sideline Rename must move the same
+    /// FileId to the FileId conflict name (issue #2).
+    #[test]
+    fn apply_of_a_sideline_rename_moves_the_loser_to_the_fileid_name() {
+        let h = start();
+        let x = FileId([0xa1; 16]);
+        std::fs::write(h.backing.path().join("f"), b"loser\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+            st.index.take_version(x, ver_at(1, 1, 1), &[]);
+        }
+        let name = conflict(b"f", x);
+        assert!(matches!(
+            h.repl.apply(
+                2,
+                2,
+                &Entry::Rename {
+                    id: Some(x),
+                    from: b"f".to_vec(),
+                    to: name.clone(),
+                    flags: 0,
+                },
+            ),
+            Ok(true)
+        ));
+        assert_eq!(
+            std::fs::read(
+                h.backing
+                    .path()
+                    .join(String::from_utf8_lossy(&name).as_ref())
+            )
+            .unwrap(),
+            b"loser\n"
+        );
+        assert!(!h.backing.path().join("f").exists());
+        let st = h.repl.state();
+        assert_eq!(st.index.get(b"f"), None);
+        assert_eq!(st.index.get(&name), Some(x));
+    }
+
+    /// Directory Create AlreadyExists must Skip (advancing applied) rather
+    /// than Retry and stall the journal (issue #2).
+    #[test]
+    fn apply_create_of_a_directory_at_a_taken_path_is_skipped() {
+        let h = start();
+        let x = FileId([0xb1; 16]);
+        let y = FileId([0xb2; 16]);
+        std::fs::create_dir(h.backing.path().join("d")).unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"d", x);
+        }
+        let entry = Entry::Create {
+            id: y,
+            path: b"d".to_vec(),
+            kind: NodeKind::Dir,
+            attrs: Attrs::default(),
+            rdev: 0,
+            target: Vec::new(),
+        };
+        assert!(
+            matches!(h.repl.apply(2, 2, &entry), Err(ApplyError::Skip(_))),
+            "directory AlreadyExists must Skip, not Retry"
+        );
+        assert_eq!(h.repl.state().index.get(b"d"), Some(x));
+        assert!(h.backing.path().join("d").is_dir());
     }
 }
