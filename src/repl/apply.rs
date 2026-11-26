@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::config::NodeId;
-use crate::net::wire::{Entry, FileId, Message, PullMode, Version};
+use crate::net::wire::{Attrs, Entry, FileId, Message, NodeKind, PullMode, Version};
 
 use super::core::Repl;
 use super::net::ApplyError;
@@ -647,5 +647,130 @@ mod tests {
             "duplicate remove"
         );
         assert_eq!(h.repl.state().index.tombstone(&x), Some(v));
+    }
+
+    fn ver_at(seq: u64, node: u16, disk: u64) -> Version {
+        Version { seq, node, disk }
+    }
+
+    fn queue_data(h: &Harness, origin: u16, seq: u64, id: FileId, version: Version) {
+        use crate::repl::relay::Queued;
+        let mut inbox = crate::repl::core::lock(&h.repl.inbox);
+        inbox.entry(origin).or_default().insert(
+            origin,
+            seq,
+            Queued {
+                deps: Vec::new(),
+                entry: Entry::Data {
+                    id,
+                    path: b"f".to_vec(),
+                    version,
+                    size: 4,
+                    attrs: Attrs::default(),
+                    lineage: Vec::new(),
+                },
+                via: origin,
+            },
+        );
+    }
+
+    fn create_y(y: FileId) -> Entry {
+        Entry::Create {
+            id: y,
+            path: b"f".to_vec(),
+            kind: NodeKind::File,
+            attrs: Attrs::default(),
+            rdev: 0,
+            target: Vec::new(),
+        }
+    }
+
+    /// A Create at a path another FileId already has must not be skipped
+    /// (that would still advance applied). Without a version to compare,
+    /// apply retries (issue #2).
+    #[test]
+    fn apply_create_at_a_taken_path_retries_until_a_version_is_known() {
+        let h = start();
+        let x = FileId([0x41; 16]);
+        let y = FileId([0x42; 16]);
+        std::fs::write(h.backing.path().join("f"), b"local\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+            st.index.take_version(x, ver_at(1, 1, 1), &[]);
+        }
+        assert!(
+            matches!(h.repl.apply(2, 2, &create_y(y)), Err(ApplyError::Retry(_))),
+            "must retry, not skip, when the incoming version is unknown"
+        );
+        assert_eq!(h.repl.state().index.get(b"f"), Some(x));
+        assert_eq!(
+            std::fs::read(h.backing.path().join("f")).unwrap(),
+            b"local\n"
+        );
+    }
+
+    /// Two FileIds at one path: the greater Version wins the path, and
+    /// the loser is kept under a deterministic conflict name, same FileId
+    /// (issue #2).
+    #[test]
+    fn apply_create_at_a_taken_path_keeps_the_loser_as_a_conflict_copy() {
+        let h = start();
+        let x = FileId([0x51; 16]);
+        let y = FileId([0x52; 16]);
+        std::fs::write(h.backing.path().join("f"), b"older\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+            st.index.take_version(x, ver_at(1, 1, 1), &[]);
+        }
+        queue_data(&h, 2, 2, y, ver_at(2, 2, 2));
+        assert!(
+            matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
+            "incoming greater Version must take the path, not skip"
+        );
+        let conflict = h.backing.path().join("f.syncfs-conflict-1-1-1");
+        assert_eq!(std::fs::read(&conflict).unwrap(), b"older\n");
+        assert_eq!(h.repl.state().index.get(b"f"), Some(y));
+        assert_eq!(
+            h.repl.state().index.get(b"f.syncfs-conflict-1-1-1"),
+            Some(x)
+        );
+        // Idempotent: a second apply must not Skip or invent another copy.
+        assert!(matches!(
+            h.repl.apply(2, 2, &create_y(y)),
+            Ok(true) | Ok(false)
+        ));
+        let st = h.repl.state();
+        assert_eq!(st.index.get(b"f"), Some(y));
+        assert_eq!(st.index.get(b"f.syncfs-conflict-1-1-1"), Some(x));
+    }
+
+    /// The greater Version at the path stays there; the incoming FileId
+    /// is created at the conflict name so later Data can find it (issue #2).
+    #[test]
+    fn apply_create_at_a_taken_path_sidelines_a_lesser_incoming_file() {
+        let h = start();
+        let x = FileId([0x61; 16]);
+        let y = FileId([0x62; 16]);
+        std::fs::write(h.backing.path().join("f"), b"newer\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+            st.index.take_version(x, ver_at(2, 1, 1), &[]);
+        }
+        queue_data(&h, 2, 2, y, ver_at(1, 2, 2));
+        assert!(
+            matches!(h.repl.apply(2, 2, &create_y(y)), Ok(true)),
+            "local greater Version keeps the path; incoming becomes a conflict copy"
+        );
+        assert_eq!(
+            std::fs::read(h.backing.path().join("f")).unwrap(),
+            b"newer\n"
+        );
+        assert!(h.backing.path().join("f.syncfs-conflict-2-1-2").exists());
+        let st = h.repl.state();
+        assert_eq!(st.index.get(b"f"), Some(x));
+        assert_eq!(st.index.get(b"f.syncfs-conflict-2-1-2"), Some(y));
     }
 }
