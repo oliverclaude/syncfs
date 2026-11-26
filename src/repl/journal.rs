@@ -198,6 +198,24 @@ impl Journal {
     pub fn committed(&mut self, upto: u64) {
         self.durable = self.durable.max(upto);
     }
+
+    /// Drop every entry that has not been flushed yet, and reuse those
+    /// sequence numbers. Peers never saw them. Returns the number of
+    /// entries retracted.
+    pub fn retract_undurable(&mut self) -> usize {
+        let mut n = 0;
+        while self.last() > self.durable {
+            let last = self.last();
+            self.new.remove(&last);
+            self.entries.remove(&last);
+            self.next = last;
+            n += 1;
+        }
+        if self.staged > self.durable {
+            self.staged = self.durable;
+        }
+        n
+    }
 }
 
 #[cfg(test)]
@@ -254,5 +272,22 @@ mod tests {
         assert_eq!(back.last(), 2);
         assert_eq!(back.acked(3), 1);
         assert_eq!(back.sendable(1, 10).len(), 1);
+    }
+
+    #[test]
+    fn retract_undurable_reuses_the_seq_until_flush() {
+        let mut j = Journal::default();
+        let s = j.append(vec![], e(1));
+        assert_eq!(s, 1);
+        let t = j.append(vec![], e(2));
+        assert_eq!(t, 2);
+        assert_eq!(j.retract_undurable(), 2);
+        assert_eq!(j.last(), 0);
+        let s = j.append(vec![], e(3));
+        assert_eq!(s, 1);
+        let (_, upto) = j.take_changed();
+        j.committed(upto);
+        assert_eq!(j.retract_undurable(), 0);
+        assert_eq!(j.last(), 1);
     }
 }
