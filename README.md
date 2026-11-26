@@ -1195,6 +1195,8 @@ Each step ends with passing tests and a commit.
 
 ## Issue tracking
 
+Design choices are recorded in [DECISIONS.md](DECISIONS.md).
+
 Open work is scored and picked as described in [CONTRIBUTING.md](CONTRIBUTING.md):
 every issue and enhancement gets `effort` and `likelihood` labels (lower
 is better) and a short reason when it is filed. Work is taken in lowest
