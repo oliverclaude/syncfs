@@ -37,6 +37,13 @@ pub fn fileid_conflict_name(path: &[u8], id: FileId) -> Vec<u8> {
     out
 }
 
+/// Whether `path` is a conflict-copy name (`….syncfs-conflict-…`),
+/// either a FileId-hex B4 copy or a UTC keep-if-diverged copy.
+pub fn is_conflict_copy_path(path: &[u8]) -> bool {
+    const MARK: &[u8] = b".syncfs-conflict-";
+    path.windows(MARK.len()).any(|w| w == MARK)
+}
+
 /// A missing version is older than any real one (seq starts at 1).
 fn version_or_none(v: Option<Version>) -> Version {
     v.filter(|v| v.seq > 0).unwrap_or(Version {
@@ -183,7 +190,7 @@ impl Repl {
     /// Moves `id` from `path` to the FileId conflict name, keeping the
     /// same FileId and its version, and journals a Rename so peers
     /// apply the same path.
-    fn sideline_as_conflict(&self, id: FileId, path: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn sideline_as_conflict(&self, id: FileId, path: &[u8]) -> io::Result<Vec<u8>> {
         let name = fileid_conflict_name(path, id);
         if self.state().index.get(&name) == Some(id) && self.backing.exists(&name) {
             if self.state().index.get(path) == Some(id) {
@@ -309,5 +316,17 @@ mod tests {
             ),
             b"f.syncfs-conflict-0102030405060708090a0b0c0d0e0f10".to_vec()
         );
+    }
+
+    #[test]
+    fn conflict_copy_paths_are_recognised() {
+        assert!(is_conflict_copy_path(
+            b"b/f0.syncfs-conflict-d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"
+        ));
+        assert!(is_conflict_copy_path(
+            b"d/f.txt.syncfs-conflict-3-20260921T141320Z"
+        ));
+        assert!(!is_conflict_copy_path(b"b/f0"));
+        assert!(!is_conflict_copy_path(b"b/f3"));
     }
 }

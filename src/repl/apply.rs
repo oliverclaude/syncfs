@@ -214,33 +214,51 @@ impl Repl {
                 to,
                 flags,
             } => {
-                let known = self.state().index.get(from);
-                if let (Some(id), Some(k)) = (id, known) {
-                    if *id != k {
-                        return Ok(false);
+                // Follow the FileId: a B4 sideline may have already moved
+                // it off `from` (issue #2).
+                let Some(src) = self.local_path(*id, from) else {
+                    return Ok(false);
+                };
+                if src.as_slice() == to.as_slice() {
+                    return Ok(false);
+                }
+                let known = *id;
+                // Completing a diverted Create: dest is a different live
+                // FileId and the source already sits at a conflict-copy
+                // path, so B4-sideline dest instead of burying it.
+                // Normal rename-over still A1-buries after the syscall.
+                let dest_id = (*flags & libc::RENAME_EXCHANGE == 0)
+                    .then(|| self.state().index.get(to))
+                    .flatten();
+                if let Some(dest_id) = dest_id {
+                    if known != Some(dest_id) && super::conflict::is_conflict_copy_path(&src) {
+                        // `dest_id` is a copy: the state lock must not be
+                        // held across sideline (it takes the same lock).
+                        self.sideline_as_conflict(dest_id, to)
+                            .map_err(ApplyError::Retry)?;
                     }
                 }
-                let (moved, replaced) = (self.backing.stat(from).ok(), self.backing.stat(to).ok());
-                self.backing.rename(from, to, *flags).map_err(skip)?;
-                self.invalidate_entry(from);
+                let (moved, replaced) = (self.backing.stat(&src).ok(), self.backing.stat(to).ok());
+                self.backing.rename(&src, to, *flags).map_err(skip)?;
+                self.invalidate_entry(&src);
                 self.invalidate_entry(to);
                 // The kernel may still reach both files under their old
                 // names; the next open, unlink or rename there gets ESTALE.
-                self.note_moved(from, moved.as_ref());
+                self.note_moved(&src, moved.as_ref());
                 self.note_moved(to, replaced.as_ref());
                 let mut st = self.state();
                 if *flags & libc::RENAME_EXCHANGE != 0 {
-                    st.index.exchange(from, to);
+                    st.index.exchange(&src, to);
                 } else {
                     // After backing.rename succeeded: dest's last link is
                     // already overwritten on disk. Journal a Remove so a
                     // peer with an earlier Data for that FileId can skip
                     // instead of stalling (issue #2). RENAME_EXCHANGE
                     // keeps both files. displace holds only `&mut State`
-                    // (no re-lock).
+                    // (no re-lock). No-op if dest was just sidelined.
                     self.displace_last_link(&mut st, to);
                     let replaced = st.index.get(to);
-                    st.index.rename(from, to);
+                    st.index.rename(&src, to);
                     if let Some(r) = replaced.filter(|r| Some(*r) != known) {
                         if st.index.rec(&r).is_none() {
                             st.dirty.forget(r);
@@ -938,5 +956,133 @@ mod tests {
         );
         assert_eq!(h.repl.state().index.get(b"d"), Some(x));
         assert!(h.backing.path().join("d").is_dir());
+    }
+
+    /// After B4 relocates an incoming Create to a FileId conflict name,
+    /// a later journaled Rename still names the original `from`. Apply
+    /// must follow `path_of(id)` and complete the move (issue #2).
+    #[test]
+    fn apply_rename_follows_fileid_when_the_source_was_sidelined() {
+        let h = start();
+        let winner = FileId([0xc1; 16]);
+        let moved = FileId([0xc2; 16]);
+        std::fs::create_dir(h.backing.path().join("b")).unwrap();
+        std::fs::write(h.backing.path().join("b/f3"), b"winner\n").unwrap();
+        let name = conflict(b"b/f3", moved);
+        let name_path = h
+            .backing
+            .path()
+            .join(String::from_utf8_lossy(&name).as_ref());
+        std::fs::write(&name_path, b"moved\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"b/f3", winner);
+            st.index.take_version(winner, ver_at(11, 1, 1), &[]);
+            st.index.insert(&name, moved);
+            st.index.take_version(moved, ver_at(7, 2, 2), &[]);
+        }
+        assert!(
+            matches!(
+                h.repl.apply(
+                    2,
+                    3,
+                    &Entry::Rename {
+                        id: Some(moved),
+                        from: b"b/f3".to_vec(),
+                        to: b"b/f0".to_vec(),
+                        flags: 0,
+                    },
+                ),
+                Ok(true)
+            ),
+            "rename must follow the FileId off the conflict path"
+        );
+        assert_eq!(
+            std::fs::read(h.backing.path().join("b/f0")).unwrap(),
+            b"moved\n"
+        );
+        assert_eq!(
+            std::fs::read(h.backing.path().join("b/f3")).unwrap(),
+            b"winner\n"
+        );
+        assert!(!name_path.exists());
+        let st = h.repl.state();
+        assert_eq!(st.index.get(b"b/f0"), Some(moved));
+        assert_eq!(st.index.get(b"b/f3"), Some(winner));
+        assert_eq!(st.index.get(&name), None);
+    }
+
+    /// Completing a diverted Create (source already at a conflict-copy
+    /// path) must B4-sideline a live dest rather than A1-bury it, so
+    /// every node keeps the same conflict copy (issue #2).
+    #[test]
+    fn apply_rename_from_a_conflict_path_sidelines_a_live_dest() {
+        let h = start();
+        let dest = FileId([0xd1; 16]);
+        let winner = FileId([0xd2; 16]);
+        let moved = FileId([0xd3; 16]);
+        std::fs::create_dir(h.backing.path().join("b")).unwrap();
+        std::fs::write(h.backing.path().join("b/f0"), b"other\n").unwrap();
+        std::fs::write(h.backing.path().join("b/f3"), b"winner\n").unwrap();
+        let src = conflict(b"b/f3", moved);
+        let src_path = h
+            .backing
+            .path()
+            .join(String::from_utf8_lossy(&src).as_ref());
+        std::fs::write(&src_path, b"moved\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"b/f0", dest);
+            st.index.take_version(dest, ver_at(1, 1, 1), &[]);
+            st.index.insert(b"b/f3", winner);
+            st.index.take_version(winner, ver_at(11, 1, 1), &[]);
+            st.index.insert(&src, moved);
+            st.index.take_version(moved, ver_at(7, 2, 2), &[]);
+        }
+        assert!(
+            matches!(
+                h.repl.apply(
+                    2,
+                    3,
+                    &Entry::Rename {
+                        id: Some(moved),
+                        from: b"b/f3".to_vec(),
+                        to: b"b/f0".to_vec(),
+                        flags: 0,
+                    },
+                ),
+                Ok(true)
+            ),
+            "rename off a conflict path must take dest and keep the displaced file"
+        );
+        assert_eq!(
+            std::fs::read(h.backing.path().join("b/f0")).unwrap(),
+            b"moved\n"
+        );
+        assert_eq!(
+            std::fs::read(h.backing.path().join("b/f3")).unwrap(),
+            b"winner\n"
+        );
+        let dest_name = conflict(b"b/f0", dest);
+        let dest_path = h
+            .backing
+            .path()
+            .join(String::from_utf8_lossy(&dest_name).as_ref());
+        assert_eq!(std::fs::read(&dest_path).unwrap(), b"other\n");
+        assert!(!src_path.exists());
+        {
+            let st = h.repl.state();
+            assert_eq!(st.index.get(b"b/f0"), Some(moved));
+            assert_eq!(st.index.get(b"b/f3"), Some(winner));
+            assert_eq!(st.index.get(&dest_name), Some(dest));
+            assert!(
+                st.index.tombstone(&dest).is_none(),
+                "dest must be sidelined, not buried"
+            );
+        }
+        assert!(
+            journaled_rename(&h, dest, b"b/f0", &dest_name),
+            "sideline must journal a Rename to the FileId conflict name"
+        );
     }
 }
