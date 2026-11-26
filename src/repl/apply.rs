@@ -414,12 +414,49 @@ impl Repl {
                     self.discard(origin, id, version);
                     return r;
                 }
-                Err(e) => return Err(ApplyError::Retry(e)),
+                Err(_) => {
+                    // The origin went away after the dirty pull (the
+                    // hash RPC fails). Retrying would stall this entry
+                    // while the bytes already sit on disk, and peers
+                    // that have not seen the Data yet never get it
+                    // (`changes_are_forwarded_when_the_origin_is_down`).
+                    // Copy from a peer that already has this version;
+                    // otherwise keep the dirty-pulled copy.
+                    if let Some(r) = self.copy_from_a_peer_with(origin, id, version) {
+                        self.discard(origin, id, version);
+                        return r;
+                    }
+                }
             }
         }
         self.record_version(id, &path, version, lineage);
         self.invalidate(&path);
         Ok(true)
+    }
+
+    /// If a connected data peer other than `skip` already holds at least
+    /// `version` of `id`, copy from there. `None` if no such peer is
+    /// reachable (the caller keeps its local copy).
+    fn copy_from_a_peer_with(&self, skip: NodeId, id: FileId, version: Version) -> Option<Applied> {
+        for p in self.data_peers_up() {
+            if p == skip {
+                continue;
+            }
+            match self.remote_hashes(p, id) {
+                Ok(remote) if remote.version.is_some_and(|v| v >= version) => {
+                    return Some(self.copy_whole(p, id, version));
+                }
+                Ok(_) => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
+                Err(e) => return Some(Err(ApplyError::Retry(e))),
+            }
+        }
+        None
     }
 
     /// Whether the local bytes at `path` already match `source`'s whole
