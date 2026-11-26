@@ -18,6 +18,48 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-26 — Replication: conflict-copy names when two file ids share a path (#2)
+
+**Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
+
+This supersedes the Version-based conflict-copy *name* from the earlier
+26 Nov winner-rule entry. The winner rule itself is unchanged: the
+greater `Version` still wins the path; an unversioned file loses to
+any real `Version`; `FileId` is the last tie-break.
+
+After that entry was implemented, soak runs showed a name split: an
+unversioned local file treated as `0-0-0` produced `path.syncfs-conflict-0-0-0`
+on one node and `path.syncfs-conflict-<node>-<seq>-<disk>` on a node
+that already knew the version. Retrying a file `Create` until a version
+was known also deadlocked apply on empty files that never get a
+`Data`/`Attr`. Options recorded then:
+
+1. Name B4 conflict copies `path.syncfs-conflict-<fileid-hex>` (the
+   FileId is known at `Create`). Stop retrying a file `Create` only
+   because its version is unknown.
+2. Keep Version-based names, but never emit `0-0-0`, and do not Retry
+   forever: Retry only while a `Data`/`Attr` is still ahead in that
+   origin's inbox/journal; if no version will appear, use a FileId-based
+   suffix; rename an existing `…-0-0-0` copy once a real version is
+   recorded.
+3. Journal the B4 sideline as a `Rename` (or `Create`) so peers apply
+   the same name and the copy replicates, combined with 1 or 2.
+
+A related hole in the same runs: directory `Create` `AlreadyExists` had
+been changed to Retry and stalled later journal entries.
+
+**Choice.** 1 plus 3, and Skip for directories. The name uses the full
+16-byte lowercase FileId hex. A local loser is journaled as a `Rename`
+to that path. Directory `Create` `AlreadyExists` is Skip again, as
+before the two-FileId change, so `applied` advances.
+
+**Upgrade.** Existing `path.syncfs-conflict-<node>-<seq>-<disk>` and
+`path.syncfs-conflict-0-0-0` names are not rewritten. After upgrade,
+new clashes use the FileId name, so a cluster may briefly have both
+shapes until the old files are removed.
+
+**Status.** Implemented on `bug/grokbot/#2`. Decided, not yet merged.
+
 ## 2026-11-26 — Replication: winner rule when two file ids share a path (#2)
 
 **Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
