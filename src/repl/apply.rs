@@ -310,10 +310,13 @@ impl Repl {
             self.discard(origin, id, version);
             return Ok(false);
         };
-        if !self.has_base(&id, version, lineage) {
-            // The local copy is not one the origin's changed blocks apply
-            // to (the origin wrote over a copy without this one's last
-            // changes): compare the whole file.
+        if !self.has_base(&id, version, lineage) || self.session_data_is_final(origin, id, version)
+        {
+            // Interim Data stays on the dirty-block path below. The
+            // session-final entry must match the origin's whole file:
+            // a dirty pull only fetches blocks the origin rewrote, so a
+            // stale or torn prefix would otherwise be recorded as this
+            // version (issue #2).
             self.bind(id, &path);
             return self.copy_whole(origin, id, version);
         }
@@ -388,6 +391,26 @@ impl Repl {
         Err(ApplyError::Retry(io::Error::other(format!(
             "no connected node has version {version:?} of {id}"
         ))))
+    }
+
+    /// Whether this Data is the last one we have seen for `id` at
+    /// `version` from `origin`. A later same-version Data still queued
+    /// means this entry is interim; the dirty-block path applies. The
+    /// current entry has already been popped from the inbox.
+    fn session_data_is_final(&self, origin: NodeId, id: FileId, version: Version) -> bool {
+        let inbox = super::core::lock(&self.inbox);
+        !inbox.get(&origin).is_some_and(|ib| {
+            ib.queue.values().any(|q| {
+                matches!(
+                    &q.entry,
+                    Entry::Data {
+                        id: fid,
+                        version: v,
+                        ..
+                    } if *fid == id && *v == version
+                )
+            })
+        })
     }
 
     /// A later Remove or a newer Data for `id` is already in the inbox.
