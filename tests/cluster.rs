@@ -1761,6 +1761,77 @@ fn rename_exchange_does_not_drop_either_file() {
     );
 }
 
+/// A session-final Data entry must make the whole file match the origin
+/// (issue #2). Dirty-block apply of a later session leaves blocks the
+/// origin did not rewrite; a stale or torn prefix would be recorded as
+/// the new version if the final entry were not verified or copied whole.
+#[test]
+fn session_final_data_repairs_stale_blocks_dirty_pull_would_miss() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Mount, Daemon],
+        &[
+            "--lock-lease-timeout",
+            "1s",
+            "--lock-wait",
+            "5s",
+            "--freshness-timeout",
+            "2s",
+            "--block-size",
+            "4K",
+        ],
+    );
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    let block = 4096usize;
+    let first = vec![0xa5u8; block * 2];
+    std::fs::write(c.node(1).mnt().join("f"), &first).unwrap();
+    wait_for("every node has the two-block file", || {
+        [1u16, 2, 3]
+            .iter()
+            .all(|n| {
+                std::fs::read(c.node(*n).backing().join("f"))
+                    .ok()
+                    .as_deref()
+                    == Some(first.as_slice())
+            })
+            .then_some(())
+    });
+    // Corrupt a block the next write will not touch.
+    let mut torn = first.clone();
+    torn[..16].copy_from_slice(&[0x11u8; 16]);
+    std::fs::write(c.node(3).backing().join("f"), &torn).unwrap();
+    let mut second = first.clone();
+    second.extend(std::iter::repeat_n(0x5au8, block));
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(c.node(1).mnt().join("f"))
+            .unwrap();
+        f.write_all(&second[block * 2..]).unwrap();
+        f.sync_all().unwrap();
+    }
+    wait_for("node 2 has the appended file intact", || {
+        (std::fs::read(c.node(2).backing().join("f")).ok().as_deref() == Some(second.as_slice()))
+            .then_some(())
+    });
+    wait_for(
+        "node 3 copied the whole file, not only the new block",
+        || {
+            (std::fs::read(c.node(3).backing().join("f")).ok().as_deref()
+                == Some(second.as_slice()))
+            .then_some(())
+        },
+    );
+    for id in [1u16, 2, 3] {
+        let r = in_sync(&c, id);
+        assert_eq!(r["in_sync"], true, "node {id}: {r:#}");
+    }
+}
+
 /// A change reaches whose origin went away before it could send it:
 /// a third mount forwards it, ordered and once.
 #[test]
