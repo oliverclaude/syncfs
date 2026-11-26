@@ -431,3 +431,175 @@ impl Repl {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::config::{resolve, Config, Environment, Mode, PartialConfig, Peer};
+    use crate::lock::{LockManager, Settings};
+    use crate::net::Network;
+    use crate::repl::core::Repl;
+    use crate::repl::store::{Flusher, Store};
+
+    fn cfg(port: u16, state: &std::path::Path) -> Config {
+        let p = PartialConfig {
+            node_id: Some(1),
+            mode: Some(Mode::Daemon),
+            cluster_name: Some("test".into()),
+            listen: Some(format!("127.0.0.1:{port}").parse().unwrap()),
+            peers: Some(vec![Peer {
+                id: 1,
+                address: format!("127.0.0.1:{port}"),
+            }]),
+            state_dir: Some(state.to_path_buf()),
+            heartbeat_interval: Some("100ms".parse().unwrap()),
+            lock_lease_timeout: Some("1s".parse().unwrap()),
+            lock_wait: Some("1s".parse().unwrap()),
+            ..Default::default()
+        };
+        let env = Environment {
+            is_root: false,
+            home: Some("/tmp".into()),
+            xdg_state_home: None,
+            cwd: "/".into(),
+        };
+        resolve(p, &env).unwrap().config
+    }
+
+    struct Harness {
+        repl: Arc<Repl>,
+        backing: tempfile::TempDir,
+        _state: tempfile::TempDir,
+        net: Network,
+        locks: LockManager,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.repl.shutdown();
+            self.locks.shutdown();
+            self.net.shutdown();
+        }
+    }
+
+    fn start() -> Harness {
+        let state = tempfile::tempdir().unwrap();
+        let backing = tempfile::tempdir().unwrap();
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        drop(sock);
+        let cfg = cfg(port, state.path());
+        let store = Store::open(state.path()).unwrap();
+        let flusher = Flusher::new(Arc::new(store));
+        let net = Network::start(&cfg).unwrap();
+        let locks = LockManager::start(Settings::from_config(&cfg), net.clone());
+        let repl = Repl::start(
+            &cfg,
+            backing.path(),
+            1,
+            Arc::clone(&flusher),
+            net.clone(),
+            locks.clone(),
+            None,
+        )
+        .unwrap();
+        Harness {
+            repl,
+            backing,
+            _state: state,
+            net,
+            locks,
+        }
+    }
+
+    fn ver(seq: u64) -> Version {
+        Version {
+            seq,
+            node: 1,
+            disk: 1,
+        }
+    }
+
+    /// Applying a peer's Rename over a last link must bury that FileId
+    /// and journal a local Remove; otherwise a later Data for it stalls
+    /// (issue #2).
+    #[test]
+    fn apply_rename_over_journals_a_remove_for_the_displaced_file() {
+        let h = start();
+        let x = FileId([0x11; 16]);
+        let y = FileId([0x22; 16]);
+        std::fs::write(h.backing.path().join("f"), b"old\n").unwrap();
+        std::fs::write(h.backing.path().join("g"), b"new\n").unwrap();
+        {
+            let mut st = h.repl.state();
+            st.index.insert(b"f", x);
+            st.index.take_version(x, ver(1), &[]);
+            st.index.insert(b"g", y);
+        }
+        assert!(
+            matches!(
+                h.repl.apply(
+                    2,
+                    2,
+                    &Entry::Rename {
+                        id: Some(y),
+                        from: b"g".to_vec(),
+                        to: b"f".to_vec(),
+                        flags: 0,
+                    },
+                ),
+                Ok(true)
+            ),
+            "rename should apply"
+        );
+        assert_eq!(std::fs::read(h.backing.path().join("f")).unwrap(), b"new\n");
+        assert!(!h.backing.path().join("g").exists());
+        let st = h.repl.state();
+        assert_eq!(st.index.get(b"f"), Some(y));
+        assert!(
+            st.index.tombstone(&x).is_some(),
+            "the displaced FileId must be buried, not dropped"
+        );
+        assert!(
+            st.journal.entries().any(|(_, rec)| {
+                matches!(
+                    &rec.entry,
+                    Entry::Remove { id: Some(id), .. } if *id == x
+                )
+            }),
+            "apply must journal a Remove for the displaced last link"
+        );
+    }
+
+    /// A versioned Remove is skipped once the FileId is already a
+    /// tombstone, so Removes journaled by several nodes for the same
+    /// last-link drop stay idempotent (issue #2).
+    #[test]
+    fn apply_of_duplicate_removes_is_idempotent() {
+        let h = start();
+        let x = FileId([0x33; 16]);
+        let v = ver(2);
+        {
+            let mut st = h.repl.state();
+            st.index.bury(x, v);
+        }
+        let rem = Entry::Remove {
+            id: Some(x),
+            path: b"f".to_vec(),
+            dir: false,
+            version: Some(v),
+            lineage: Vec::new(),
+        };
+        assert!(
+            matches!(h.repl.apply(2, 2, &rem), Ok(false)),
+            "first remove"
+        );
+        assert!(
+            matches!(h.repl.apply(3, 3, &rem), Ok(false)),
+            "duplicate remove"
+        );
+        assert_eq!(h.repl.state().index.tombstone(&x), Some(v));
+    }
+}
