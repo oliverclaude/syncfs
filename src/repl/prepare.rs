@@ -191,7 +191,7 @@ impl Repl {
                 id,
                 path: path.clone(),
                 kind,
-                attrs: attrs.clone(),
+                attrs,
                 rdev,
                 target: target.to_vec(),
             },
@@ -325,7 +325,7 @@ impl Repl {
         };
         let (kind, attrs, rdev, target) = snap
             .as_ref()
-            .map(|s| (s.kind, s.attrs.clone(), s.rdev, s.target.clone()))
+            .map(|s| (s.kind, s.attrs, s.rdev, s.target.clone()))
             .unwrap_or((
                 if dir { NodeKind::Dir } else { NodeKind::File },
                 Attrs::default(),
@@ -556,7 +556,7 @@ impl Repl {
                 id: d.id,
                 path: d.path.clone(),
                 kind: d.kind,
-                attrs: d.attrs.clone(),
+                attrs: d.attrs,
                 rdev: d.rdev,
                 target: d.target.clone(),
             },
@@ -592,7 +592,7 @@ impl Repl {
                 path: d.path.clone(),
                 version,
                 size,
-                attrs: d.attrs.clone(),
+                attrs: d.attrs,
                 lineage: d.lineage.clone(),
             },
         );
@@ -632,7 +632,7 @@ fn snapshot_as_displaced(op: &InflightOp) -> Option<Displaced> {
             version: *version,
             lineage: lineage.clone(),
             kind: *kind,
-            attrs: attrs.clone(),
+            attrs: *attrs,
             rdev: *rdev,
             target: target.clone(),
         }),
@@ -929,7 +929,7 @@ mod tests {
             Entry::Attr { path, attrs, .. } if path == b"f" => Some(attrs),
             _ => None,
         });
-        let attr = attr.expect(&format!("missing Attr after create: {entries:?}"));
+        let attr = attr.unwrap_or_else(|| panic!("missing Attr after create: {entries:?}"));
         assert_ne!(attr.mtime, (0, 0), "origin times should come from stat");
         assert!(h.repl().state().inflight.is_none());
     }

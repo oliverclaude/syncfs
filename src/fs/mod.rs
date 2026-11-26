@@ -371,6 +371,7 @@ impl<H: WriteHooks> SyncFs<H> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_node(
         &self,
         req: &Request,
