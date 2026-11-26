@@ -326,15 +326,48 @@ impl<H: WriteHooks> SyncFs<H> {
     /// the change is recorded.
     fn mutate<T>(&self, op: Mutation<'_>, apply: impl FnOnce() -> Res<T>) -> Res<T> {
         let _guard = self.hooks.before(&op)?;
+        let namespace = matches!(
+            op,
+            Mutation::Create { .. } | Mutation::Rename { .. } | Mutation::Remove { .. }
+        );
+        if namespace {
+            self.hooks.prepare(&op)?;
+        }
         match apply() {
             Ok(v) => {
-                self.hooks.after(&op);
+                if namespace {
+                    self.hooks.confirm(&op)?;
+                } else {
+                    self.hooks.after(&op);
+                }
                 Ok(v)
             }
             Err(e) => {
-                self.hooks.failed(&op);
+                if namespace {
+                    self.hooks.abort(&op);
+                } else {
+                    self.hooks.failed(&op);
+                }
                 Err(e)
             }
+        }
+    }
+
+    /// Owner a newly created name should have: the requesting user when
+    /// running as root (the parent's group stays in a set-group-ID
+    /// directory), otherwise this process.
+    fn create_owner(&self, req: &Request, parent: &Inode) -> (u32, u32) {
+        if self.as_root {
+            let gid = match Self::stat(parent) {
+                Ok(st) if st.st_mode & libc::S_ISGID != 0 => st.st_gid,
+                _ => req.gid(),
+            };
+            (req.uid(), gid)
+        } else {
+            (
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            )
         }
     }
 
@@ -344,14 +377,23 @@ impl<H: WriteHooks> SyncFs<H> {
         parent: INodeNo,
         name: &OsStr,
         kind: FileType,
+        mode: u32,
+        rdev: u64,
+        target: &[u8],
         make: impl FnOnce(&Inode) -> Res<()>,
     ) -> Res<fuser::FileAttr> {
         Self::guard(parent, name)?;
         let p = self.inode(parent)?;
+        let (uid, gid) = self.create_owner(req, &p);
         let op = Mutation::Create {
             parent: self.node(&p),
             name,
             kind,
+            mode,
+            uid,
+            gid,
+            rdev,
+            target,
         };
         let (_, attr) = self.mutate(op, || {
             make(&p)?;
@@ -692,16 +734,25 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
         reply: ReplyEntry,
     ) {
         let kind = attr::kind_from_mode(mode);
-        let res = self.create_node(req, parent, name, kind, |p| {
-            rustix::fs::mknodat(
-                &p.fd,
-                name,
-                rustix::fs::FileType::from_raw_mode(mode),
-                Mode::from_raw_mode(mode & !umask & 0o7777),
-                u64::from(rdev),
-            )
-            .map_err(errno)
-        });
+        let res = self.create_node(
+            req,
+            parent,
+            name,
+            kind,
+            mode & !umask & 0o7777,
+            u64::from(rdev),
+            b"",
+            |p| {
+                rustix::fs::mknodat(
+                    &p.fd,
+                    name,
+                    rustix::fs::FileType::from_raw_mode(mode),
+                    Mode::from_raw_mode(mode & !umask & 0o7777),
+                    u64::from(rdev),
+                )
+                .map_err(errno)
+            },
+        );
         reply!(self, Op::Mknod, reply, res, |attr| reply.entry(
             &TTL,
             &attr,
@@ -718,10 +769,19 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let res = self.create_node(req, parent, name, FileType::Directory, |p| {
-            rustix::fs::mkdirat(&p.fd, name, Mode::from_raw_mode(mode & !umask & 0o7777))
-                .map_err(errno)
-        });
+        let res = self.create_node(
+            req,
+            parent,
+            name,
+            FileType::Directory,
+            mode & !umask & 0o7777,
+            0,
+            b"",
+            |p| {
+                rustix::fs::mkdirat(&p.fd, name, Mode::from_raw_mode(mode & !umask & 0o7777))
+                    .map_err(errno)
+            },
+        );
         reply!(self, Op::Mkdir, reply, res, |attr| reply.entry(
             &TTL,
             &attr,
@@ -775,9 +835,17 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let res = self.create_node(req, parent, link_name, FileType::Symlink, |p| {
-            rustix::fs::symlinkat(target, &p.fd, link_name).map_err(errno)
-        });
+        let target_bytes = target.as_os_str().as_bytes();
+        let res = self.create_node(
+            req,
+            parent,
+            link_name,
+            FileType::Symlink,
+            0o777,
+            0,
+            target_bytes,
+            |p| rustix::fs::symlinkat(target, &p.fd, link_name).map_err(errno),
+        );
         reply!(self, Op::Symlink, reply, res, |attr| reply.entry(
             &TTL,
             &attr,
@@ -1261,10 +1329,16 @@ impl<H: WriteHooks> Filesystem for SyncFs<H> {
             Self::guard(parent, name)?;
             let p = self.inode(parent)?;
             let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+            let (uid, gid) = self.create_owner(req, &p);
             let op = Mutation::Create {
                 parent: self.node(&p),
                 name,
                 kind: FileType::RegularFile,
+                mode: mode & !umask & 0o7777,
+                uid,
+                gid,
+                rdev: 0,
+                target: b"",
             };
             let created = self.mutate(op, || {
                 // Exclusive: if the name appeared since the kernel looked

@@ -307,6 +307,24 @@ impl ClusterHooks {
         })))
     }
 
+    fn rekey_if_rename(&self, op: &Mutation<'_>) {
+        if let Mutation::Rename {
+            parent,
+            name,
+            new_parent,
+            new_name,
+            ..
+        } = *op
+        {
+            // The parents still exist: we hold locks under them.
+            if let (Ok(Some(from)), Ok(Some(to))) =
+                (child(parent, name), child(new_parent, new_name))
+            {
+                self.rekey(&from, &to);
+            }
+        }
+    }
+
     /// Moves write locks under `from` to the same place under `to`.
     fn rekey(&self, from: &Key, to: &Key) {
         let mut by_ino = self.by_ino();
@@ -401,20 +419,42 @@ impl WriteHooks for ClusterHooks {
 
     fn after(&self, op: &Mutation<'_>) {
         self.repl.record(op);
-        if let Mutation::Rename {
-            parent,
-            name,
-            new_parent,
-            new_name,
-            ..
-        } = *op
-        {
-            // The parents still exist: we hold locks under them.
-            if let (Ok(Some(from)), Ok(Some(to))) =
-                (child(parent, name), child(new_parent, new_name))
-            {
-                self.rekey(&from, &to);
-            }
+        self.rekey_if_rename(op);
+    }
+
+    fn prepare(&self, op: &Mutation<'_>) -> Result<(), Errno> {
+        if matches!(
+            op,
+            Mutation::Create { .. } | Mutation::Rename { .. } | Mutation::Remove { .. }
+        ) {
+            self.repl.prepare(op).map_err(|e| {
+                log::error!("replication: cannot journal {op:?} before the change: {e}");
+                Errno::EIO
+            })?;
+        }
+        Ok(())
+    }
+
+    fn confirm(&self, op: &Mutation<'_>) -> Result<(), Errno> {
+        if matches!(
+            op,
+            Mutation::Create { .. } | Mutation::Rename { .. } | Mutation::Remove { .. }
+        ) {
+            self.repl.confirm(op).map_err(|e| {
+                log::warn!("replication: cannot confirm {op:?}: {e}");
+                Errno::EIO
+            })?;
+        }
+        self.rekey_if_rename(op);
+        Ok(())
+    }
+
+    fn abort(&self, op: &Mutation<'_>) {
+        if matches!(
+            op,
+            Mutation::Create { .. } | Mutation::Rename { .. } | Mutation::Remove { .. }
+        ) {
+            self.repl.abort(op);
         }
     }
 

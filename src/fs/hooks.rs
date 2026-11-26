@@ -120,10 +120,17 @@ pub struct AttrChange {
 #[derive(Clone, Copy, Debug)]
 pub enum Mutation<'a> {
     /// New file, directory, symlink or special file `name` in `parent`.
+    /// `mode` is after umask; `uid`/`gid` follow the chown policy;
+    /// `target` is the symlink target (empty otherwise).
     Create {
         parent: NodeRef<'a>,
         name: &'a OsStr,
         kind: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u64,
+        target: &'a [u8],
     },
     /// New hard link to `node`.
     Link {
@@ -226,6 +233,22 @@ pub trait WriteHooks: Send + Sync + 'static {
     /// Called after `op` was applied successfully.
     fn after(&self, _op: &Mutation<'_>) {}
 
+    /// Journal a namespace change durably before the backing syscall
+    /// (create, rename, unlink). Default: do nothing.
+    fn prepare(&self, _op: &Mutation<'_>) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    /// After a successful namespace syscall: record post-syscall Attr
+    /// for a Create, and clear the inflight marker.
+    fn confirm(&self, _op: &Mutation<'_>) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    /// After a failed namespace syscall: journal a compensating entry
+    /// and revert the index.
+    fn abort(&self, _op: &Mutation<'_>) {}
+
     /// Called when `op` was allowed by `before` but then failed. A data
     /// change may have been partly applied.
     fn failed(&self, _op: &Mutation<'_>) {}
@@ -257,6 +280,18 @@ impl<T: WriteHooks + ?Sized> WriteHooks for std::sync::Arc<T> {
 
     fn after(&self, op: &Mutation<'_>) {
         (**self).after(op)
+    }
+
+    fn prepare(&self, op: &Mutation<'_>) -> Result<(), Errno> {
+        (**self).prepare(op)
+    }
+
+    fn confirm(&self, op: &Mutation<'_>) -> Result<(), Errno> {
+        (**self).confirm(op)
+    }
+
+    fn abort(&self, op: &Mutation<'_>) {
+        (**self).abort(op)
     }
 
     fn failed(&self, op: &Mutation<'_>) {

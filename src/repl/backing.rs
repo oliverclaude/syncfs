@@ -215,15 +215,63 @@ impl Backing {
         rdev: u64,
         target: &[u8],
     ) -> io::Result<()> {
+        let (d, n) = self.create_node(path, kind, attrs, rdev, target)?;
+        self.set_attrs_at(&d, &n, kind, attrs)
+    }
+
+    /// Like [`create`], but does not apply placeholder times. Used when
+    /// redoing a local Create that was journaled with intended metadata
+    /// before the inode existed.
+    pub fn create_intended(
+        &self,
+        path: &[u8],
+        kind: NodeKind,
+        attrs: &Attrs,
+        rdev: u64,
+        target: &[u8],
+    ) -> io::Result<()> {
+        let (d, n) = self.create_node(path, kind, attrs, rdev, target)?;
+        if self.as_root {
+            let r = rustix::fs::chownat(
+                &d,
+                &n,
+                Some(rustix::fs::Uid::from_raw(attrs.uid)),
+                Some(rustix::fs::Gid::from_raw(attrs.gid)),
+                AtFlags::SYMLINK_NOFOLLOW,
+            );
+            if let Err(e) = r {
+                log::debug!("replication: chown {n:?}: {e}");
+            }
+        }
+        if kind != NodeKind::Symlink {
+            rustix::fs::chmodat(
+                &d,
+                &n,
+                Mode::from_raw_mode(attrs.mode & 0o7777),
+                AtFlags::empty(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn create_node(
+        &self,
+        path: &[u8],
+        kind: NodeKind,
+        attrs: &Attrs,
+        rdev: u64,
+        target: &[u8],
+    ) -> io::Result<(OwnedFd, std::ffi::OsString)> {
         let (d, n) = self.parent(path)?;
+        let n = n.to_os_string();
         let mode = Mode::from_raw_mode(attrs.mode & 0o7777);
         match kind {
-            NodeKind::Dir => rustix::fs::mkdirat(&d, n, mode)?,
-            NodeKind::Symlink => rustix::fs::symlinkat(OsStr::from_bytes(target), &d, n)?,
+            NodeKind::Dir => rustix::fs::mkdirat(&d, &n, mode)?,
+            NodeKind::Symlink => rustix::fs::symlinkat(OsStr::from_bytes(target), &d, &n)?,
             NodeKind::File => {
                 rustix::fs::openat(
                     &d,
-                    n,
+                    &n,
                     OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
                     mode,
                 )?;
@@ -235,10 +283,10 @@ impl Backing {
                     NodeKind::CharDevice => FileType::CharacterDevice,
                     _ => FileType::BlockDevice,
                 };
-                rustix::fs::mknodat(&d, n, ft, mode, rdev)?;
+                rustix::fs::mknodat(&d, &n, ft, mode, rdev)?;
             }
         }
-        self.set_attrs_at(&d, n, kind, attrs)
+        Ok((d, n))
     }
 
     pub fn link(&self, existing: &[u8], path: &[u8]) -> io::Result<()> {

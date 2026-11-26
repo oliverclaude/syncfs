@@ -16,7 +16,7 @@ use crate::lock::LockManager;
 use crate::net::wire::{Entry, FileId, Message, Version};
 use crate::net::Network;
 
-use super::backing::{attrs_of, kind_of, Backing};
+use super::backing::{attrs_of, Backing};
 use super::dirty::Dirty;
 use super::files::Index;
 use super::journal::Journal;
@@ -105,6 +105,9 @@ pub(crate) struct State {
     /// session). A peer's entry for one of them is older than the session
     /// and waits until it ends.
     pub locked_here: HashMap<FileId, usize>,
+    /// A namespace change journaled and not yet confirmed (or compensated).
+    pub inflight: Option<super::prepare::Inflight>,
+    pub inflight_changed: bool,
 }
 
 const CLEAN_KEY: &[u8] = b"clean";
@@ -158,7 +161,7 @@ pub fn path_bytes(p: &Path) -> Vec<u8> {
     p.as_os_str().as_bytes().to_vec()
 }
 
-fn join(parent: &[u8], name: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn join(parent: &[u8], name: &std::ffi::OsStr) -> Vec<u8> {
     let mut p = parent.to_vec();
     if !p.is_empty() {
         p.push(b'/');
@@ -364,6 +367,8 @@ impl Repl {
                 counters: Counters::default(),
                 tombstones_expired: None,
                 locked_here: HashMap::new(),
+                inflight: Repl::load_inflight(store.as_ref())?,
+                inflight_changed: false,
             }),
             cv: Condvar::new(),
             flusher: Arc::clone(&flusher),
@@ -441,6 +446,9 @@ impl Repl {
                     })
             }),
         });
+        if repl.state().inflight.is_some() {
+            repl.recover_inflight()?;
+        }
         Ok(repl)
     }
 
@@ -752,32 +760,26 @@ impl Repl {
 
     fn try_record(&self, op: &Mutation<'_>) -> std::io::Result<()> {
         match *op {
-            Mutation::Create { parent, name, .. } => {
+            Mutation::Create {
+                parent,
+                name,
+                kind,
+                mode,
+                uid,
+                gid,
+                rdev,
+                target,
+            } => {
+                // Namespace creates go through `prepare` (journal first).
+                // Kept for any leftover record() caller.
                 let path = join(&path_bytes(&parent.path()?), name);
-                let st = parent.stat_child(name)?;
-                let kind = kind_of(&st);
-                let target = if kind == crate::net::wire::NodeKind::Symlink {
-                    parent.readlink_child(name)?
-                } else {
-                    Vec::new()
-                };
-                let id = FileId::random();
-                let mut s = self.state();
-                self.displace_last_link(&mut s, &path);
-                s.index.insert(&path, id);
-                self.append(
-                    &mut s,
-                    Entry::Create {
-                        id,
-                        path,
-                        kind,
-                        attrs: attrs_of(&st),
-                        rdev: st.st_rdev,
-                        target,
-                    },
-                );
-                drop(s);
-                self.cv.notify_all();
+                self.prepare_create(
+                    path,
+                    super::prepare::node_kind(kind),
+                    super::prepare::intended_attrs(mode, uid, gid),
+                    rdev,
+                    target,
+                )?;
             }
             Mutation::Link {
                 node,
@@ -1090,6 +1092,13 @@ impl Repl {
         for id in leaving {
             st.window.remove(&id);
             ops.push((Table::Window, id.0.to_vec(), None));
+        }
+        if std::mem::take(&mut st.inflight_changed) {
+            ops.push((
+                Table::Meta,
+                super::prepare::INFLIGHT_KEY.to_vec(),
+                st.inflight.as_ref().map(encode),
+            ));
         }
         drop(st);
         let weak: Weak<Repl> = self.this.get().cloned().unwrap_or_default();
