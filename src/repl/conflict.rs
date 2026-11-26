@@ -27,16 +27,6 @@ pub fn conflict_name(path: &[u8], me: NodeId, at: SystemTime) -> Vec<u8> {
 }
 
 /// A deterministic conflict path for a file set aside because two
-/// FileIds met at `path`. The same version always maps to the same
-/// name, so every node that applies the same rule keeps the loser
-/// at the same path (issue #2).
-pub fn versioned_conflict_name(path: &[u8], v: Version) -> Vec<u8> {
-    let mut out = path.to_vec();
-    out.extend_from_slice(format!(".syncfs-conflict-{}-{}-{}", v.node, v.seq, v.disk).as_bytes());
-    out
-}
-
-/// A deterministic conflict path for a file set aside because two
 /// FileIds met at `path`. The name uses the loser's FileId (full
 /// 16-byte lowercase hex) so every node agrees even when the file
 /// has no version (issue #2).
@@ -190,15 +180,11 @@ impl Repl {
         found
     }
 
-    /// Moves `id` from `path` to the deterministic conflict name for
-    /// `version`, keeping the same FileId and its version.
-    fn sideline_as_conflict(
-        &self,
-        id: FileId,
-        path: &[u8],
-        version: Version,
-    ) -> io::Result<Vec<u8>> {
-        let name = versioned_conflict_name(path, version);
+    /// Moves `id` from `path` to the FileId conflict name, keeping the
+    /// same FileId and its version, and journals a Rename so peers
+    /// apply the same path.
+    fn sideline_as_conflict(&self, id: FileId, path: &[u8]) -> io::Result<Vec<u8>> {
+        let name = fileid_conflict_name(path, id);
         if self.state().index.get(&name) == Some(id) && self.backing.exists(&name) {
             if self.state().index.get(path) == Some(id) {
                 if let Err(e) = self.backing.remove(path, false) {
@@ -229,19 +215,29 @@ impl Repl {
         if st.index.get(path) == Some(id) {
             st.index.remove_path(path);
         }
+        self.append(
+            &mut st,
+            Entry::Rename {
+                id: Some(id),
+                from: path.to_vec(),
+                to: name.clone(),
+                flags: 0,
+            },
+        );
         drop(st);
         self.cv.notify_all();
         Ok(name)
     }
 
     /// `path` already names another file: pick a winner by Version (seq,
-    /// then node, then disk; FileId breaks a tie) and keep the loser as
-    /// a conflict copy with the same FileId, so later Data finds it and
-    /// every node converges on the same names (issue #2).
+    /// then node, then disk; an unversioned file loses to any real
+    /// Version; FileId breaks a tie) and keep the loser as a conflict
+    /// copy named `path.syncfs-conflict-<fileid-hex>`, same FileId, and
+    /// journal a Rename when the local file is the one moved (issue #2).
     ///
     /// Does not skip: skipping would still advance `applied` and leave
-    /// two FileIds at one path. Retries until the incoming version is
-    /// known.
+    /// two FileIds at one path. Does not retry only because a version
+    /// is unknown.
     pub(crate) fn apply_create_at_taken_path(
         &self,
         id: FileId,
@@ -260,14 +256,10 @@ impl Repl {
         if local_id == id {
             return Ok(false);
         }
-        let Some(incoming_ver) = self.version_for(id) else {
-            return Err(ApplyError::Retry(io::Error::other(
-                "waiting for a version to compare with the file at this path",
-            )));
-        };
+        let incoming_ver = version_or_none(self.version_for(id));
         let local_ver = version_or_none(self.state().index.version(&local_id));
         if (incoming_ver, id) > (local_ver, local_id) {
-            self.sideline_as_conflict(local_id, path, local_ver)
+            self.sideline_as_conflict(local_id, path)
                 .map_err(ApplyError::Retry)?;
             self.backing
                 .create(path, kind, attrs, rdev, target)
@@ -278,7 +270,7 @@ impl Repl {
             self.cv.notify_all();
             Ok(true)
         } else {
-            let name = versioned_conflict_name(path, incoming_ver);
+            let name = fileid_conflict_name(path, id);
             if self.state().index.get(&name) == Some(id) && self.backing.exists(&name) {
                 return Ok(false);
             }
@@ -306,17 +298,6 @@ mod tests {
         assert_eq!(
             conflict_name(b"d/f.txt", 3, t),
             b"d/f.txt.syncfs-conflict-3-20260921T141320Z".to_vec()
-        );
-        assert_eq!(
-            versioned_conflict_name(
-                b"f",
-                Version {
-                    seq: 1,
-                    node: 2,
-                    disk: 7,
-                },
-            ),
-            b"f.syncfs-conflict-2-1-7".to_vec()
         );
         assert_eq!(
             fileid_conflict_name(

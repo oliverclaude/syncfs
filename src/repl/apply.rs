@@ -130,7 +130,10 @@ impl Repl {
                         return self
                             .apply_create_at_taken_path(*id, path, *kind, attrs, *rdev, target);
                     }
-                    return Err(ApplyError::Retry(io::Error::new(
+                    // Directories (and other non-files): Skip so applied
+                    // advances; Retry would stall the rest of the journal
+                    // (issue #2).
+                    return Err(skip(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         "another file has this path here",
                     )));
