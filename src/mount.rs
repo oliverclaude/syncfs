@@ -710,11 +710,16 @@ fn serve(served: Served, mut signals: Signals) -> anyhow::Result<()> {
             }
         }
     });
+    // Aborts the connection if this process dies holding it (issue #3).
+    let watchdog = crate::watchdog::Watchdog::start(&mountpoint);
     let mut bg = session.spawn().context("starting FUSE session")?;
     // Take the join handle without dropping `bg`, which still holds the
     // Mount and would fusermount the path if dropped. The dummy is reaped
     // when `bg` is dropped or forgotten.
     let session_res = std::mem::replace(&mut bg.guard, std::thread::spawn(|| Ok(()))).join();
+    // The connection has ended and its number may soon name another
+    // mount: the watchdog must not abort it any more.
+    drop(watchdog);
     let res = match session_res {
         // After a lazy detach some kernels abort the connection when the
         // last file is closed instead of ending it: that is the unmount.
