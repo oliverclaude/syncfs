@@ -709,6 +709,137 @@ fn locks_unlink_of_a_file_replaced_while_waiting_removes_the_new_file() {
     assert_eq!(c.node(2).status("stats").unwrap()["conflict_copies"], 0);
 }
 
+/// A SIGKILLed mount whose entry-invalidation thread is stuck in the
+/// kernel behind a directory lock that a waiting unlink holds must not
+/// hang (issue #3): the watchdog aborts the FUSE connection, the unlink
+/// fails, the process exits and the mount answers ENOTCONN.
+#[test]
+fn killed_mount_with_a_stuck_invalidation_is_aborted() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = Cluster::build(
+        &[Mount, Mount, Daemon],
+        &["--lock-lease-timeout", "1s", "--lock-wait", "10s"],
+    );
+    let inval = c.node(2).dir.join("hold-inval");
+    c.node(2)
+        .env
+        .push(("SYNCFS_TEST_HOLD_INVAL".into(), inval.display().to_string()));
+    for n in &c.nodes {
+        if n.kind == Kind::Mount {
+            std::fs::create_dir_all(n.backing().join("d")).unwrap();
+            std::fs::write(n.backing().join("d/f"), b"x").unwrap();
+            std::fs::write(n.backing().join("d/g"), b"x").unwrap();
+        }
+    }
+    c.start_all();
+    c.converge("start");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    let (m1, m2) = (c.node(1).mnt(), c.node(2).mnt());
+    // Node 2's kernel knows d, so applying the removal of d/g queues an
+    // invalidation, which is held back.
+    std::fs::metadata(m2.join("d")).unwrap();
+    std::fs::write(&inval, b"1").unwrap();
+    std::fs::remove_file(m1.join("d/g")).unwrap();
+    let b2 = c.node(2).backing();
+    eventually("d/g removed on node 2", || {
+        match b2.join("d/g").try_exists()? {
+            true => Err(std::io::Error::other("still there")),
+            false => Ok(()),
+        }
+    });
+    // Node 2's unlink holds d's lock in its kernel while it waits for f's.
+    let _w = open_rw(&m1.join("d/f")).unwrap();
+    let f2 = m2.join("d/f");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::remove_file(&f2));
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    if let Ok(r) = rx.try_recv() {
+        panic!("unlink did not wait: {r:?}");
+    }
+    // Released, the invalidation blocks in the kernel behind that lock.
+    std::fs::remove_file(&inval).unwrap();
+    let pid = c.node(2).child.as_ref().unwrap().id();
+    eventually("syncfs-inval-e is stuck in the kernel", || {
+        thread_state(pid, "syncfs-inval-e")
+            .filter(|&s| s == 'D')
+            .map(|_| ())
+            .ok_or_else(|| std::io::Error::other("not in D"))
+    });
+    c.node(2).signal(libc::SIGKILL);
+    let t = Instant::now();
+    let limit = Duration::from_secs(5);
+    let mut child = c.node(2).child.take().unwrap();
+    let exited = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if t.elapsed() > limit {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !exited {
+        // Release it so that the test can clean up, then fail.
+        abort_fuse(&m2);
+        let _ = child.wait();
+    }
+    let unlink = rx.recv_timeout(Duration::from_secs(5));
+    // A name the kernel has not cached needs the (gone) daemon.
+    let after = errno(std::fs::metadata(m2.join("never-looked-up")));
+    for (cmd, arg) in [("fusermount3", "-uz"), ("umount", "-l")] {
+        if !is_mounted(&m2) {
+            break;
+        }
+        let _ = Command::new(cmd)
+            .arg(arg)
+            .arg(&m2)
+            .stderr(Stdio::null())
+            .status();
+    }
+    assert!(exited, "killed node 2 did not exit within {limit:?}");
+    eprintln!("killed node exited {:?} after SIGKILL", t.elapsed());
+    let e = errno(unlink.expect("unlink still waiting"));
+    assert!(
+        matches!(e, Some(libc::ENOTCONN) | Some(libc::ECONNABORTED)),
+        "unlink: {e:?}"
+    );
+    assert_eq!(after, Some(libc::ENOTCONN));
+}
+
+/// The state letter of `pid`'s thread named `comm`, if there is one.
+fn thread_state(pid: u32, comm: &str) -> Option<char> {
+    for t in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+        let dir = t.ok()?.path();
+        let name = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        if name.trim_end() != comm {
+            continue;
+        }
+        let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+        return stat.rsplit_once(") ")?.1.chars().next();
+    }
+    None
+}
+
+/// Aborts the FUSE connection of the mount at `mnt` through
+/// /sys/fs/fuse/connections; false if it cannot.
+fn abort_fuse(mnt: &std::path::Path) -> bool {
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let want = mnt.to_string_lossy();
+    let dev = info.lines().rev().find_map(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        (f.get(4) == Some(&&*want)).then(|| f.get(2).map(|d| d.to_string()))?
+    });
+    let Some(minor) = dev.as_deref().and_then(|d| d.split(':').nth(1)) else {
+        return false;
+    };
+    std::fs::write(format!("/sys/fs/fuse/connections/{minor}/abort"), "1").is_ok()
+}
+
 /// A rename whose source a peer replaced while this node waited for the
 /// lock must move the file that is there now, not the kernel's cached
 /// dentry for the old one (issue #4). Apply on node 2 is held until the

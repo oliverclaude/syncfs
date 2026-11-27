@@ -156,7 +156,7 @@ re-check which seeds pass reliably and add the short fault soak as a
 blocking CI job. The issue stays open. (The lettered alternatives to
 C were not written down on the issue.)
 
-**Status.** Held. #5 is fixed; #2 and #3 are still open. The job is
+**Status.** Held. #3 and #5 are fixed; #2 is still open. The job is
 not in CI yet.
 
 ## 2026-11-19 to 2026-11-22 — Process
@@ -257,9 +257,10 @@ handoff or freshness fallback.
 
 **Status.** The rename `ESTALE` is in main (ae2c039, #4). The soak
 excuse is in main (d5be362 and follow-ups, #5). The watchdog is
-decided, not yet implemented; #3 is still open. The soak harness
-already aborts a hung mount's FUSE connection after 30 s as a
-stopgap, so the run fails instead of hanging.
+implemented (0a1a3fd, with the test a987e3c and README 20baaa2, #3):
+a killed mount now exits and answers `ENOTCONN` within about 200 ms.
+The soak harness's 30 s abort stays as a backstop, e.g. for a
+process-group kill that takes the watchdog down too.
 
 ## 2026-11-19 — Rename races return ESTALE
 

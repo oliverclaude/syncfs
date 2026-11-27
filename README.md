@@ -193,6 +193,13 @@ fusermount3 -u /mnt/data                   # unmount (or: umount /mnt/data as ro
 - **Root** mounts with mount(2) directly; the mount shows up as type
   `fuse.syncfs`. The kernel checks permissions (`default_permissions`),
   and with `allow_other` files created by other users belong to them.
+- A small **watchdog** process (`syncfs-watchdog`, a child of the daemon
+  holding none of its files) aborts the FUSE connection through
+  `/sys/fs/fuse/connections/N/abort` when the daemon dies without closing
+  it, e.g. when SIGKILLed or OOM-killed while the kernel holds one of its
+  threads. The mount then fails with `ENOTCONN` instead of hanging; unmount
+  it with `fusermount3 -u` (or `umount`) and mount again. A clean unmount
+  stops the watchdog.
 
 ### /etc/fstab
 
@@ -1033,6 +1040,12 @@ recorded, so peers never get it: a bug, logged as a warning)), and
   entries (a peer's create, rename or remove) show after the 1 s entry TTL.
 - With two data nodes there is nobody to forward through: a node waits
   for the origin (reads stay local; locked writes use freshness).
+- The watchdog needs `/sys/fs/fuse/connections` (the `fusectl` file
+  system; a warning is logged without it). Killing the daemon's whole
+  process group or cgroup (e.g. systemd's default `KillMode`) kills the
+  watchdog too, and a hung mount then needs
+  `echo 1 > /sys/fs/fuse/connections/N/abort` by hand (`N` is the minor of
+  the mount's device in `/proc/self/mountinfo`).
 - Paths longer than `PATH_MAX` (4096 bytes) cannot be named and are not
   replicated (a warning is logged); their locks fall back to the root lock.
 

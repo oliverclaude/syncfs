@@ -14,3 +14,4 @@ pub mod reload;
 pub mod repl;
 pub mod status;
 pub mod voter;
+pub mod watchdog;
