@@ -1604,7 +1604,11 @@ fn soak(kinds: &[Kind]) {
         if t.elapsed() > Duration::from_secs(120) {
             why = format!("all up: {}, in sync: {synced}\n", s.all_up());
             for n in s.mounts() {
-                why += &format!("  node {}: {}\n", n.id, sync_breakdown(n.status("replication")));
+                why += &format!(
+                    "  node {}: {}\n",
+                    n.id,
+                    sync_breakdown(n.status("replication"))
+                );
             }
             let base = &trees[0];
             for (id, tr) in &trees[1..] {
