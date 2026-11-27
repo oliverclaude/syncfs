@@ -18,6 +18,25 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-27 — Replication: leaked sessions and dirty marks (#27)
+
+**Issue:** [#27](https://github.com/oliverclaude/syncfs/issues/27)
+
+A node stays out of sync with matching trees because it keeps a write
+session or dirty marks for a file that no longer has a path, and
+nothing ends or clears them.
+
+**Options.** A: a periodic clean-up on each store flush that ends the
+sessions and drops the marks of pathless files not locked here (logged
+as a warning). B: trace each leak with debug logging and fix it where
+it starts. C: make `in_sync` ignore pathless sessions and marks. Also
+offered: A plus B's logging.
+
+**Choice.** B. (No reason was recorded.)
+
+**Status.** Decided; the trace logging is on `bug/grokbot/#27`, the
+fixes are not yet implemented.
+
 ## 2026-11-26 — Replication: remaining #2 fixes
 
 **Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
