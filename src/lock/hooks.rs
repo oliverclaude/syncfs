@@ -264,7 +264,8 @@ impl ClusterHooks {
             })?;
         if !acquired.new_session {
             // Another reference's session (fresh already) does the remove.
-            let guard = self.guard(vec![key.clone()]);
+            let bound = self.locks.session(&key).map(|(f, _)| f);
+            let guard = self.removal_guard(key.clone(), bound);
             self.begin(&key)?;
             return Ok(Some(guard));
         }
@@ -303,8 +304,18 @@ impl ClusterHooks {
             if !repl.in_session(&file) {
                 locks.mark_written(&key);
             }
+            unbind_if_removed(&locks, &repl, &key, Some(file));
             release(&locks, &repl, &key);
         })))
+    }
+
+    /// Releases `key` after a remove joined the session on `file`.
+    fn removal_guard(&self, key: Key, file: Option<crate::net::wire::FileId>) -> OpGuard {
+        let (locks, repl) = (self.locks.clone(), Arc::clone(&self.repl));
+        OpGuard::new(move || {
+            unbind_if_removed(&locks, &repl, &key, file);
+            release(&locks, &repl, &key);
+        })
     }
 
     /// Moves write locks under `from` to the same place under `to`.
@@ -465,6 +476,23 @@ impl WriteHooks for ClusterHooks {
         if let Some(key) = key {
             release(&self.locks, &self.repl, &key);
         }
+    }
+}
+
+/// A remove took `file` (the session's file on `key`) away while other
+/// references keep the lock: a file created at the path next must start
+/// its own session, not write into the removed file's (#27).
+fn unbind_if_removed(
+    locks: &LockManager,
+    repl: &Repl,
+    key: &Key,
+    file: Option<crate::net::wire::FileId>,
+) {
+    let Some(file) = file else {
+        return;
+    };
+    if !repl.has_path(&file) && locks.unbind_removed(key, file) {
+        log::debug!("locks: {key}: {file} was removed under the held lock; unbound");
     }
 }
 

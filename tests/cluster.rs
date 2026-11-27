@@ -2341,3 +2341,37 @@ fn reload_sighup_rereads_yaml_without_unmounting() {
     c.node(2).stop();
     assert!(!is_mounted(&c.node(2).mnt()));
 }
+
+/// A file created at a path whose previous file was unlinked while still
+/// open under the same write lock gets its own session: its content
+/// replicates and no session is left on the removed file (#27).
+#[test]
+fn file_created_where_an_open_file_was_unlinked_replicates() {
+    require_fuse!();
+    use std::io::Write;
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m1 = c.node(1).mnt();
+    let mut a = open_rw(&m1.join("f")).unwrap();
+    a.write_all(b"A").unwrap();
+    std::fs::remove_file(m1.join("f")).unwrap();
+    std::fs::write(m1.join("f"), b"new file").unwrap();
+    let s = c.node(1).status("replication").unwrap();
+    assert!(
+        s["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| !x["path"].is_null()),
+        "session on a removed file: {}",
+        s["sessions"]
+    );
+    drop(a);
+    let b2 = c.node(2).backing();
+    eventually("node 2 has the new file", || {
+        let got = std::fs::read(b2.join("f"))?;
+        (got == b"new file")
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("{:?}", String::from_utf8_lossy(&got))))
+    });
+}

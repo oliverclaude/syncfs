@@ -18,6 +18,56 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-27 — Locks: a file created where a locked file was removed (#27, leak a)
+
+**Issue:** [#27](https://github.com/oliverclaude/syncfs/issues/27)
+
+Found by the trace (option B below). A file is open for writing under
+its path lock, then removed and a new file created at the same path
+while the lock is still held. The lock stayed bound to the removed
+file, so the new file got no session of its own: its content never
+replicated, and a session with no path stayed open on the removed
+file.
+
+**Options.** Option 1: rebind when the new file joins: when a file
+joins a held path lock tied to a different, deleted file, end the old
+session and rebind the lock to the new file with a fresh version (needs
+a new lock-manager call; writes via the old deleted handle would count
+against the new file, causing extra resends). Option 2: unbind at the
+delete. When a local delete removes the
+lock's file, clear the lock's file and version so the next file
+created under the held lock starts its own session through the
+existing path.
+
+**Choice.** Option 2, chosen by Henk. (No reason was recorded.)
+
+**Status.** Implemented on `bug/grokbot/#27` in 2cf074d (the fix plus
+the regression test `file_created_where_an_open_file_was_unlinked_replicates`).
+Merged to `main` (`--no-ff`, with #27 kept open for leak b). The
+removed file's version is no longer reported by
+the lock release when other references keep the lock; it settles
+through the holders of its tombstone instead.
+
+## 2026-11-27 — Replication: leaked sessions and dirty marks (#27)
+
+**Issue:** [#27](https://github.com/oliverclaude/syncfs/issues/27)
+
+A node stays out of sync with matching trees because it keeps a write
+session or dirty marks for a file that no longer has a path, and
+nothing ends or clears them.
+
+**Options.** A: a periodic clean-up on each store flush that ends the
+sessions and drops the marks of pathless files not locked here (logged
+as a warning). B: trace each leak with debug logging and fix it where
+it starts. C: make `in_sync` ignore pathless sessions and marks. Also
+offered: A plus B's logging.
+
+**Choice.** B. (No reason was recorded.)
+
+**Status.** Decided; the trace logging is on `bug/grokbot/#27`. The
+fix for leak a is implemented there (see the entry above); leak b is
+not yet found or fixed. Not yet merged.
+
 ## 2026-11-26 — Replication: remaining #2 fixes
 
 **Issue:** [#2](https://github.com/oliverclaude/syncfs/issues/2)
