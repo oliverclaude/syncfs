@@ -591,6 +591,13 @@ impl Repl {
                 superseded: None,
             },
         );
+        super::trace::session(
+            "opened",
+            id,
+            Some(version),
+            st.index.path_of(&id),
+            "begin_change",
+        );
         st.index.set_version(id, version);
         st.window_drop.remove(&id);
         let new = st.window.insert(id);
@@ -629,6 +636,13 @@ impl Repl {
                 last_sent: Instant::now(),
                 superseded,
             },
+        );
+        super::trace::session(
+            "opened",
+            id,
+            Some(version),
+            st.index.path_of(&id),
+            "begin_remove",
         );
         st.window_drop.remove(&id);
         let new = st.window.insert(id);
@@ -768,7 +782,15 @@ impl Repl {
                         s.index.note_lineage(id, v);
                     }
                     s.dirty.forget(id);
-                    s.sessions.remove(&id);
+                    if s.sessions.remove(&id).is_some() {
+                        super::trace::session(
+                            "closed",
+                            id,
+                            Some(version),
+                            Some(&path),
+                            "local remove (tombstone)",
+                        );
+                    }
                     s.window_drop.insert(id);
                     let lineage = s.index.lineage(&id);
                     let seq = self.append(
@@ -791,7 +813,15 @@ impl Repl {
                 if let Some(id) = id {
                     if s.index.rec(&id).is_none() {
                         s.dirty.forget(id);
-                        s.sessions.remove(&id);
+                        if let Some(x) = s.sessions.remove(&id) {
+                            super::trace::session(
+                                "closed",
+                                id,
+                                Some(x.version),
+                                Some(&path),
+                                "local remove (last link)",
+                            );
+                        }
                     }
                 }
                 self.append(
@@ -824,7 +854,15 @@ impl Repl {
                     if let Some(r) = replaced.filter(|r| Some(*r) != id) {
                         if s.index.rec(&r).is_none() {
                             s.dirty.forget(r);
-                            s.sessions.remove(&r);
+                            if let Some(x) = s.sessions.remove(&r) {
+                                super::trace::session(
+                                    "closed",
+                                    r,
+                                    Some(x.version),
+                                    Some(&to),
+                                    "local rename over it",
+                                );
+                            }
                         }
                     }
                 }
@@ -965,7 +1003,14 @@ impl Repl {
             st.awaiting.insert(seq, (id, version));
             st.holders.entry((id, version)).or_default().insert(self.me);
         }
-        if st.sessions.remove(&id).is_some() {
+        if let Some(x) = st.sessions.remove(&id) {
+            super::trace::session(
+                "closed",
+                id,
+                Some(x.version),
+                st.index.path_of(&id),
+                "end_session",
+            );
             st.window_drop.insert(id);
         }
         drop(st);
@@ -1004,6 +1049,11 @@ impl Repl {
             }
         }
         let mut ops: Vec<Op> = st.index.take_changed();
+        if log::log_enabled!(target: "syncfs::trace", log::Level::Debug) {
+            for id in st.dirty.changed() {
+                super::trace::row(*id, st.index.path_of(id), st.dirty.has(id));
+            }
+        }
         ops.extend(st.dirty.take_changed());
         let (jops, upto) = st.journal.take_changed();
         ops.extend(jops);

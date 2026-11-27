@@ -23,4 +23,5 @@ pub mod relay;
 #[cfg(test)]
 mod relay_model;
 pub mod store;
+pub mod trace;
 pub mod version;

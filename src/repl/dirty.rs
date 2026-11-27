@@ -21,6 +21,7 @@ use crate::net::wire::{FileId, Version};
 
 use super::ranges::Ranges;
 use super::store::{decode, encode, Op, Table};
+use super::trace;
 
 type ByVersion = BTreeMap<Version, Ranges>;
 
@@ -78,6 +79,7 @@ impl Dirty {
             .copied()
             .collect();
         for id in ids {
+            trace::marks("cleared", id, None, None, "clear");
             self.forget(id);
         }
     }
@@ -116,11 +118,11 @@ impl Dirty {
         }
         let per = self.pending.entry(id).or_default();
         for &p in &self.peers {
-            per.entry(p)
-                .or_default()
-                .entry(version)
-                .or_default()
-                .insert(a, b);
+            let vs = per.entry(p).or_default();
+            if !vs.contains_key(&version) {
+                trace::marks("created", id, Some(p), Some(version), "mark");
+            }
+            vs.entry(version).or_default().insert(a, b);
         }
         self.changed.insert(id);
     }
@@ -143,6 +145,7 @@ impl Dirty {
         }
         per.retain(|_, vs| !vs.is_empty());
         if per.is_empty() {
+            trace::marks("cleared", id, None, None, "truncate");
             self.pending.remove(&id);
         }
         self.changed.insert(id);
@@ -151,6 +154,7 @@ impl Dirty {
     /// The file is gone: nothing to send.
     pub fn forget(&mut self, id: FileId) {
         if self.pending.remove(&id).is_some() {
+            trace::marks("cleared", id, None, None, "forget");
             self.changed.insert(id);
         }
         let keys: Vec<_> = self
@@ -160,6 +164,7 @@ impl Dirty {
             .copied()
             .collect();
         for k in keys {
+            trace::marks("cleared", id, Some(k.0), None, "forget (in flight)");
             self.inflight.remove(&k);
             self.changed.insert(id);
         }
@@ -186,6 +191,9 @@ impl Dirty {
         }
         vs.retain(|_, r| !r.is_empty());
         let more = !vs.is_empty();
+        if !out.is_empty() {
+            trace::marks("in flight", id, Some(peer), None, "pull");
+        }
         if let Some(per) = self.pending.get_mut(&id) {
             per.retain(|_, vs| !vs.is_empty());
             if per.is_empty() {
@@ -205,6 +213,7 @@ impl Dirty {
             .copied()
             .collect();
         for k in keys {
+            trace::marks("cleared", k.1, Some(peer), None, "acked (in flight)");
             self.inflight.remove(&k);
             self.changed.insert(k.1);
         }
@@ -220,6 +229,7 @@ impl Dirty {
             .collect();
         for k in keys {
             if let Some(vs) = self.inflight.remove(&k) {
+                trace::marks("pending again", k.1, Some(peer), None, "restore");
                 merge(
                     self.pending
                         .entry(k.1)
@@ -238,6 +248,9 @@ impl Dirty {
             return;
         };
         if let Some(vs) = per.get_mut(&peer) {
+            for v in vs.keys().filter(|v| **v <= version) {
+                trace::marks("cleared", id, Some(peer), Some(*v), "discard");
+            }
             vs.retain(|v, _| *v > version);
             if vs.is_empty() {
                 per.remove(&peer);
@@ -304,6 +317,16 @@ impl Dirty {
             .flat_map(|vs| vs.values())
             .map(Ranges::len)
             .sum()
+    }
+
+    /// Files whose row changed since the last [`take_changed`](Self::take_changed).
+    pub fn changed(&self) -> impl Iterator<Item = &FileId> + '_ {
+        self.changed.iter()
+    }
+
+    /// Whether anything is pending or in flight for `id`.
+    pub fn has(&self, id: &FileId) -> bool {
+        self.pending.contains_key(id) || self.inflight.keys().any(|(_, f)| f == id)
     }
 
     pub fn take_changed(&mut self) -> Vec<Op> {
