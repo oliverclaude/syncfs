@@ -1099,6 +1099,31 @@ impl Soak {
     }
 }
 
+/// What keeps a node's replication status from `in_sync` (#27): dirty
+/// files, unacknowledged journal entries per peer, open sessions, rebuild.
+fn sync_breakdown(r: Option<serde_json::Value>) -> String {
+    let Some(r) = r else {
+        return "no replication status".into();
+    };
+    let unacked: Vec<String> = r["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["journal_unacked"].as_u64().unwrap_or(0) > 0)
+        .map(|p| format!("{}:{}", p["id"], p["journal_unacked"]))
+        .collect();
+    format!(
+        "in_sync {}, dirty_files {}, journal_unacked [{}], open_sessions {} {}, rebuild active {}, rejoining {}",
+        r["in_sync"],
+        r["dirty_files"],
+        unacked.join(" "),
+        r["open_sessions"],
+        r["sessions"],
+        r["rebuild"]["active"],
+        r["rejoining"],
+    )
+}
+
 /// Problems found outside the checks (a stop that hung).
 static HUNG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -1578,6 +1603,9 @@ fn soak(kinds: &[Kind]) {
         }
         if t.elapsed() > Duration::from_secs(120) {
             why = format!("all up: {}, in sync: {synced}\n", s.all_up());
+            for n in s.mounts() {
+                why += &format!("  node {}: {}\n", n.id, sync_breakdown(n.status("replication")));
+            }
             let base = &trees[0];
             for (id, tr) in &trees[1..] {
                 for (k, v) in base.1.iter() {
