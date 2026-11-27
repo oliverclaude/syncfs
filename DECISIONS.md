@@ -29,8 +29,12 @@ file, so the new file got no session of its own: its content never
 replicated, and a session with no path stayed open on the removed
 file.
 
-**Options.** Two or more were offered; only the chosen one is recorded
-here. Option 2: unbind at the delete. When a local delete removes the
+**Options.** Option 1: rebind when the new file joins: when a file
+joins a held path lock tied to a different, deleted file, end the old
+session and rebind the lock to the new file with a fresh version (needs
+a new lock-manager call; writes via the old deleted handle would count
+against the new file, causing extra resends). Option 2: unbind at the
+delete. When a local delete removes the
 lock's file, clear the lock's file and version so the next file
 created under the held lock starts its own session through the
 existing path.
@@ -39,7 +43,8 @@ existing path.
 
 **Status.** Implemented on `bug/grokbot/#27` in 2cf074d (the fix plus
 the regression test `file_created_where_an_open_file_was_unlinked_replicates`).
-Not yet merged. The removed file's version is no longer reported by
+Merged to `main` (`--no-ff`, with #27 kept open for leak b). The
+removed file's version is no longer reported by
 the lock release when other references keep the lock; it settles
 through the holders of its tombstone instead.
 
