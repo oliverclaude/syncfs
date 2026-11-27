@@ -542,6 +542,11 @@ impl Repl {
         self.state().index.id_at(path)
     }
 
+    /// Whether `id` has a path here (it is not removed or unknown).
+    pub fn has_path(&self, id: &FileId) -> bool {
+        self.state().index.path_of(id).is_some()
+    }
+
     pub fn local_version(&self, id: &FileId) -> Option<Version> {
         self.state().index.version(id)
     }

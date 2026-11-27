@@ -446,6 +446,28 @@ impl LockManager {
         Some((h.file?, h.version?))
     }
 
+    /// `file`, the file of the session on `key`, was removed here while
+    /// other references keep the lock held (#27). The lock no longer
+    /// covers it: the next file at the key starts its own session (as for
+    /// a key held without a file). Its removal version is settled through
+    /// the holders of its tombstone, not this lock's release. Does nothing
+    /// for the last reference (its release reports the outcome) or for
+    /// another file.
+    pub fn unbind_removed(&self, key: &Key, file: FileId) -> bool {
+        let mut st = lock(&self.inner.st);
+        let Some(h) = st.held.get_mut(key) else {
+            return false;
+        };
+        if h.file != Some(file) || h.refs <= 1 {
+            return false;
+        }
+        h.file = None;
+        h.version = None;
+        h.written = false;
+        h.known.clear();
+        true
+    }
+
     /// The file of the session on `key` if only one reference is left
     /// (the next [`release`](Self::release) ends the session).
     pub fn last_reference(&self, key: &Key) -> Option<FileId> {
