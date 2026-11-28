@@ -493,6 +493,9 @@ fn unbind_if_removed(
     };
     if !repl.has_path(&file) && locks.unbind_removed(key, file) {
         log::debug!("locks: {key}: {file} was removed under the held lock; unbound");
+        // The release will not name the file again: end its lock session
+        // here, or peers' entries for it wait for the session forever.
+        repl.session_closed(file);
     }
 }
 
