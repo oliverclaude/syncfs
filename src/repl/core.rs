@@ -1202,6 +1202,7 @@ impl Repl {
             "journal_durable": st.journal.durable(),
             "journal_queue": st.journal.queued(),
             "open_sessions": st.sessions.len(),
+            "locked_files": st.locked_here.len(),
             "sessions": st
                 .sessions
                 .iter()

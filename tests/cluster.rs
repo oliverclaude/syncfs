@@ -2457,3 +2457,27 @@ fn write_killed_mid_session_leaves_no_unsent_changes() {
     assert_eq!(r["dirty_files"], 0, "{r:#}");
     in_sync(&c, 3);
 }
+
+/// A file unlinked while open under its write lock, with the path taken by
+/// a new file, leaves no lock marker on the removed file once the handle
+/// closes: a peer's later entries for it would wait for the session to end
+/// forever, and the peer's journal stall (#27).
+#[test]
+fn unlinked_open_file_does_not_stay_locked_here() {
+    require_fuse!();
+    use std::io::Write;
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m1 = c.node(1).mnt();
+    let mut a = open_rw(&m1.join("f")).unwrap();
+    a.write_all(b"A").unwrap();
+    std::fs::remove_file(m1.join("f")).unwrap();
+    std::fs::write(m1.join("f"), b"new file").unwrap();
+    drop(a);
+    eventually("no file is still locked on node 1", || {
+        let r = c.node(1).status("replication").unwrap();
+        (r["locked_files"] == 0)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(r["locked_files"].to_string()))
+    });
+}
