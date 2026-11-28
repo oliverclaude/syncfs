@@ -451,7 +451,12 @@ impl Repl {
                     attrs: super::backing::attrs_of(&stat),
                     lineage: st.index.lineage(&id),
                 };
-                self.append(&mut st, entry);
+                // The resend is the version's final entry: the marks go
+                // when each peer acknowledges it, also a peer that gets
+                // it relayed or copies the whole file and pulls nothing.
+                let seq = self.append(&mut st, entry);
+                st.awaiting.insert(seq, (id, version));
+                st.holders.entry((id, version)).or_default().insert(self.me);
             }
             log::info!(
                 "replication: suspect {id} checked: {} of {local_blocks} block(s) to resend",
