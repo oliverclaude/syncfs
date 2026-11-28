@@ -57,6 +57,15 @@ was recorded.
 4301caa and b979f79 (Option 1; the clearing runs at each store flush),
 48c32f8 (2a). Not yet merged (PR to `main`, awaiting Henk's approval).
 
+Also on this branch, no new choice: the unbind of leak a (2cf074d,
+already on `main`) left the removed file's lock marker (`locked_here`)
+up, because the later release no longer names the file. A peer's
+entries for that file then waited for the session forever, and a node
+stalled with `journal_unacked`. 385fb8e ends the lock session at the
+unbind (test in 3ff0e40). The rename-over variant of leak a (a lock
+still bound to a file a rename replaced; the 125 s pathless session) is
+found but not fixed; extending Option 2 to it needs Henk's approval.
+
 ## 2026-11-27 — Locks: a file created where a locked file was removed (#27, leak a)
 
 **Issue:** [#27](https://github.com/oliverclaude/syncfs/issues/27)
