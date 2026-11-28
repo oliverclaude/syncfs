@@ -2375,3 +2375,109 @@ fn file_created_where_an_open_file_was_unlinked_replicates() {
             .ok_or_else(|| std::io::Error::other(format!("{:?}", String::from_utf8_lossy(&got))))
     });
 }
+
+/// A file whose index entry went stale (its file left the backing
+/// directory without a record, as in a crash window) loses its record when
+/// a new file takes the path. Its unsent changes and any session go with it:
+/// nothing is left for a file that no longer exists (#27, leak b).
+#[test]
+fn displaced_file_record_leaves_no_unsent_changes() {
+    require_fuse!();
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    // Node 2 cannot pull: node 1's change to f stays unsent for it.
+    c.node(2).signal(libc::SIGSTOP);
+    let m1 = c.node(1).mnt();
+    std::fs::write(m1.join("f"), b"changed\n").unwrap();
+    eventually("node 1 holds an unsent change for node 2", || {
+        let r = c.node(1).status("replication").unwrap();
+        (r["dirty_files"] == 1 && r["open_sessions"] == 0)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(r.to_string()))
+    });
+    // The index still names f's file; the backing directory no longer has
+    // it. Past the kernel's entry cache, a new file takes the path.
+    std::fs::remove_file(c.node(1).backing().join("f")).unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    std::fs::write(m1.join("f"), b"").unwrap();
+    eventually("nothing left for the displaced file", || {
+        let r = c.node(1).status("replication").unwrap();
+        let pathless = r["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["path"].is_null());
+        (r["dirty_files"] == 0 && !pathless)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(r.to_string()))
+    });
+    c.node(2).signal(libc::SIGCONT);
+    in_sync(&c, 1);
+}
+
+/// A node killed in the middle of a write resends the change after its
+/// restart (the file is a suspect) and, once its peers have it, keeps no
+/// unsent changes: the resend is cleared when the peers acknowledge it, also
+/// for a peer that was away while it was sent (#27, leak b).
+#[test]
+fn write_killed_mid_session_leaves_no_unsent_changes() {
+    require_fuse!();
+    use std::io::Write;
+    let mut c = lock_cluster(&[Kind::Mount, Kind::Mount, Kind::Mount], "5s", &["f"]);
+    // Node 1 flushes its store rarely: the write's entries die with it.
+    c.node(1).stop();
+    c.node(1)
+        .env
+        .push(("SYNCFS_TEST_FLUSH_INTERVAL_MS".into(), "60000".into()));
+    c.node(1).start();
+    c.converge("node 1 back");
+    std::thread::sleep(LEASE + Duration::from_millis(100));
+    let m1 = c.node(1).mnt();
+    let mut f = open_rw(&m1.join("f")).unwrap();
+    f.write_all(b"written before the crash\n").unwrap();
+    f.sync_all().unwrap();
+    c.node(1).kill();
+    drop(f);
+    // Node 3 is away while node 1 resends the change.
+    c.node(3).signal(libc::SIGSTOP);
+    c.node(1).env.clear();
+    c.node(1).start();
+    let b2 = c.node(2).backing();
+    eventually("node 2 has the resent change", || {
+        let r = c.node(1).status("replication").unwrap();
+        let got = std::fs::read(b2.join("f"))?;
+        (got == b"written before the crash\n" && r["suspects"] == 0)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(format!("{got:?} {r}")))
+    });
+    c.node(3).signal(libc::SIGCONT);
+    c.converge("node 3 back");
+    wait_same_tree(&c, 1, 3);
+    let r = in_sync(&c, 1);
+    assert_eq!(r["dirty_files"], 0, "{r:#}");
+    in_sync(&c, 3);
+}
+
+/// A file unlinked while open under its write lock, with the path taken by
+/// a new file, leaves no lock marker on the removed file once the handle
+/// closes: a peer's later entries for it would wait for the session to end
+/// forever, and the peer's journal stall (#27).
+#[test]
+fn unlinked_open_file_does_not_stay_locked_here() {
+    require_fuse!();
+    use std::io::Write;
+    use Kind::{Daemon, Mount};
+    let mut c = lock_cluster(&[Mount, Mount, Daemon], "5s", &["f"]);
+    let m1 = c.node(1).mnt();
+    let mut a = open_rw(&m1.join("f")).unwrap();
+    a.write_all(b"A").unwrap();
+    std::fs::remove_file(m1.join("f")).unwrap();
+    std::fs::write(m1.join("f"), b"new file").unwrap();
+    drop(a);
+    eventually("no file is still locked on node 1", || {
+        let r = c.node(1).status("replication").unwrap();
+        (r["locked_files"] == 0)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other(r["locked_files"].to_string()))
+    });
+}

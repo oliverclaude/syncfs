@@ -188,6 +188,10 @@ pub struct Index {
     by_path: BTreeMap<Vec<u8>, FileId>,
     files: HashMap<FileId, FileRec>,
     changed: BTreeSet<FileId>,
+    /// Files whose record was dropped (their last path went without a
+    /// tombstone: displaced by another file, under a directory renamed
+    /// over, or stale after a rebuild); see [`Index::take_dropped`].
+    dropped: BTreeSet<FileId>,
 }
 
 impl Index {
@@ -388,10 +392,21 @@ impl Index {
             r.paths.retain(|p| p != path);
             if r.paths.is_empty() && r.removed_at.is_none() {
                 self.files.remove(&id);
+                self.dropped.insert(id);
             }
         }
         self.changed.insert(id);
         Some(id)
+    }
+
+    /// The files whose record was dropped since the last call and that
+    /// still have none (a rename removes and inserts its files again).
+    pub fn take_dropped(&mut self) -> Vec<FileId> {
+        let dropped = std::mem::take(&mut self.dropped);
+        dropped
+            .into_iter()
+            .filter(|id| !self.files.contains_key(id))
+            .collect()
     }
 
     /// Every indexed path at or below `prefix`.
@@ -502,6 +517,26 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_records_are_reported_once() {
+        let mut ix = Index::default();
+        ix.insert(b"a", id(1));
+        ix.insert(b"d/x", id(2));
+        // A rename moves its files: their records are not dropped.
+        ix.rename(b"a", b"b");
+        assert_eq!(ix.take_dropped(), Vec::<FileId>::new());
+        // Another file takes the path of 1; the directory renamed over d
+        // takes 2's.
+        ix.insert(b"b", id(3));
+        ix.insert(b"e/y", id(4));
+        ix.rename(b"e", b"d");
+        assert_eq!(ix.take_dropped(), vec![id(1), id(2)]);
+        assert_eq!(ix.take_dropped(), Vec::<FileId>::new());
+        // A tombstone keeps its record.
+        ix.bury(id(4), ver(1, 1));
+        assert_eq!(ix.take_dropped(), Vec::<FileId>::new());
+    }
 
     fn id(n: u8) -> FileId {
         FileId([n; 16])

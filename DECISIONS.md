@@ -18,6 +18,54 @@ known. Each entry should have:
 Do not invent options or reasons. If a choice is not in `main` yet,
 say so (`decided, not yet merged` or `decided, not yet implemented`).
 
+## 2026-11-28 — Replication: unsent changes left for a dropped file (#27, leak b)
+
+**Issue:** [#27](https://github.com/oliverclaude/syncfs/issues/27)
+
+Two gaps left dirty marks that nothing could send or clear. (1) The
+index drops a file's record when its last path goes without a
+tombstone (another file recorded at a stale path, a directory renamed
+over, stale paths after a rebuild); none of those paths cleared the
+file's unsent changes or session. (2) The after-crash resend of a
+suspect file was not registered for clearing on acknowledgement, so a
+peer that got it relayed or copied the whole file left its marks.
+
+**Options.** For (1):
+- Option 1: the index records every record it drops, and one central
+  place clears their unsent changes and sessions. Covers every path,
+  also ones added later.
+- Option 2: each caller that records a path clears the file it
+  displaced. Explicit, but a future caller can forget it.
+- Option 3: a displaced file becomes a tombstone instead of being
+  deleted. Changes replication behaviour for displaced files; the
+  riskiest.
+
+For (2):
+- 2a: register the resend for clearing on acknowledgement, as the crash
+  comparison and conflict copies do.
+- 2b: leave it; rely on (1) once the record goes. Marks stay while the
+  file exists.
+
+Both regression tests were asked for: a deterministic stale-index test
+and a test that kills a node mid-write.
+
+**Choice.** Option 1 and 2a, with both tests, chosen by Henk. The
+reasons are the trade-offs above, as they were offered; no other reason
+was recorded.
+
+**Status.** Implemented on `bug/grokbot/#27-leak-b`: c8583ef (tests),
+4301caa and b979f79 (Option 1; the clearing runs at each store flush),
+48c32f8 (2a). Not yet merged (PR to `main`, awaiting Henk's approval).
+
+Also on this branch, no new choice: the unbind of leak a (2cf074d,
+already on `main`) left the removed file's lock marker (`locked_here`)
+up, because the later release no longer names the file. A peer's
+entries for that file then waited for the session forever, and a node
+stalled with `journal_unacked`. 385fb8e ends the lock session at the
+unbind (test in 3ff0e40). The rename-over variant of leak a (a lock
+still bound to a file a rename replaced; the 125 s pathless session) is
+found but not fixed; extending Option 2 to it needs Henk's approval.
+
 ## 2026-11-27 — Locks: a file created where a locked file was removed (#27, leak a)
 
 **Issue:** [#27](https://github.com/oliverclaude/syncfs/issues/27)
