@@ -114,6 +114,25 @@ fn applied_key(origin: NodeId) -> Vec<u8> {
     format!("applied.{origin}").into_bytes()
 }
 
+impl State {
+    /// Clears what is left of the files whose index record was dropped
+    /// (see [`Index::take_dropped`](super::files::Index::take_dropped)):
+    /// their unsent changes and their sessions. Nothing can send or end
+    /// them for a file without a record (#27).
+    pub(crate) fn settle_dropped(&mut self) {
+        for id in self.index.take_dropped() {
+            if self.dirty.has(&id) {
+                super::trace::marks("cleared", id, None, None, "record dropped");
+                self.dirty.forget(id);
+            }
+            if let Some(x) = self.sessions.remove(&id) {
+                super::trace::session("closed", id, Some(x.version), None, "record dropped");
+                self.window_drop.insert(id);
+            }
+        }
+    }
+}
+
 /// `peer` acknowledged this node's journal up to `seq`: trims the journal,
 /// drops the marks of what it pulled, and, for every session-final entry
 /// up to `seq` (in `awaiting`), the marks of that version and older it did
@@ -1025,6 +1044,7 @@ impl Repl {
     /// Changes for the next flush.
     fn batch(&self) -> Batch {
         let mut st = self.state();
+        st.settle_dropped();
         // Long sessions: send what they changed so far now and then.
         let now = Instant::now();
         let due: Vec<FileId> = st
